@@ -1,0 +1,74 @@
+[package]
+name = "datrina"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Datrina The Lenswright — Open-source AI dashboard agent"
+
+[lib]
+name = "datrina_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri core
+tauri = { version = "2", features = ["tray-icon", "devtools"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+tauri-plugin-store = "2"
+tauri-plugin-os = "2"
+tauri-plugin-process = "2"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full", "process", "io-util", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Scheduling
+tokio-cron-scheduler = "0.13"
+cron = "0.15"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+dirs = "6.0"
+once_cell = "1.20"
+dashmap = "6.1"
+parking_lot = "0.12"
+
+# MCP protocol
+async-trait = "0.1"
+futures = "0.3"
+
+# Process management for MCP
+portable-pty = "0.9"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
