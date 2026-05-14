@@ -13,14 +13,14 @@ use modules::scheduler::Scheduler;
 use modules::storage::Storage;
 use modules::tool_engine::ToolEngine;
 
-use parking_lot::RwLock;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Global application state
 pub struct AppState {
     pub storage: Arc<Storage>,
     pub mcp_manager: Arc<MCPManager>,
-    pub scheduler: Arc<RwLock<Scheduler>>,
+    pub scheduler: Arc<Mutex<Scheduler>>,
     pub tool_engine: Arc<ToolEngine>,
     pub ai_engine: Arc<AIEngine>,
 }
@@ -32,7 +32,9 @@ impl AppState {
 
         let storage = Arc::new(storage);
         let mcp_manager = Arc::new(MCPManager::new());
-        let scheduler = Arc::new(RwLock::new(Scheduler::new()));
+        let mut scheduler = Scheduler::new();
+        scheduler.start().await?;
+        let scheduler = Arc::new(Mutex::new(scheduler));
         let tool_engine = Arc::new(ToolEngine::default());
         let ai_engine = Arc::new(AIEngine::default());
 
@@ -57,6 +59,8 @@ macro_rules! generate_handler {
             $crate::commands::dashboard::get_dashboard,
             $crate::commands::dashboard::create_dashboard,
             $crate::commands::dashboard::update_dashboard,
+            $crate::commands::dashboard::add_dashboard_widget,
+            $crate::commands::dashboard::apply_build_change,
             $crate::commands::dashboard::delete_dashboard,
             $crate::commands::dashboard::refresh_widget,
             // Chat commands
@@ -76,6 +80,8 @@ macro_rules! generate_handler {
             // Provider commands
             $crate::commands::provider::list_providers,
             $crate::commands::provider::add_provider,
+            $crate::commands::provider::update_provider,
+            $crate::commands::provider::set_provider_enabled,
             $crate::commands::provider::remove_provider,
             $crate::commands::provider::test_provider,
             // Workflow commands

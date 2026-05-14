@@ -7,7 +7,7 @@ import { TopBar } from './components/layout/TopBar';
 import { StatusBar } from './components/layout/StatusBar';
 import { ProviderSettings } from './components/layout/ProviderSettings';
 import { configApi, dashboardApi, providerApi } from './lib/api';
-import type { CreateProviderRequest, Dashboard, LLMProvider, Widget, WidgetRuntimeData, WorkflowEventEnvelope } from './lib/api';
+import type { CreateProviderRequest, Dashboard, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WorkflowEventEnvelope } from './lib/api';
 
 function App() {
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
@@ -207,6 +207,64 @@ function App() {
     }
   };
 
+  const handleAddWidget = async (widgetType: 'text' | 'gauge') => {
+    if (!activeDashboard) return;
+    setIsBusy(true);
+    setError(null);
+    setStatusMessage('Adding widget...');
+    try {
+      const updated = await dashboardApi.addWidget(activeDashboard.id, {
+        widget_type: widgetType,
+        title: widgetType === 'text' ? 'Local note' : 'Local metric',
+        content: widgetType === 'text' ? '**Local note**\n\nSaved through Datrina apply command.' : undefined,
+        value: widgetType === 'gauge' ? 64 : undefined,
+      });
+      setDashboards(prev => upsertDashboard(prev, updated));
+      setStatusMessage('Widget added');
+    } catch (err) {
+      setError(errorMessage(err, 'Failed to add widget'));
+      setStatusMessage('Add widget failed');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleApplyBuildChange = async (action: 'create_local_dashboard' | 'add_text_widget' | 'add_gauge_widget') => {
+    setIsBusy(true);
+    setError(null);
+    setStatusMessage('Applying build change...');
+    try {
+      const updated = await dashboardApi.applyBuildChange({
+        action,
+        dashboard_id: activeDashboard?.id,
+        title: action === 'create_local_dashboard'
+          ? 'AI Build Dashboard'
+          : action === 'add_text_widget'
+            ? 'AI build note'
+            : 'AI build metric',
+        content: action === 'add_text_widget' ? '**Generated change**\n\nApplied after explicit confirmation.' : undefined,
+        value: action === 'add_gauge_widget' ? 76 : undefined,
+      });
+      setDashboards(prev => upsertDashboard(prev, updated));
+      setActiveId(updated.id);
+      setStatusMessage('Build change applied');
+      if (updated.layout.length > 0) {
+        const widget = updated.layout[updated.layout.length - 1];
+        setRefreshingWidgetId(widget.id);
+        const result = await dashboardApi.refreshWidget(updated.id, widget.id);
+        if (result.data) {
+          setWidgetData(prev => ({ ...prev, [widget.id]: result.data }));
+        }
+      }
+    } catch (err) {
+      setError(errorMessage(err, 'Failed to apply build change'));
+      setStatusMessage('Build apply failed');
+    } finally {
+      setIsBusy(false);
+      setRefreshingWidgetId(null);
+    }
+  };
+
   const handleRefreshWidget = async (widgetId: string) => {
     if (!activeDashboard) return;
     setRefreshingWidgetId(widgetId);
@@ -253,6 +311,51 @@ function App() {
     } catch (err) {
       setStatusMessage('Provider save failed');
       throw err;
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleUpdateProvider = async (id: string, provider: UpdateProviderRequest) => {
+    setIsBusy(true);
+    setError(null);
+    setStatusMessage('Updating provider...');
+    try {
+      const saved = await providerApi.update(id, provider);
+      setProviders(prev => upsertProvider(prev, saved));
+      if (saved.is_enabled) {
+        setActiveProviderId(saved.id);
+        await configApi.set('active_provider_id', saved.id);
+      }
+      setStatusMessage('Provider updated');
+    } catch (err) {
+      setError(errorMessage(err, 'Failed to update provider'));
+      setStatusMessage('Provider update failed');
+      throw err;
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleSetProviderEnabled = async (id: string, isEnabled: boolean) => {
+    setIsBusy(true);
+    setError(null);
+    setStatusMessage(isEnabled ? 'Enabling provider...' : 'Disabling provider...');
+    try {
+      const saved = await providerApi.setEnabled(id, isEnabled);
+      setProviders(prev => upsertProvider(prev, saved));
+      if (!isEnabled && activeProviderId === id) {
+        const nextActiveId = providers.find(provider => provider.id !== id && provider.is_enabled)?.id ?? null;
+        setActiveProviderId(nextActiveId);
+        await configApi.set('active_provider_id', nextActiveId ?? '');
+      } else if (isEnabled) {
+        setActiveProviderId(saved.id);
+        await configApi.set('active_provider_id', saved.id);
+      }
+      setStatusMessage(isEnabled ? 'Provider enabled' : 'Provider disabled');
+    } catch (err) {
+      setError(errorMessage(err, 'Failed to update provider state'));
+      setStatusMessage('Provider state update failed');
     } finally {
       setIsBusy(false);
     }
@@ -361,6 +464,7 @@ function App() {
               refreshingWidgetId={refreshingWidgetId}
               onRefreshWidget={handleRefreshWidget}
               onLayoutCommit={handleLayoutCommit}
+              onAddWidget={handleAddWidget}
             />
           ) : (
             <EmptyState onCreate={() => handleCreate('local_mvp')} onBuild={() => { setChatMode('build'); setIsChatOpen(true); }} />
@@ -375,8 +479,10 @@ function App() {
           mode={chatMode}
           dashboardId={activeId ?? undefined}
           activeProvider={activeProvider}
+          canApplyToDashboard={Boolean(activeDashboard)}
           onClose={() => setIsChatOpen(false)}
           onModeChange={setChatMode}
+          onApplyBuildChange={handleApplyBuildChange}
         />
       )}
 
@@ -389,6 +495,8 @@ function App() {
           error={error}
           onClose={() => setIsProviderSettingsOpen(false)}
           onAddProvider={handleAddProvider}
+          onUpdateProvider={handleUpdateProvider}
+          onSetProviderEnabled={handleSetProviderEnabled}
           onRemoveProvider={handleRemoveProvider}
           onSetActiveProvider={handleSetActiveProvider}
           onTestProvider={handleTestProvider}

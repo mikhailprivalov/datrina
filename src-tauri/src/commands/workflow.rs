@@ -3,6 +3,7 @@ use tracing::info;
 
 use crate::models::workflow::{Workflow, WorkflowRun, WORKFLOW_EVENT_CHANNEL};
 use crate::models::ApiResult;
+use crate::modules::scheduler::ScheduledRuntime;
 use crate::modules::workflow_engine::WorkflowEngine;
 use crate::AppState;
 
@@ -41,7 +42,16 @@ pub async fn execute_workflow(
         Err(e) => return Ok(ApiResult::err(e.to_string())),
     };
 
-    let engine = WorkflowEngine::with_tool_engine(state.tool_engine.as_ref());
+    let provider = match active_provider(&state).await {
+        Ok(provider) => provider,
+        Err(e) => return Ok(ApiResult::err(e.to_string())),
+    };
+    let engine = WorkflowEngine::with_runtime(
+        state.tool_engine.as_ref(),
+        state.mcp_manager.as_ref(),
+        state.ai_engine.as_ref(),
+        provider,
+    );
     info!("⚡ Executing workflow: {} ({})", workflow.name, id);
 
     Ok(match engine.execute(&workflow, input).await {
@@ -67,13 +77,37 @@ pub async fn execute_workflow(
     })
 }
 
+async fn active_provider(
+    state: &State<'_, AppState>,
+) -> anyhow::Result<Option<crate::models::provider::LLMProvider>> {
+    let providers = state.storage.list_providers().await?;
+    let active_provider_id = state
+        .storage
+        .get_config("active_provider_id")
+        .await?
+        .filter(|id| !id.trim().is_empty());
+    Ok(active_provider_id
+        .as_deref()
+        .and_then(|id| {
+            providers
+                .iter()
+                .find(|provider| provider.id == id && provider.is_enabled)
+        })
+        .or_else(|| providers.iter().find(|provider| provider.is_enabled))
+        .cloned())
+}
+
 #[tauri::command]
 pub async fn create_workflow(
+    app: AppHandle,
     state: State<'_, AppState>,
     workflow: Workflow,
 ) -> Result<ApiResult<bool>, String> {
     Ok(match state.storage.create_workflow(&workflow).await {
         Ok(()) => {
+            if let Err(e) = schedule_if_cron(&app, &state, workflow.clone()).await {
+                return Ok(ApiResult::err(e.to_string()));
+            }
             info!("📋 Created workflow: {}", workflow.name);
             ApiResult::ok(true)
         }
@@ -90,4 +124,35 @@ pub async fn delete_workflow(
         Ok(()) => ApiResult::ok(true),
         Err(e) => ApiResult::err(e.to_string()),
     })
+}
+
+async fn schedule_if_cron(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    workflow: Workflow,
+) -> anyhow::Result<()> {
+    let cron = match workflow
+        .trigger
+        .config
+        .as_ref()
+        .and_then(|config| config.cron.as_deref())
+    {
+        Some(cron) => cron.to_string(),
+        None => return Ok(()),
+    };
+    let provider = active_provider(state).await?;
+    let runtime = ScheduledRuntime {
+        app: app.clone(),
+        storage: state.storage.clone(),
+        tool_engine: state.tool_engine.clone(),
+        mcp_manager: state.mcp_manager.clone(),
+        ai_engine: state.ai_engine.clone(),
+        provider,
+    };
+    state
+        .scheduler
+        .lock()
+        .await
+        .schedule_cron(workflow, &cron, runtime)
+        .await
 }

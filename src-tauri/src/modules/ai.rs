@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 use crate::models::chat::{ChatMessage, MessageRole};
 use crate::models::provider::{
@@ -17,12 +18,17 @@ pub struct AIResponse {
     pub content: String,
     pub provider_id: String,
     pub model: String,
+    pub tokens: Option<crate::models::chat::TokenUsage>,
+    pub latency_ms: u64,
 }
 
 impl Default for AIEngine {
     fn default() -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(45))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 }
@@ -35,8 +41,12 @@ impl AIEngine {
     ) -> Result<AIResponse> {
         validate_provider(provider)?;
 
-        let content = match provider.kind {
-            ProviderKind::LocalMock => local_mock_response(messages),
+        let started = Instant::now();
+        let completion = match provider.kind {
+            ProviderKind::LocalMock => AICompletion {
+                content: local_mock_response(messages),
+                tokens: Some(local_mock_tokens(messages)),
+            },
             ProviderKind::Ollama => self.complete_ollama(provider, messages).await?,
             ProviderKind::Openrouter | ProviderKind::Custom => {
                 self.complete_openai_compatible(provider, messages).await?
@@ -44,9 +54,11 @@ impl AIEngine {
         };
 
         Ok(AIResponse {
-            content,
+            content: completion.content,
             provider_id: provider.id.clone(),
             model: provider.default_model.clone(),
+            tokens: completion.tokens,
+            latency_ms: started.elapsed().as_millis() as u64,
         })
     }
 
@@ -99,13 +111,19 @@ impl AIEngine {
         &self,
         provider: &LLMProvider,
         messages: &[ChatMessage],
-    ) -> Result<String> {
+    ) -> Result<AICompletion> {
         let endpoint = openai_chat_endpoint(&provider.base_url)?;
         let mut request = self.client.post(endpoint).json(&json!({
             "model": provider.default_model,
             "stream": false,
             "messages": to_openai_messages(messages),
         }));
+
+        if matches!(provider.kind, ProviderKind::Openrouter) {
+            request = request
+                .header("HTTP-Referer", "https://github.com/datrina/datrina")
+                .header("X-Title", "Datrina");
+        }
 
         if let Some(api_key) = provider
             .api_key
@@ -115,31 +133,42 @@ impl AIEngine {
             request = request.bearer_auth(api_key);
         }
 
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow!("provider_network_error: {}", e))?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
             return Err(anyhow!(
-                "provider returned HTTP {}: {}",
+                "provider_http_error status={}: {}",
                 status,
                 truncate(&body)
             ));
         }
 
-        let parsed: OpenAIChatResponse = serde_json::from_str(&body)?;
-        parsed
+        let parsed: OpenAIChatResponse =
+            serde_json::from_str(&body).map_err(|e| anyhow!("provider_parse_error: {}", e))?;
+        let content = parsed
             .choices
             .into_iter()
             .find_map(|choice| choice.message.content)
             .filter(|content| !content.trim().is_empty())
-            .ok_or_else(|| anyhow!("provider response did not include assistant content"))
+            .ok_or_else(|| anyhow!("provider_empty_response: missing assistant content"))?;
+        Ok(AICompletion {
+            content,
+            tokens: parsed.usage.map(|usage| crate::models::chat::TokenUsage {
+                prompt: usage.prompt_tokens.unwrap_or(0),
+                completion: usage.completion_tokens.unwrap_or(0),
+            }),
+        })
     }
 
     async fn complete_ollama(
         &self,
         provider: &LLMProvider,
         messages: &[ChatMessage],
-    ) -> Result<String> {
+    ) -> Result<AICompletion> {
         let endpoint = join_url(&provider.base_url, "/api/chat")?;
         let response = self
             .client
@@ -150,25 +179,30 @@ impl AIEngine {
                 "messages": to_ollama_messages(messages),
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow!("provider_network_error: {}", e))?;
 
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
             return Err(anyhow!(
-                "provider returned HTTP {}: {}",
+                "provider_http_error status={}: {}",
                 status,
                 truncate(&body)
             ));
         }
 
-        let parsed: OllamaChatResponse = serde_json::from_str(&body)?;
+        let parsed: OllamaChatResponse =
+            serde_json::from_str(&body).map_err(|e| anyhow!("provider_parse_error: {}", e))?;
         if parsed.message.content.trim().is_empty() {
             return Err(anyhow!(
-                "provider response did not include assistant content"
+                "provider_empty_response: missing assistant content"
             ));
         }
-        Ok(parsed.message.content)
+        Ok(AICompletion {
+            content: parsed.message.content,
+            tokens: None,
+        })
     }
 
     async fn test_openai_compatible(&self, provider: &LLMProvider) -> Result<()> {
@@ -180,6 +214,12 @@ impl AIEngine {
             "messages": [{"role": "user", "content": "ping"}],
         }));
 
+        if matches!(provider.kind, ProviderKind::Openrouter) {
+            request = request
+                .header("HTTP-Referer", "https://github.com/datrina/datrina")
+                .header("X-Title", "Datrina");
+        }
+
         if let Some(api_key) = provider
             .api_key
             .as_ref()
@@ -188,14 +228,17 @@ impl AIEngine {
             request = request.bearer_auth(api_key);
         }
 
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow!("provider_network_error: {}", e))?;
         if response.status().is_success() {
             Ok(())
         } else {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             Err(anyhow!(
-                "provider returned HTTP {}: {}",
+                "provider_http_error status={}: {}",
                 status,
                 truncate(&body)
             ))
@@ -204,13 +247,23 @@ impl AIEngine {
 
     async fn test_ollama(&self, provider: &LLMProvider) -> Result<()> {
         let endpoint = join_url(&provider.base_url, "/api/tags")?;
-        let response = self.client.get(endpoint).send().await?;
+        let response = self
+            .client
+            .get(endpoint)
+            .send()
+            .await
+            .map_err(|e| anyhow!("provider_network_error: {}", e))?;
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(anyhow!("provider returned HTTP {}", response.status()))
+            Err(anyhow!("provider_http_error status={}", response.status()))
         }
     }
+}
+
+struct AICompletion {
+    content: String,
+    tokens: Option<crate::models::chat::TokenUsage>,
 }
 
 pub fn validate_provider(provider: &LLMProvider) -> Result<()> {
@@ -306,9 +359,20 @@ fn local_mock_response(messages: &[ChatMessage]) -> String {
         .unwrap_or("");
 
     format!(
-        "Local mock AI response. Received {} user characters. Tool calling and dashboard generation are not enabled in W6.",
+        "Local mock AI response. Received {} user characters. Build changes require the visible Apply controls, and tool execution stays behind Rust policy gates.",
         latest_user.chars().count()
     )
+}
+
+fn local_mock_tokens(messages: &[ChatMessage]) -> crate::models::chat::TokenUsage {
+    let prompt_chars = messages
+        .iter()
+        .map(|message| message.content.len())
+        .sum::<usize>();
+    crate::models::chat::TokenUsage {
+        prompt: (prompt_chars / 4).max(1) as u32,
+        completion: 24,
+    }
 }
 
 fn truncate(value: &str) -> String {
@@ -323,6 +387,7 @@ fn truncate(value: &str) -> String {
 #[derive(Deserialize)]
 struct OpenAIChatResponse {
     choices: Vec<OpenAIChoice>,
+    usage: Option<OpenAIUsage>,
 }
 
 #[derive(Deserialize)]
@@ -333,6 +398,12 @@ struct OpenAIChoice {
 #[derive(Deserialize)]
 struct OpenAIMessage {
     content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIUsage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]

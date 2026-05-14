@@ -1,16 +1,23 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter};
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::info;
+use tracing::{error, info};
 
-use crate::models::workflow::Workflow;
+use crate::models::provider::LLMProvider;
+use crate::models::workflow::{Workflow, WORKFLOW_EVENT_CHANNEL};
 use crate::models::Id;
+use crate::modules::ai::AIEngine;
+use crate::modules::mcp_manager::MCPManager;
+use crate::modules::storage::Storage;
+use crate::modules::tool_engine::ToolEngine;
+use crate::modules::workflow_engine::WorkflowEngine;
 
 /// Manages scheduled workflow execution
 pub struct Scheduler {
     scheduler: Option<JobScheduler>,
     jobs: HashMap<Id, uuid::Uuid>,
-    registration_only: bool,
 }
 
 impl Scheduler {
@@ -18,7 +25,6 @@ impl Scheduler {
         Self {
             scheduler: None,
             jobs: HashMap::new(),
-            registration_only: true,
         }
     }
 
@@ -30,43 +36,45 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Schedule a workflow with cron expression
-    pub async fn schedule_cron(&mut self, workflow: &Workflow, cron_expr: &str) -> Result<()> {
+    /// Schedule a workflow with cron expression and execute through the same
+    /// persisted runner used by manual workflow commands.
+    pub async fn schedule_cron(
+        &mut self,
+        workflow: Workflow,
+        cron_expr: &str,
+        runtime: ScheduledRuntime,
+    ) -> Result<()> {
         let sched = self
             .scheduler
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Scheduler not started"))?;
 
         let workflow_id = workflow.id.clone();
+        let workflow_name = workflow.name.clone();
         let cron_owned = cron_expr.to_string();
 
         let job = Job::new_async(cron_expr, move |_uuid, _l| {
-            let wid = workflow_id.clone();
+            let workflow = workflow.clone();
             let cron = cron_owned.clone();
+            let runtime = runtime.clone();
             Box::pin(async move {
-                info!(
-                    "⏰ Cron matched workflow {} (cron: {}), but scheduler is registration-only in MVP baseline",
-                    wid, cron
-                );
+                info!("⏰ Cron matched workflow {} (cron: {})", workflow.id, cron);
+                if let Err(error) = execute_scheduled_workflow(workflow, runtime).await {
+                    error!("Scheduled workflow execution failed: {}", error);
+                }
             })
         })?;
 
         let job_id = job.guid();
         sched.add(job).await?;
 
-        self.jobs.insert(workflow.id.clone(), job_id);
+        self.jobs.insert(workflow_id, job_id);
         info!(
             "📅 Scheduled workflow '{}' with cron: {}",
-            workflow.name, cron_expr
+            workflow_name, cron_expr
         );
 
         Ok(())
-    }
-
-    /// MVP scheduler scope: cron registrations are tracked, but execution is
-    /// intentionally not triggered until the workflow runner is injected here.
-    pub fn is_registration_only(&self) -> bool {
-        self.registration_only
     }
 
     /// Unschedule a workflow
@@ -99,6 +107,42 @@ impl Scheduler {
     pub fn list_scheduled(&self) -> Vec<Id> {
         self.jobs.keys().cloned().collect()
     }
+}
+
+#[derive(Clone)]
+pub struct ScheduledRuntime {
+    pub app: AppHandle,
+    pub storage: Arc<Storage>,
+    pub tool_engine: Arc<ToolEngine>,
+    pub mcp_manager: Arc<MCPManager>,
+    pub ai_engine: Arc<AIEngine>,
+    pub provider: Option<LLMProvider>,
+}
+
+async fn execute_scheduled_workflow(
+    workflow: Workflow,
+    runtime: ScheduledRuntime,
+) -> anyhow::Result<()> {
+    let engine = WorkflowEngine::with_runtime(
+        runtime.tool_engine.as_ref(),
+        runtime.mcp_manager.as_ref(),
+        runtime.ai_engine.as_ref(),
+        runtime.provider,
+    );
+    let execution = engine.execute(&workflow, None).await?;
+    let run = execution.run;
+    runtime
+        .storage
+        .save_workflow_run(&workflow.id, &run)
+        .await?;
+    runtime
+        .storage
+        .update_workflow_last_run(&workflow.id, &run)
+        .await?;
+    for event in execution.events {
+        runtime.app.emit(WORKFLOW_EVENT_CHANNEL, event)?;
+    }
+    Ok(())
 }
 
 impl Default for Scheduler {

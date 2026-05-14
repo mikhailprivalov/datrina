@@ -6,11 +6,13 @@ interface Props {
   mode: 'build' | 'context';
   dashboardId?: string;
   activeProvider?: LLMProvider;
+  canApplyToDashboard: boolean;
   onClose: () => void;
   onModeChange: (mode: 'build' | 'context') => void;
+  onApplyBuildChange: (action: 'create_local_dashboard' | 'add_text_widget' | 'add_gauge_widget') => Promise<void>;
 }
 
-export function ChatPanel({ mode, dashboardId, activeProvider, onClose, onModeChange }: Props) {
+export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboard, onClose, onModeChange, onApplyBuildChange }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -109,8 +111,36 @@ export function ChatPanel({ mode, dashboardId, activeProvider, onClose, onModeCh
               {mode === 'build' ? 'Ask for build guidance' : 'Ask about your dashboard data'}
             </p>
             <p className="text-xs mt-1 opacity-70">
-              {mode === 'build' ? 'Dashboard generation and tool calling are not enabled in the MVP slice.' : 'Requires a configured provider or local_mock provider.'}
+              {mode === 'build' ? 'Generated changes are applied only after explicit confirmation.' : 'Requires a configured provider or local_mock provider.'}
             </p>
+          </div>
+        )}
+
+        {mode === 'build' && (
+          <div className="rounded-lg border border-border bg-background/70 p-3 text-xs">
+            <p className="mb-2 font-medium text-foreground">Generated changes</p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => onApplyBuildChange('create_local_dashboard')}
+                className="rounded-md bg-primary px-2.5 py-1.5 text-primary-foreground hover:bg-primary/90"
+              >
+                Apply dashboard
+              </button>
+              <button
+                onClick={() => onApplyBuildChange('add_text_widget')}
+                disabled={!canApplyToDashboard}
+                className="rounded-md border border-border px-2.5 py-1.5 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Add text
+              </button>
+              <button
+                onClick={() => onApplyBuildChange('add_gauge_widget')}
+                disabled={!canApplyToDashboard}
+                className="rounded-md border border-border px-2.5 py-1.5 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Add gauge
+              </button>
+            </div>
           </div>
         )}
 

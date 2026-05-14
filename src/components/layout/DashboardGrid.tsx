@@ -18,6 +18,7 @@ interface Props {
   refreshingWidgetId: string | null;
   onRefreshWidget: (widgetId: string) => void;
   onLayoutCommit: (layout: Widget[]) => void;
+  onAddWidget: (widgetType: 'text' | 'gauge') => void;
 }
 
 export function DashboardGrid({
@@ -27,6 +28,7 @@ export function DashboardGrid({
   refreshingWidgetId,
   onRefreshWidget,
   onLayoutCommit,
+  onAddWidget,
 }: Props) {
   const layouts = {
     lg: dashboard.layout.map(w => ({
@@ -56,51 +58,61 @@ export function DashboardGrid({
           <p className="mt-2 text-sm text-muted-foreground">
             This dashboard is saved locally. Widgets will appear here after a workflow or build step adds them.
           </p>
+          <div className="mt-4 flex justify-center gap-2">
+            <button onClick={() => onAddWidget('text')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add text</button>
+            <button onClick={() => onAddWidget('gauge')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add gauge</button>
+          </div>
         </div>
       </div>
     );
   }
 
   return (
-    <ResponsiveGridLayout
-      className="layout"
-      layouts={layouts}
-      breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480, xxs: 0 }}
-      cols={{ lg: 12, md: 10, sm: 6, xs: 4, xxs: 2 }}
-      rowHeight={60}
-      draggableHandle=".widget-drag-handle"
-      margin={[12, 12]}
-      onDragStop={handleLayoutCommit}
-      onResizeStop={handleLayoutCommit}
-    >
-      {dashboard.layout.map(widget => (
-        <div key={widget.id} className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
-          <div className="widget-drag-handle flex items-center justify-between px-3 py-2 border-b border-border/50 cursor-move">
-            <span className="text-sm font-medium truncate">{widget.title}</span>
-            <div className="flex items-center gap-1">
-              <button
-                className="p-1 rounded hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                title="Refresh widget data"
-                disabled={refreshingWidgetId === widget.id}
-                onMouseDown={event => event.stopPropagation()}
-                onClick={() => onRefreshWidget(widget.id)}
-              >
-                <svg className={`w-3.5 h-3.5 text-muted-foreground ${refreshingWidgetId === widget.id ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-              </button>
+    <div className="space-y-3">
+      <div className="flex justify-end gap-2">
+        <button onClick={() => onAddWidget('text')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add text</button>
+        <button onClick={() => onAddWidget('gauge')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add gauge</button>
+      </div>
+      <ResponsiveGridLayout
+        className="layout"
+        layouts={layouts}
+        breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480, xxs: 0 }}
+        cols={{ lg: 12, md: 10, sm: 6, xs: 4, xxs: 2 }}
+        rowHeight={60}
+        draggableHandle=".widget-drag-handle"
+        margin={[12, 12]}
+        onDragStop={handleLayoutCommit}
+        onResizeStop={handleLayoutCommit}
+      >
+        {dashboard.layout.map(widget => (
+          <div key={widget.id} className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
+            <div className="widget-drag-handle flex items-center justify-between px-3 py-2 border-b border-border/50 cursor-move">
+              <span className="text-sm font-medium truncate">{widget.title}</span>
+              <div className="flex items-center gap-1">
+                <button
+                  className="p-1 rounded hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  title="Refresh widget data"
+                  disabled={refreshingWidgetId === widget.id}
+                  onMouseDown={event => event.stopPropagation()}
+                  onClick={() => onRefreshWidget(widget.id)}
+                >
+                  <svg className={`w-3.5 h-3.5 text-muted-foreground ${refreshingWidgetId === widget.id ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div className="p-3 h-[calc(100%-40px)] overflow-auto">
+              {widgetErrors[widget.id] ? (
+                <WidgetError message={widgetErrors[widget.id]} />
+              ) : (
+                <WidgetRenderer widget={widget} data={widgetData[widget.id]} />
+              )}
             </div>
           </div>
-          <div className="p-3 h-[calc(100%-40px)] overflow-auto">
-            {widgetErrors[widget.id] ? (
-              <WidgetError message={widgetErrors[widget.id]} />
-            ) : (
-              <WidgetRenderer widget={widget} data={widgetData[widget.id]} />
-            )}
-          </div>
-        </div>
-      ))}
-    </ResponsiveGridLayout>
+        ))}
+      </ResponsiveGridLayout>
+    </div>
   );
 }
 

@@ -3,11 +3,15 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use tracing::{error, info};
 
+use crate::models::chat::{ChatMessage, ChatMode, MessageRole};
+use crate::models::provider::LLMProvider;
 use crate::models::workflow::{
     NodeKind, RunStatus, TriggerKind, Workflow, WorkflowEdge, WorkflowEventEnvelope,
     WorkflowEventKind, WorkflowNode, WorkflowRun, WorkflowTrigger,
 };
 use crate::models::Id;
+use crate::modules::ai::AIEngine;
+use crate::modules::mcp_manager::MCPManager;
 use crate::modules::tool_engine::ToolEngine;
 
 pub struct WorkflowExecution {
@@ -18,16 +22,41 @@ pub struct WorkflowExecution {
 /// DAG-based workflow execution engine
 pub struct WorkflowEngine<'a> {
     tool_engine: Option<&'a ToolEngine>,
+    mcp_manager: Option<&'a MCPManager>,
+    ai_engine: Option<&'a AIEngine>,
+    provider: Option<LLMProvider>,
 }
 
 impl<'a> WorkflowEngine<'a> {
     pub fn new() -> Self {
-        Self { tool_engine: None }
+        Self {
+            tool_engine: None,
+            mcp_manager: None,
+            ai_engine: None,
+            provider: None,
+        }
     }
 
     pub fn with_tool_engine(tool_engine: &'a ToolEngine) -> Self {
         Self {
             tool_engine: Some(tool_engine),
+            mcp_manager: None,
+            ai_engine: None,
+            provider: None,
+        }
+    }
+
+    pub fn with_runtime(
+        tool_engine: &'a ToolEngine,
+        mcp_manager: &'a MCPManager,
+        ai_engine: &'a AIEngine,
+        provider: Option<LLMProvider>,
+    ) -> Self {
+        Self {
+            tool_engine: Some(tool_engine),
+            mcp_manager: Some(mcp_manager),
+            ai_engine: Some(ai_engine),
+            provider,
         }
     }
 
@@ -175,15 +204,50 @@ impl<'a> WorkflowEngine<'a> {
                 if let Some(tool_engine) = self.tool_engine {
                     tool_engine.validate_mcp_tool_call(server_id, tool_name)?;
                 }
-                Err(anyhow!(
-                    "MCP workflow nodes are unsupported until the workflow engine is wired to the MCP runtime"
-                ))
+
+                if server_id == "builtin" {
+                    return self.execute_builtin_tool(tool_name, config).await;
+                }
+
+                let mcp_manager = self
+                    .mcp_manager
+                    .ok_or_else(|| anyhow!("MCP runtime is unavailable for workflow execution"))?;
+                mcp_manager
+                    .call_tool(server_id, tool_name, config.get("arguments").cloned())
+                    .await
             }
 
             NodeKind::Llm => {
-                Err(anyhow!(
-                    "LLM workflow nodes are unsupported until workflow execution is wired to the AI provider runtime"
-                ))
+                let ai_engine = self
+                    .ai_engine
+                    .ok_or_else(|| anyhow!("AI runtime is unavailable for workflow execution"))?;
+                let provider = self.provider.as_ref().ok_or_else(|| {
+                    anyhow!("Workflow LLM node requires an enabled active provider")
+                })?;
+                let prompt = config
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Summarize the workflow context.");
+                let input_key = config.get("input_key").and_then(|v| v.as_str());
+                let grounded_input = input_key
+                    .and_then(|key| context.get(key))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::to_value(context).unwrap_or(json!({})));
+                let messages = vec![
+                    runtime_chat_message(MessageRole::System, "You are executing a Datrina workflow LLM node. Return concise content for downstream workflow nodes."),
+                    runtime_chat_message(
+                        MessageRole::User,
+                        &format!("Prompt: {}\nWorkflow context JSON: {}", prompt, grounded_input),
+                    ),
+                ];
+                let response = ai_engine.complete_chat(provider, &messages).await?;
+                Ok(json!({
+                    "content": response.content,
+                    "provider_id": response.provider_id,
+                    "model": response.model,
+                    "tokens": response.tokens,
+                    "latency_ms": response.latency_ms,
+                }))
             }
 
             NodeKind::Transform => {
@@ -279,6 +343,51 @@ impl<'a> WorkflowEngine<'a> {
         }
     }
 
+    async fn execute_builtin_tool(&self, tool_name: &str, config: &Value) -> Result<Value> {
+        let tool_engine = self
+            .tool_engine
+            .ok_or_else(|| anyhow!("Tool runtime is unavailable for workflow execution"))?;
+        match tool_name {
+            "http_request" => {
+                let arguments = config.get("arguments").unwrap_or(config);
+                let method = arguments
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("GET");
+                let url = arguments
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("http_request requires url"))?;
+                tool_engine
+                    .http_request(
+                        method,
+                        url,
+                        arguments.get("body").cloned(),
+                        arguments.get("headers").cloned(),
+                    )
+                    .await
+            }
+            "curl" => {
+                let args = config
+                    .get("arguments")
+                    .and_then(|v| v.get("args"))
+                    .or_else(|| config.get("args"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("curl workflow tool requires args"))?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(ToString::to_string)
+                            .ok_or_else(|| anyhow!("curl args must be strings"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                tool_engine.execute_curl(args).await
+            }
+            other => Err(anyhow!("Unsupported built-in workflow tool '{}'", other)),
+        }
+    }
+
     fn event(
         kind: WorkflowEventKind,
         workflow: &Workflow,
@@ -370,6 +479,19 @@ impl<'a> WorkflowEngine<'a> {
 impl<'a> Default for WorkflowEngine<'a> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn runtime_chat_message(role: MessageRole, content: &str) -> ChatMessage {
+    ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role,
+        content: content.to_string(),
+        mode: ChatMode::Context,
+        tool_calls: None,
+        tool_results: None,
+        metadata: None,
+        timestamp: chrono::Utc::now().timestamp_millis(),
     }
 }
 
@@ -489,7 +611,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("LLM workflow nodes are unsupported"));
+            .contains("AI runtime is unavailable"));
 
         Ok(())
     }
