@@ -37,7 +37,6 @@
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-fs": "^2.0.0",
-    "@tauri-apps/plugin-shell": "^2.0.0",
     "@tauri-apps/plugin-sql": "^2.0.0",
     "@tauri-apps/plugin-store": "^2.0.0",
     "ai": "^4.0.0",

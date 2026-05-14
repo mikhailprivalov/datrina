@@ -713,6 +713,65 @@ Parallelism:
   or command request/response shapes. Those changes must be serialized through
   the W10 integration owner.
 
+### W11 - Opener Plugin Migration
+
+Status: implemented
+
+Depends on: W10
+
+Owner role: production-readiness cleanup agent
+
+Ownership:
+
+- `datrina/src-tauri/Cargo.toml`
+- `datrina/src-tauri/src/main.rs`
+- `datrina/src-tauri/src/commands/system.rs`
+- `datrina/package.json`
+- `datrina/bun.lock`
+- `datrina/src-tauri/gen/schemas/*`
+- targeted validation/docs updates under `datrina/docs/` and `datrina/README.md`
+
+Scope:
+
+- Replace the deprecated `tauri_plugin_shell::Shell::open` path used by the
+  Rust `open_url` command with the accepted Tauri opener plugin path.
+- Keep the existing frontend/Rust command contract unchanged:
+  `systemApi.openUrl` still invokes `open_url` and expects void success
+  semantics.
+- Remove the resolved deprecation residual from public validation notes and the
+  residual backlog.
+- Remove unused frontend shell plugin dependency if no frontend code imports it.
+
+Out of scope:
+
+- New frontend opener APIs.
+- Broader production packaging or icon work.
+- Public HTTP/API behavior.
+
+Acceptance checks:
+
+- Tauri config JSON parse succeeds.
+- `bun run check:contract` passes.
+- `bun run typecheck` passes.
+- `bun run build` passes.
+- `cargo fmt --all --check` passes.
+- `cargo check --workspace --all-targets` passes without the previous
+  `tauri_plugin_shell::Shell::open` deprecation warning.
+
+Completion notes:
+
+- W11 validation is recorded in `docs/W11_OPENER_PLUGIN_MIGRATION.md`.
+- `open_url` now uses `tauri_plugin_opener::OpenerExt`.
+- `tauri-plugin-shell` was replaced with `tauri-plugin-opener` because no other
+  Rust shell plugin usage remained in the codebase.
+- Tauri generated schemas now expose opener permissions instead of shell
+  permissions.
+
+Parallelism:
+
+- Serial cleanup after W10. Do not overlap with work that changes system command
+  registration or Tauri plugin bootstrap.
+
 ## Parallelization Model
 
 Recommended agent queue:
@@ -725,6 +784,8 @@ Recommended agent queue:
 6. Run W9 as final docs/review.
 7. Run W10 as the product-completion stream after W9, promoting selected
    residuals into real end-to-end runtime behavior.
+8. Run W11 as a narrow production-readiness cleanup for the opener plugin
+   migration.
 
 Do not give two agents simultaneous ownership of `src/lib/api.ts`, `src-tauri/src/models/*`, or command request/response shapes. Contract drift is already the main risk.
 
