@@ -8,7 +8,6 @@ This backlog records deferred features from the reconciliation plan. Items here 
 
 - Replace local-only plaintext SQLite fallback for provider secrets and MCP environment values with encrypted OS keychain/keyring storage.
 - Restore production bundle packaging, production icon sets, and platform distribution checks.
-- Replace the deprecated `tauri_plugin_shell::Shell::open` usage with the accepted opener path.
 
 ## Workflow And Scheduler
 

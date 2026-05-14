@@ -120,7 +120,6 @@ cargo check --workspace --all-targets
 Expected baseline notes:
 
 - `bun run build` may report a non-failing Vite chunk-size warning.
-- `cargo check --workspace --all-targets` may report a non-failing deprecation warning for `tauri_plugin_shell::Shell::open`.
 - `src-tauri/tauri.conf.json` has bundle packaging disabled for the baseline.
 
 ## Configuration
@@ -150,12 +149,13 @@ Allowed stdio process commands in the current policy baseline:
 
 Agent execution and reconciliation history live in `docs/`:
 
-- `docs/RECONCILIATION_PLAN.md`: historical W0-W9 execution contract.
+- `docs/RECONCILIATION_PLAN.md`: historical W0-W11 execution contract.
 - `docs/DECISIONS.md`: accepted P0 runtime decisions and post-MVP exclusions.
 - `docs/W*_*.md`: accepted baseline reports from individual workstreams.
 - `docs/RESIDUAL_BACKLOG.md`: concise backlog for deferred work after the MVP baseline.
 - `docs/W9_DOCS_CLOSEOUT.md`: W9 closeout and validation record.
 - `docs/W10_END_TO_END_PRODUCT_RUNTIME.md`: W10 implementation and validation record.
+- `docs/W11_OPENER_PLUGIN_MIGRATION.md`: W11 opener migration validation record.
 
 ## Project Structure
 
