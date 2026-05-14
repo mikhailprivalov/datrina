@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import type { CreateProviderRequest, LLMProvider, ProviderTestResult } from '../../lib/api';
+import type { CreateProviderRequest, LLMProvider, ProviderTestResult, UpdateProviderRequest } from '../../lib/api';
 
 type ProviderKind = LLMProvider['kind'];
 
@@ -11,6 +11,8 @@ interface Props {
   error: string | null;
   onClose: () => void;
   onAddProvider: (provider: CreateProviderRequest) => Promise<void>;
+  onUpdateProvider: (id: string, provider: UpdateProviderRequest) => Promise<void>;
+  onSetProviderEnabled: (id: string, isEnabled: boolean) => Promise<void>;
   onRemoveProvider: (id: string) => Promise<void>;
   onSetActiveProvider: (id: string) => Promise<void>;
   onTestProvider: (id: string) => Promise<ProviderTestResult>;
@@ -55,6 +57,8 @@ export function ProviderSettings({
   error,
   onClose,
   onAddProvider,
+  onUpdateProvider,
+  onSetProviderEnabled,
   onRemoveProvider,
   onSetActiveProvider,
   onTestProvider,
@@ -62,6 +66,7 @@ export function ProviderSettings({
   const [draft, setDraft] = useState<CreateProviderRequest>(PROVIDER_TEMPLATES.local_mock);
   const [apiKey, setApiKey] = useState('');
   const [modelsText, setModelsText] = useState(PROVIDER_TEMPLATES.local_mock.models?.join(', ') ?? '');
+  const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
 
@@ -79,6 +84,28 @@ export function ProviderSettings({
     setLocalError(null);
   };
 
+  const editProvider = (provider: LLMProvider) => {
+    setEditingProviderId(provider.id);
+    setDraft({
+      name: provider.name,
+      kind: provider.kind,
+      base_url: provider.base_url,
+      default_model: provider.default_model,
+      models: provider.models,
+    });
+    setApiKey('');
+    setModelsText(provider.models.join(', '));
+    setTestResult(null);
+    setLocalError(null);
+  };
+
+  const resetDraft = () => {
+    setEditingProviderId(null);
+    setDraft(PROVIDER_TEMPLATES.local_mock);
+    setApiKey('');
+    setModelsText(PROVIDER_TEMPLATES.local_mock.models?.join(', ') ?? '');
+  };
+
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     setLocalError(null);
@@ -91,14 +118,20 @@ export function ProviderSettings({
       .filter(Boolean);
 
     try {
-      await onAddProvider({
+      const payload = {
         ...draft,
         name: draft.name.trim(),
         base_url: draft.base_url.trim(),
         default_model: draft.default_model.trim(),
         api_key: trimmedApiKey ? trimmedApiKey : undefined,
         models,
-      });
+      };
+      if (editingProviderId) {
+        await onUpdateProvider(editingProviderId, payload);
+        resetDraft();
+      } else {
+        await onAddProvider(payload);
+      }
       if (!initialSetup) {
         setApiKey('');
       }
@@ -233,8 +266,17 @@ export function ProviderSettings({
                 disabled={!canSubmit}
                 className="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {initialSetup ? 'Save and continue' : 'Add provider'}
+                {editingProviderId ? 'Save changes' : initialSetup ? 'Save and continue' : 'Add provider'}
               </button>
+              {editingProviderId && (
+                <button
+                  type="button"
+                  onClick={resetDraft}
+                  className="rounded-lg border border-border px-4 py-2 text-sm transition-colors hover:bg-muted"
+                >
+                  Cancel edit
+                </button>
+              )}
               {initialSetup && draft.kind !== 'local_mock' && (
                 <button
                   type="button"
@@ -290,6 +332,22 @@ export function ProviderSettings({
                         className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         Test
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => editProvider(provider)}
+                        disabled={isBusy}
+                        className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onSetProviderEnabled(provider.id, !provider.is_enabled)}
+                        disabled={isBusy}
+                        className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {provider.is_enabled ? 'Disable' : 'Enable'}
                       </button>
                       <button
                         type="button"

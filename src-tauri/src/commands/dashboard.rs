@@ -4,9 +4,12 @@ use tauri::{AppHandle, Emitter, State};
 use tracing::info;
 
 use crate::models::dashboard::{
-    CreateDashboardRequest, CreateDashboardTemplate, Dashboard, UpdateDashboardRequest,
+    AddWidgetRequest, ApplyBuildChangeRequest, BuildChangeAction, CreateDashboardRequest,
+    CreateDashboardTemplate, Dashboard, DashboardWidgetType, UpdateDashboardRequest,
 };
-use crate::models::widget::{DatasourceConfig, GaugeConfig, GaugeThreshold, Widget};
+use crate::models::widget::{
+    DatasourceConfig, GaugeConfig, GaugeThreshold, TextAlign, TextConfig, TextFormat, Widget,
+};
 use crate::models::workflow::{
     NodeKind, RunStatus, TriggerKind, Workflow, WorkflowEdge, WorkflowNode, WorkflowTrigger,
     WORKFLOW_EVENT_CHANNEL,
@@ -104,6 +107,81 @@ pub async fn update_dashboard(
 }
 
 #[tauri::command]
+pub async fn add_dashboard_widget(
+    state: State<'_, AppState>,
+    dashboard_id: String,
+    req: AddWidgetRequest,
+) -> Result<ApiResult<Dashboard>, String> {
+    Ok(
+        match add_widget_to_dashboard(&state, &dashboard_id, req).await {
+            Ok(dashboard) => ApiResult::ok(dashboard),
+            Err(e) => ApiResult::err(e.to_string()),
+        },
+    )
+}
+
+#[tauri::command]
+pub async fn apply_build_change(
+    state: State<'_, AppState>,
+    req: ApplyBuildChangeRequest,
+) -> Result<ApiResult<Dashboard>, String> {
+    let result = match req.action {
+        BuildChangeAction::CreateLocalDashboard => {
+            let name = req
+                .title
+                .unwrap_or_else(|| "AI Build Dashboard".to_string());
+            create_dashboard(
+                state,
+                CreateDashboardRequest {
+                    name,
+                    description: Some(
+                        "Created through an explicit build-chat apply command.".to_string(),
+                    ),
+                    template: Some(CreateDashboardTemplate::LocalMvp),
+                },
+            )
+            .await
+        }
+        BuildChangeAction::AddTextWidget => {
+            let dashboard_id = match req.dashboard_id {
+                Some(id) => id,
+                None => return Ok(ApiResult::err("dashboard_id is required".to_string())),
+            };
+            add_dashboard_widget(
+                state,
+                dashboard_id,
+                AddWidgetRequest {
+                    widget_type: DashboardWidgetType::Text,
+                    title: req.title.unwrap_or_else(|| "Build note".to_string()),
+                    content: req.content,
+                    value: None,
+                },
+            )
+            .await
+        }
+        BuildChangeAction::AddGaugeWidget => {
+            let dashboard_id = match req.dashboard_id {
+                Some(id) => id,
+                None => return Ok(ApiResult::err("dashboard_id is required".to_string())),
+            };
+            add_dashboard_widget(
+                state,
+                dashboard_id,
+                AddWidgetRequest {
+                    widget_type: DashboardWidgetType::Gauge,
+                    title: req.title.unwrap_or_else(|| "Build metric".to_string()),
+                    content: None,
+                    value: req.value,
+                },
+            )
+            .await
+        }
+    };
+
+    result
+}
+
+#[tauri::command]
 pub async fn delete_dashboard(
     state: State<'_, AppState>,
     id: String,
@@ -138,6 +216,45 @@ async fn persist_dashboard_with_workflows(
     }
     state.storage.create_dashboard(dashboard).await?;
     Ok(())
+}
+
+async fn add_widget_to_dashboard(
+    state: &State<'_, AppState>,
+    dashboard_id: &str,
+    req: AddWidgetRequest,
+) -> AnyResult<Dashboard> {
+    let mut dashboard = state
+        .storage
+        .get_dashboard(dashboard_id)
+        .await?
+        .ok_or_else(|| anyhow!("Dashboard not found"))?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let next_y = dashboard
+        .layout
+        .iter()
+        .map(|widget| widget_position_bottom(widget))
+        .max()
+        .unwrap_or(0);
+    let (widget, workflow) = match req.widget_type {
+        DashboardWidgetType::Text => local_text_widget(
+            req.title,
+            req.content
+                .unwrap_or_else(|| "Build note saved locally.".to_string()),
+            next_y,
+            now,
+        ),
+        DashboardWidgetType::Gauge => {
+            local_gauge_widget(req.title, req.value.unwrap_or(64.0), next_y, now)
+        }
+    };
+
+    state.storage.create_workflow(&workflow).await?;
+    dashboard.workflows.push(workflow);
+    dashboard.layout.push(widget);
+    dashboard.updated_at = now;
+    state.storage.update_dashboard(&dashboard).await?;
+    Ok(dashboard)
 }
 
 async fn refresh_widget_inner(
@@ -180,7 +297,12 @@ async fn refresh_widget_inner(
             .ok_or_else(|| anyhow!("Datasource workflow not found"))?,
     };
 
-    let engine = WorkflowEngine::with_tool_engine(state.tool_engine.as_ref());
+    let engine = WorkflowEngine::with_runtime(
+        state.tool_engine.as_ref(),
+        state.mcp_manager.as_ref(),
+        state.ai_engine.as_ref(),
+        active_provider(state).await?,
+    );
     let execution = engine.execute(&workflow, None).await?;
     let run = execution.run;
 
@@ -214,6 +336,36 @@ async fn refresh_widget_inner(
         "workflow_run_id": run.id,
         "data": data,
     }))
+}
+
+async fn active_provider(
+    state: &State<'_, AppState>,
+) -> AnyResult<Option<crate::models::provider::LLMProvider>> {
+    let providers = state.storage.list_providers().await?;
+    let active_provider_id = state
+        .storage
+        .get_config("active_provider_id")
+        .await?
+        .filter(|id| !id.trim().is_empty());
+    Ok(active_provider_id
+        .as_deref()
+        .and_then(|id| {
+            providers
+                .iter()
+                .find(|provider| provider.id == id && provider.is_enabled)
+        })
+        .or_else(|| providers.iter().find(|provider| provider.is_enabled))
+        .cloned())
+}
+
+fn widget_position_bottom(widget: &Widget) -> i32 {
+    match widget {
+        Widget::Chart { y, h, .. }
+        | Widget::Text { y, h, .. }
+        | Widget::Table { y, h, .. }
+        | Widget::Image { y, h, .. }
+        | Widget::Gauge { y, h, .. } => y + h,
+    }
 }
 
 fn extract_output<'a>(node_results: &'a Value, output_key: &str) -> Option<&'a Value> {
@@ -385,6 +537,140 @@ fn local_mvp_slice(now: i64) -> (Vec<Widget>, Vec<Workflow>) {
     };
 
     (vec![widget], vec![workflow])
+}
+
+fn local_text_widget(title: String, content: String, y: i32, now: i64) -> (Widget, Workflow) {
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let widget_id = uuid::Uuid::new_v4().to_string();
+    let workflow = single_output_workflow(
+        workflow_id.clone(),
+        "Local text widget refresh".to_string(),
+        json!(content),
+        "content".to_string(),
+        now,
+    );
+
+    let widget = Widget::Text {
+        id: widget_id,
+        title,
+        x: 0,
+        y,
+        w: 6,
+        h: 3,
+        config: TextConfig {
+            format: TextFormat::Markdown,
+            font_size: 14,
+            color: None,
+            align: TextAlign::Left,
+        },
+        datasource: Some(DatasourceConfig {
+            workflow_id,
+            output_key: "output.content".to_string(),
+            post_process: None,
+        }),
+    };
+
+    (widget, workflow)
+}
+
+fn local_gauge_widget(title: String, value: f64, y: i32, now: i64) -> (Widget, Workflow) {
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let widget_id = uuid::Uuid::new_v4().to_string();
+    let workflow = single_output_workflow(
+        workflow_id.clone(),
+        "Local gauge widget refresh".to_string(),
+        json!(value),
+        "value".to_string(),
+        now,
+    );
+
+    let widget = Widget::Gauge {
+        id: widget_id,
+        title,
+        x: 0,
+        y,
+        w: 4,
+        h: 4,
+        config: GaugeConfig {
+            min: 0.0,
+            max: 100.0,
+            unit: Some("%".to_string()),
+            thresholds: Some(vec![
+                GaugeThreshold {
+                    value: 50.0,
+                    color: "hsl(0 72% 50%)".to_string(),
+                    label: Some("Low".to_string()),
+                },
+                GaugeThreshold {
+                    value: 80.0,
+                    color: "hsl(38 92% 50%)".to_string(),
+                    label: Some("Good".to_string()),
+                },
+                GaugeThreshold {
+                    value: 100.0,
+                    color: "hsl(142 76% 36%)".to_string(),
+                    label: Some("High".to_string()),
+                },
+            ]),
+            show_value: true,
+        },
+        datasource: Some(DatasourceConfig {
+            workflow_id,
+            output_key: "output.value".to_string(),
+            post_process: None,
+        }),
+    };
+
+    (widget, workflow)
+}
+
+fn single_output_workflow(
+    workflow_id: String,
+    name: String,
+    value: Value,
+    output_key: String,
+    now: i64,
+) -> Workflow {
+    Workflow {
+        id: workflow_id,
+        name,
+        description: Some(
+            "Deterministic local workflow created by an explicit apply command.".to_string(),
+        ),
+        nodes: vec![
+            WorkflowNode {
+                id: "source".to_string(),
+                kind: NodeKind::Datasource,
+                label: "Local applied value".to_string(),
+                position: None,
+                config: Some(json!({ "data": value })),
+            },
+            WorkflowNode {
+                id: "output".to_string(),
+                kind: NodeKind::Output,
+                label: "Widget output".to_string(),
+                position: None,
+                config: Some(json!({
+                    "input_node": "source",
+                    "output_key": output_key
+                })),
+            },
+        ],
+        edges: vec![WorkflowEdge {
+            id: "source-to-output".to_string(),
+            source: "source".to_string(),
+            target: "output".to_string(),
+            condition: None,
+        }],
+        trigger: WorkflowTrigger {
+            kind: TriggerKind::Manual,
+            config: None,
+        },
+        is_enabled: true,
+        last_run: None,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 trait WidgetDatasource {

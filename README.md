@@ -1,6 +1,6 @@
 # Datrina The Lenswright
 
-Datrina is a local-first Tauri v2 desktop app for building and refreshing AI-assisted dashboards. The current MVP baseline is a desktop application with a React UI, Rust command backend, SQLite persistence, Rust-mediated chat providers, and one deterministic local dashboard slice.
+Datrina is a local-first Tauri v2 desktop app for building and refreshing AI-assisted dashboards. The current product runtime is a desktop application with a React UI, Rust command backend, SQLite persistence, Rust-mediated chat providers, explicit build-apply commands, policy-gated tool/workflow execution, and deterministic local dashboard paths.
 
 The active implementation boundary is:
 
@@ -19,16 +19,22 @@ Implemented and validated in the reconciliation baseline:
 - Built-in `local_mvp` dashboard template with a deterministic local datasource workflow and gauge widget.
 - Widget refresh through Rust, including persisted workflow run state and `workflow:event` emission.
 - Rust-mediated provider and chat boundary for OpenRouter, Ollama, OpenAI-compatible custom providers, and deterministic `local_mock`.
+- Provider add/update/re-key/enable/disable/test flows through Rust commands; provider secrets are not returned to React.
+- Context chat is grounded with the selected dashboard, widgets, and workflow run state before provider execution.
+- Build chat changes are applied only through explicit UI controls backed by Rust commands.
+- Dashboard widget creation UI for local text and gauge widgets, each backed by a deterministic persisted workflow.
+- Workflow `llm` nodes execute through the same Rust AI provider runtime used by chat.
+- Workflow MCP/built-in tool nodes execute through the Rust `ToolEngine`/MCP gateway or fail with explicit policy/runtime errors.
+- Scheduler cron jobs created through workflow commands execute through the same persisted workflow run path as manual execution.
 - Honest no-key chat behavior: without an enabled provider or `local_mock`, chat returns an unavailable/error state instead of fake assistant output.
 - Stdio MCP server configuration, persisted server records, process lifecycle plumbing, and validation through the Rust tool policy gateway.
 - Tool security baseline with one Rust gateway for built-in tools, stdio MCP process validation, network URL policy, and audit logging.
 
 In-progress or intentionally limited in the MVP:
 
-- Scheduler support is registration-only. Cron matches are logged, but scheduled workflow execution is deferred.
-- MCP and LLM workflow node execution returns explicit unsupported/errors where not wired into the MVP slice.
 - Widget post-process steps are unavailable in the MVP vertical slice.
-- Chat is one provider response at a time. Dashboard generation, tool calling, and multi-step agent behavior are not enabled.
+- Chat is one provider response at a time. Provider-driven tool schema emission, streaming chat events, and multi-step agent resume loops are not enabled.
+- Real-provider behavior requires user-provided credentials/service availability; credential-free validation uses `local_mock`.
 - Provider and MCP secrets are Rust-owned and masked before reaching React, but the MVP fallback stores them as local-only plaintext SQLite data under the Tauri app data directory. Encrypted OS keychain/keyring storage is a production follow-up.
 - Production packaging is not restored in the baseline; bundle packaging and final icon sets are deferred.
 
@@ -65,7 +71,7 @@ Planned, not MVP-supported:
 │  │  ├── AI Provider Runtime            │    │
 │  │  ├── MCP Manager (stdio baseline)   │    │
 │  │  ├── Tool Engine (policy gateway)   │    │
-│  │  └── Scheduler (registration-only)  │    │
+│  │  └── Scheduler (persisted runner)   │    │
 │  └─────────────────────────────────────┘    │
 └─────────────────────────────────────────────┘
 ```
@@ -81,7 +87,7 @@ Planned, not MVP-supported:
 | Storage | SQLite through `sqlx` |
 | AI | Rust-mediated OpenRouter, Ollama, OpenAI-compatible custom providers, `local_mock` |
 | MCP | Stdio baseline with Rust policy validation |
-| Scheduling | `tokio-cron-scheduler` registration baseline |
+| Scheduling | `tokio-cron-scheduler` with persisted workflow execution |
 
 ## Prerequisites
 
@@ -149,6 +155,7 @@ Agent execution and reconciliation history live in `docs/`:
 - `docs/W*_*.md`: accepted baseline reports from individual workstreams.
 - `docs/RESIDUAL_BACKLOG.md`: concise backlog for deferred work after the MVP baseline.
 - `docs/W9_DOCS_CLOSEOUT.md`: W9 closeout and validation record.
+- `docs/W10_END_TO_END_PRODUCT_RUNTIME.md`: W10 implementation and validation record.
 
 ## Project Structure
 

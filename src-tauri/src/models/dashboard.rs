@@ -43,3 +43,41 @@ pub struct UpdateDashboardRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflows: Option<Vec<Workflow>>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddWidgetRequest {
+    pub widget_type: DashboardWidgetType,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardWidgetType {
+    Text,
+    Gauge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyBuildChangeRequest {
+    pub action: BuildChangeAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildChangeAction {
+    CreateLocalDashboard,
+    AddTextWidget,
+    AddGaugeWidget,
+}

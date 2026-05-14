@@ -582,7 +582,7 @@ Parallelism:
 
 ### W10 - End-To-End Product Runtime
 
-Status: proposed
+Status: implemented with residuals
 
 Depends on: W9, plus accepted runtime baselines from W3, W4, W5, W6, W7, W8
 
@@ -679,6 +679,29 @@ Acceptance checks:
 - No new hidden placeholder success paths appear; sample/demo behavior is
   visibly labeled as such.
 - README/docs are updated only after behavior is implemented and validated.
+
+Completion notes:
+
+- W10 validation is recorded in `docs/W10_END_TO_END_PRODUCT_RUNTIME.md`.
+- Provider settings can add, update, re-key, enable, disable, select, and test
+  providers through Rust commands.
+- Provider calls use a bounded request timeout, OpenRouter-specific headers,
+  structured error prefixes, token usage capture when available, and latency
+  metadata.
+- Context chat prepends selected dashboard/widget/workflow-run context before
+  provider execution.
+- Build chat exposes visible apply controls. Dashboard creation and local
+  text/gauge widget addition are applied only through Rust commands and persisted
+  dashboard/workflow updates.
+- Workflow `llm` nodes execute through the Rust AI provider runtime. Workflow
+  MCP and built-in tool nodes execute through the `ToolEngine`/MCP gateway or
+  fail with explicit policy/runtime errors.
+- Scheduler cron jobs registered through workflow creation execute through the
+  same persisted workflow engine path used by manual runs.
+- Remaining W10 residuals are provider-driven chat tool schema emission/parsing,
+  bounded provider tool-call resume loops, typed streaming events, full widget
+  editing forms, widget post-process execution, and live real-provider
+  verification with user-provided credentials/service availability.
 
 Parallelism:
 

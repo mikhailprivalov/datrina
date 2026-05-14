@@ -289,6 +289,16 @@ export interface CreateProviderRequest {
   models?: string[];
 }
 
+export interface UpdateProviderRequest {
+  name?: string;
+  kind?: LLMProvider['kind'];
+  base_url?: string;
+  api_key?: string;
+  default_model?: string;
+  models?: string[];
+  is_enabled?: boolean;
+}
+
 export interface ProviderTestResult {
   status: 'ok' | 'invalid_config' | 'unavailable' | 'unsupported';
   provider_id: string;
@@ -353,6 +363,17 @@ export const dashboardApi = {
     call<Dashboard>('create_dashboard', { req: { name, description, template } }),
   update: (id: string, data: Partial<Dashboard>) =>
     call<Dashboard>('update_dashboard', { id, req: data }),
+  addWidget: (
+    dashboardId: string,
+    widget: { widget_type: 'text' | 'gauge'; title: string; content?: string; value?: number }
+  ) => call<Dashboard>('add_dashboard_widget', { dashboardId, req: widget }),
+  applyBuildChange: (req: {
+    action: 'create_local_dashboard' | 'add_text_widget' | 'add_gauge_widget';
+    dashboard_id?: string;
+    title?: string;
+    content?: string;
+    value?: number;
+  }) => call<Dashboard>('apply_build_change', { req }),
   delete: (id: string) => call<boolean>('delete_dashboard', { id }),
   refreshWidget: (dashboardId: string, widgetId: string) =>
     call<WidgetRefreshResult>('refresh_widget', { dashboardId, widgetId }),
@@ -388,6 +409,10 @@ export const mcpApi = {
 export const providerApi = {
   list: () => call<LLMProvider[]>('list_providers'),
   add: (provider: CreateProviderRequest) => call<LLMProvider>('add_provider', { req: provider }),
+  update: (id: string, provider: UpdateProviderRequest) =>
+    call<LLMProvider>('update_provider', { id, req: provider }),
+  setEnabled: (id: string, isEnabled: boolean) =>
+    call<LLMProvider>('set_provider_enabled', { id, isEnabled }),
   remove: (id: string) => call<boolean>('remove_provider', { id }),
   test: (id: string) => call<ProviderTestResult>('test_provider', { id }),
 };
