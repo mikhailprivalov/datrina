@@ -22,8 +22,10 @@ Implemented and validated in the reconciliation baseline:
 - Provider add/update/re-key/enable/disable/test flows through Rust commands; provider secrets are not returned to React.
 - Context chat is grounded with the selected dashboard, widgets, and workflow run state before provider execution.
 - Build chat requests provider-generated structured dashboard/widget proposals with explicit executable datasource plans, previews them in the UI, and applies them only after explicit confirmation through Rust commands.
+- OpenAI-compatible chat providers stream assistant content through typed Tauri `chat:event` events while Rust remains the only provider caller.
+- Provider-supplied public reasoning fields, when present, render in a separated visible reasoning region without requesting or exposing hidden chain-of-thought.
 - Proposal apply can create chart, table, text, gauge, and image widgets with persisted datasource workflows backed by `ToolEngine`, stdio MCP, or Rust-mediated provider execution.
-- Provider-driven chat tool calling emits OpenAI-compatible tool schemas, executes safe built-in `http_request` calls and configured stdio MCP tool calls through the Rust policy gateway, persists visible tool results/errors, and resumes once for the final assistant response.
+- Provider-driven chat tool calling emits OpenAI-compatible tool schemas, executes safe built-in `http_request` calls and configured stdio MCP tool calls through the Rust policy gateway, streams masked tool activity, persists visible tool results/errors, and resumes once for the final assistant response.
 - Dashboard widget creation UI for local text and gauge widgets, each backed by a deterministic persisted workflow.
 - Workflow `llm` nodes execute through the same Rust AI provider runtime used by chat.
 - Workflow MCP/built-in tool nodes reconnect persisted enabled stdio MCP servers before execution, then execute through the Rust `ToolEngine`/MCP gateway or fail with explicit policy/runtime errors.
@@ -37,7 +39,8 @@ Implemented and validated in the reconciliation baseline:
 In-progress or intentionally limited in the MVP:
 
 - Widget post-process steps are unavailable in the current product path.
-- Chat supports a bounded one-resume tool loop for safe built-in HTTP requests and configured stdio MCP tools; streaming chat events and arbitrary multi-step agent loops are not enabled.
+- Chat supports a bounded one-resume tool loop for safe built-in HTTP requests and configured stdio MCP tools; arbitrary multi-step agent loops are not enabled.
+- `local_mock` and Ollama chat paths use synthetic single-step chat events rather than live token streaming.
 - Real-provider behavior requires user-provided credentials/service availability; credential-free validation uses `local_mock` dev/test mode and is not live acceptance evidence.
 - Provider and MCP secrets are Rust-owned and masked before reaching React, but the MVP fallback stores them as local-only plaintext SQLite data under the Tauri app data directory. Encrypted OS keychain/keyring storage is a production follow-up.
 - Production packaging is not restored in the baseline; bundle packaging and final icon sets are deferred.
@@ -160,6 +163,7 @@ Agent execution and reconciliation history live in `docs/`:
 - `docs/W11_OPENER_PLUGIN_MIGRATION.md`: W11 opener migration validation record.
 - `docs/W12_PROVIDER_DRIVEN_AGENTIC_DASHBOARD_BUILDER.md`: W12 provider proposal validation record.
 - `docs/W13_DURABLE_REAL_RUNTIME_PIPELINE.md`: W13 durable runtime validation record.
+- `docs/W14_CHAT_STREAMING_TRACE_UI.md`: W14 chat streaming and observability validation record.
 
 ## Project Structure
 

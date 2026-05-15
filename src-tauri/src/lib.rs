@@ -13,6 +13,7 @@ use modules::scheduler::Scheduler;
 use modules::storage::Storage;
 use modules::tool_engine::ToolEngine;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -23,6 +24,7 @@ pub struct AppState {
     pub scheduler: Arc<Mutex<Scheduler>>,
     pub tool_engine: Arc<ToolEngine>,
     pub ai_engine: Arc<AIEngine>,
+    pub chat_abort_flags: Arc<dashmap::DashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -71,6 +73,7 @@ impl AppState {
             scheduler,
             tool_engine,
             ai_engine,
+            chat_abort_flags: Arc::new(dashmap::DashMap::new()),
         })
     }
 }
@@ -115,6 +118,8 @@ macro_rules! generate_handler {
             $crate::commands::chat::get_session,
             $crate::commands::chat::create_session,
             $crate::commands::chat::send_message,
+            $crate::commands::chat::send_message_stream,
+            $crate::commands::chat::cancel_chat_response,
             $crate::commands::chat::delete_session,
             // MCP commands
             $crate::commands::mcp::list_servers,

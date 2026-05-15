@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
+use futures::StreamExt;
 use reqwest::{header, Client};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::models::chat::{ChatMessage, MessageRole, ToolCall};
@@ -21,6 +23,12 @@ pub struct AIResponse {
     pub tokens: Option<crate::models::chat::TokenUsage>,
     pub latency_ms: u64,
     pub tool_calls: Vec<ToolCall>,
+    pub reasoning: Option<String>,
+}
+
+pub enum AIStreamEvent {
+    ContentDelta(String),
+    ReasoningDelta(String),
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +72,7 @@ impl AIEngine {
                 content: local_mock_response(messages),
                 tokens: Some(local_mock_tokens(messages)),
                 tool_calls: vec![],
+                reasoning: None,
             },
             ProviderKind::Ollama => self.complete_ollama(provider, messages).await?,
             ProviderKind::Openrouter | ProviderKind::Custom => {
@@ -79,6 +88,63 @@ impl AIEngine {
             tokens: completion.tokens,
             latency_ms: started.elapsed().as_millis() as u64,
             tool_calls: completion.tool_calls,
+            reasoning: completion.reasoning,
+        })
+    }
+
+    pub async fn complete_chat_with_tools_streaming<F, C>(
+        &self,
+        provider: &LLMProvider,
+        messages: &[ChatMessage],
+        tools: &[AIToolSpec],
+        mut on_event: F,
+        is_cancelled: C,
+    ) -> Result<AIResponse>
+    where
+        F: FnMut(AIStreamEvent),
+        C: Fn() -> bool,
+    {
+        validate_provider(provider)?;
+
+        let started = Instant::now();
+        let completion = match provider.kind {
+            ProviderKind::Openrouter | ProviderKind::Custom => {
+                self.complete_openai_compatible_streaming(
+                    provider,
+                    messages,
+                    tools,
+                    &mut on_event,
+                    is_cancelled,
+                )
+                .await?
+            }
+            ProviderKind::LocalMock => {
+                let content = local_mock_response(messages);
+                on_event(AIStreamEvent::ContentDelta(content.clone()));
+                AICompletion {
+                    content,
+                    tokens: Some(local_mock_tokens(messages)),
+                    tool_calls: vec![],
+                    reasoning: None,
+                }
+            }
+            ProviderKind::Ollama => {
+                let completion = self.complete_ollama(provider, messages).await?;
+                if !completion.content.is_empty() {
+                    on_event(AIStreamEvent::ContentDelta(completion.content.clone()));
+                }
+                completion
+            }
+        };
+
+        Ok(AIResponse {
+            content: completion.content,
+            provider_id: provider.id.clone(),
+            model: provider.default_model.clone(),
+            tokens: completion.tokens,
+            latency_ms: started.elapsed().as_millis() as u64,
+            tool_calls: completion.tool_calls,
+            reasoning: completion.reasoning,
         })
     }
 
@@ -228,6 +294,167 @@ impl AIEngine {
                 completion: usage.completion_tokens.unwrap_or(0),
             }),
             tool_calls,
+            reasoning: message.reasoning.or(message.reasoning_content),
+        })
+    }
+
+    async fn complete_openai_compatible_streaming<F, C>(
+        &self,
+        provider: &LLMProvider,
+        messages: &[ChatMessage],
+        tools: &[AIToolSpec],
+        on_event: &mut F,
+        is_cancelled: C,
+    ) -> Result<AICompletion>
+    where
+        F: FnMut(AIStreamEvent),
+        C: Fn() -> bool,
+    {
+        let endpoint = openai_chat_endpoint(&provider.base_url)?;
+        let mut payload = json!({
+            "model": provider.default_model,
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "messages": to_openai_messages(messages),
+        });
+
+        if !tools.is_empty() {
+            payload["tools"] = json!(tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>());
+            payload["tool_choice"] = json!("auto");
+        }
+
+        let mut request = self
+            .client
+            .post(endpoint)
+            .header(header::ACCEPT_ENCODING, "identity")
+            .json(&payload);
+
+        if matches!(provider.kind, ProviderKind::Openrouter) {
+            request = request
+                .header("HTTP-Referer", "https://github.com/datrina/datrina")
+                .header("X-Title", "Datrina");
+        }
+
+        if let Some(api_key) = provider
+            .api_key
+            .as_ref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            request = request.bearer_auth(api_key);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow!("provider_network_error: {}", e))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .map_err(|e| anyhow!("provider_body_error status={}: {}", status, e))?;
+            return Err(anyhow!(
+                "provider_http_error status={}: {}",
+                status,
+                truncate(&body)
+            ));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tool_builders: BTreeMap<u32, ToolCallBuilder> = BTreeMap::new();
+        let mut tokens = None;
+
+        while let Some(chunk) = stream.next().await {
+            if is_cancelled() {
+                return Err(anyhow!("chat_stream_cancelled"));
+            }
+            let chunk = chunk.map_err(|e| anyhow!("provider_stream_error: {}", e))?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(event_end) = buffer.find("\n\n") {
+                let raw_event = buffer[..event_end].to_string();
+                buffer = buffer[event_end + 2..].to_string();
+                for data in sse_data_lines(&raw_event) {
+                    if data == "[DONE]" {
+                        continue;
+                    }
+                    let parsed: OpenAIStreamResponse = serde_json::from_str(&data)
+                        .map_err(|e| anyhow!("provider_stream_parse_error: {}", e))?;
+                    if let Some(usage) = parsed.usage {
+                        tokens = Some(crate::models::chat::TokenUsage {
+                            prompt: usage.prompt_tokens.unwrap_or(0),
+                            completion: usage.completion_tokens.unwrap_or(0),
+                        });
+                    }
+                    for choice in parsed.choices {
+                        let delta = choice.delta;
+                        if let Some(part) = delta.content.filter(|part| !part.is_empty()) {
+                            content.push_str(&part);
+                            on_event(AIStreamEvent::ContentDelta(part));
+                        }
+                        let visible_reasoning = delta.reasoning.or(delta.reasoning_content);
+                        if let Some(part) = visible_reasoning.filter(|part| !part.is_empty()) {
+                            reasoning.push_str(&part);
+                            on_event(AIStreamEvent::ReasoningDelta(part));
+                        }
+                        for tool_delta in delta.tool_calls.unwrap_or_default() {
+                            let builder = tool_builders.entry(tool_delta.index).or_default();
+                            if let Some(id) = tool_delta.id {
+                                builder.id = Some(id);
+                            }
+                            if let Some(function) = tool_delta.function {
+                                if let Some(name) = function.name {
+                                    builder.name.push_str(&name);
+                                }
+                                if let Some(arguments) = function.arguments {
+                                    builder.arguments.push_str(&arguments);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if is_cancelled() {
+            return Err(anyhow!("chat_stream_cancelled"));
+        }
+
+        let tool_calls = tool_builders
+            .into_iter()
+            .filter_map(|(index, builder)| builder.build(index))
+            .collect::<Vec<_>>();
+
+        if content.trim().is_empty() && tool_calls.is_empty() {
+            return Err(anyhow!(
+                "provider_empty_response: missing assistant content and tool calls"
+            ));
+        }
+
+        Ok(AICompletion {
+            content,
+            tokens,
+            tool_calls,
+            reasoning: if reasoning.trim().is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
         })
     }
 
@@ -274,6 +501,7 @@ impl AIEngine {
             content: parsed.message.content,
             tokens: None,
             tool_calls: vec![],
+            reasoning: None,
         })
     }
 
@@ -344,6 +572,28 @@ struct AICompletion {
     content: String,
     tokens: Option<crate::models::chat::TokenUsage>,
     tool_calls: Vec<ToolCall>,
+    reasoning: Option<String>,
+}
+
+#[derive(Default)]
+struct ToolCallBuilder {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCallBuilder {
+    fn build(self, index: u32) -> Option<ToolCall> {
+        if self.name.trim().is_empty() {
+            return None;
+        }
+        let arguments = serde_json::from_str(&self.arguments).unwrap_or_else(|_| json!({}));
+        Some(ToolCall {
+            id: self.id.unwrap_or_else(|| format!("tool-call-{index}")),
+            name: self.name,
+            arguments,
+        })
+    }
 }
 
 pub fn validate_provider(provider: &LLMProvider) -> Result<()> {
@@ -494,6 +744,16 @@ fn truncate(value: &str) -> String {
     }
 }
 
+fn sse_data_lines(raw_event: &str) -> Vec<String> {
+    raw_event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct OpenAIChatResponse {
     choices: Vec<OpenAIChoice>,
@@ -509,6 +769,8 @@ struct OpenAIChoice {
 struct OpenAIMessage {
     content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCall>>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -527,6 +789,38 @@ struct OpenAIFunctionCall {
 struct OpenAIUsage {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamResponse {
+    choices: Vec<OpenAIStreamChoice>,
+    usage: Option<OpenAIUsage>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamChoice {
+    delta: OpenAIStreamDelta,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamDelta {
+    content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<OpenAIStreamToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamToolCall {
+    index: u32,
+    id: Option<String>,
+    function: Option<OpenAIStreamFunctionCall>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamFunctionCall {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]

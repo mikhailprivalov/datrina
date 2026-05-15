@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { chatApi } from '../../lib/api';
-import type { BuildProposal, ChatMessage, ChatSession, LLMProvider } from '../../lib/api';
+import type { BuildProposal, ChatEventEnvelope, ChatMessage, ChatSession, LLMProvider, ToolCallTrace, ToolResultTrace } from '../../lib/api';
 
 interface Props {
   mode: 'build' | 'context';
@@ -17,6 +18,7 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [session, setSession] = useState<ChatSession | null>(null);
+  const [streamTraces, setStreamTraces] = useState<Record<string, StreamTrace>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -36,6 +38,103 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  useEffect(() => {
+    if (!session?.id) return;
+    const activeSessionId = session.id;
+    const unsubscribe = listen<ChatEventEnvelope>('chat:event', event => {
+      const chatEvent = event.payload;
+      if (chatEvent.session_id !== activeSessionId) return;
+
+      if (chatEvent.kind === 'message_started') {
+        const draft = assistantDraft(chatEvent, mode);
+        setMessages(prev => upsertMessage(prev, draft));
+        setStreamTraces(prev => ({
+          ...prev,
+          [chatEvent.message_id]: {
+            synthetic: chatEvent.synthetic,
+            toolCalls: [],
+            toolResults: [],
+          },
+        }));
+        return;
+      }
+
+      if (chatEvent.kind === 'content_delta' && chatEvent.content_delta) {
+        setMessages(prev => updateMessage(prev, chatEvent.message_id, msg => ({
+          ...msg,
+          content: `${msg.content}${chatEvent.content_delta}`,
+        })));
+        return;
+      }
+
+      if ((chatEvent.kind === 'reasoning_delta' && chatEvent.reasoning_delta) || chatEvent.kind === 'reasoning_snapshot') {
+        const reasoning = chatEvent.reasoning ?? chatEvent.reasoning_delta ?? '';
+        setMessages(prev => updateMessage(prev, chatEvent.message_id, msg => ({
+          ...msg,
+          metadata: {
+            ...msg.metadata,
+            reasoning: chatEvent.kind === 'reasoning_delta'
+              ? `${msg.metadata?.reasoning ?? ''}${reasoning}`
+              : reasoning,
+          },
+        })));
+        return;
+      }
+
+      if (chatEvent.kind === 'tool_call_requested' || chatEvent.kind === 'tool_execution_started') {
+        if (!chatEvent.tool_call) return;
+        setStreamTraces(prev => ({
+          ...prev,
+          [chatEvent.message_id]: upsertToolCall(prev[chatEvent.message_id], chatEvent.tool_call!, chatEvent.synthetic),
+        }));
+        return;
+      }
+
+      if (chatEvent.kind === 'tool_result') {
+        if (!chatEvent.tool_result) return;
+        setStreamTraces(prev => ({
+          ...prev,
+          [chatEvent.message_id]: upsertToolResult(prev[chatEvent.message_id], chatEvent.tool_result!, chatEvent.synthetic),
+        }));
+        return;
+      }
+
+      if (chatEvent.kind === 'build_proposal_parsed' && chatEvent.build_proposal) {
+        setMessages(prev => updateMessage(prev, chatEvent.message_id, msg => ({
+          ...msg,
+          metadata: {
+            ...msg.metadata,
+            build_proposal: chatEvent.build_proposal,
+          },
+        })));
+        return;
+      }
+
+      if (chatEvent.kind === 'message_completed' && chatEvent.final_message) {
+        setMessages(prev => upsertMessage(prev, chatEvent.final_message!));
+        setIsLoading(false);
+        return;
+      }
+
+      if (chatEvent.kind === 'message_failed') {
+        setMessages(prev => upsertMessage(prev, {
+          id: chatEvent.message_id,
+          role: 'assistant',
+          content: `Error: ${chatEvent.error ?? 'Chat stream failed'}`,
+          mode,
+          timestamp: chatEvent.emitted_at,
+        }));
+        setIsLoading(false);
+      }
+    });
+
+    return () => {
+      unsubscribe.then(dispose => dispose()).catch(err => {
+        console.error('Failed to unsubscribe from chat events:', err);
+      });
+    };
+  }, [session?.id, mode]);
 
   useEffect(() => {
     const textarea = inputRef.current;
@@ -64,8 +163,8 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
     setMessages(prev => [...prev, userMsg]);
 
     try {
-      const assistant = await chatApi.sendMessage(session.id, content);
-      setMessages(prev => [...prev, assistant]);
+      const assistant = await chatApi.sendMessageStream(session.id, content);
+      setMessages(prev => upsertMessage(prev, assistant));
     } catch (err) {
       const error: ChatMessage = {
         id: crypto.randomUUID(),
@@ -77,6 +176,15 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
       setMessages(prev => [...prev, error]);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    if (!session || !isLoading) return;
+    try {
+      await chatApi.cancelResponse(session.id);
+    } catch (err) {
+      console.error('Failed to cancel chat response:', err);
     }
   };
 
@@ -145,6 +253,15 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
                 : 'bg-muted text-foreground rounded-bl-md'
             }`}>
               {msg.content}
+              {msg.metadata?.reasoning && (
+                <ReasoningTrace reasoning={msg.metadata.reasoning} />
+              )}
+              {streamTraces[msg.id]?.synthetic && (
+                <p className="mt-2 text-[10px] text-muted-foreground">Single-step provider event</p>
+              )}
+              {streamTraces[msg.id] && (
+                <ToolTrace trace={streamTraces[msg.id]} />
+              )}
               {msg.metadata?.build_proposal && (
                 <ProposalPreview
                   proposal={msg.metadata.build_proposal}
@@ -159,9 +276,14 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
                     </svg>
                     Used {msg.tool_calls.length} tool{msg.tool_calls.length > 1 ? 's' : ''}
                   </p>
+                  {msg.tool_calls.map(call => (
+                    <p key={call.id} className="mt-1 text-[10px] opacity-70">
+                      {call.name}: {previewData(maskForDisplay(call.arguments))}
+                    </p>
+                  ))}
                   {msg.tool_results?.map(result => (
                     <p key={result.tool_call_id} className="mt-1 text-[10px] opacity-70">
-                      {result.name}: {result.error ? `error - ${result.error}` : 'ok'}
+                      {result.name}: {result.error ? `error - ${result.error}` : `ok - ${previewData(maskForDisplay(result.result))}`}
                     </p>
                   ))}
                 </div>
@@ -209,13 +331,19 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
             rows={1}
           />
           <button
-            onClick={handleSend}
-            disabled={!input.trim() || isLoading}
+            onClick={isLoading ? handleCancel : handleSend}
+            disabled={!isLoading && !input.trim()}
             className="p-2.5 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0"
           >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-            </svg>
+            {isLoading ? (
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M7 7h10v10H7z" />
+              </svg>
+            ) : (
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+              </svg>
+            )}
           </button>
         </div>
         <p className="text-[10px] text-muted-foreground/60 mt-1.5 text-center">Shift+Enter for new line</p>
@@ -226,6 +354,105 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
 
 function normalizeChatInput(value: string) {
   return value.replace(/[—–]/g, '--');
+}
+
+interface StreamTrace {
+  synthetic: boolean;
+  toolCalls: ToolCallTrace[];
+  toolResults: ToolResultTrace[];
+}
+
+function assistantDraft(event: ChatEventEnvelope, mode: 'build' | 'context'): ChatMessage {
+  return {
+    id: event.message_id,
+    role: 'assistant',
+    content: '',
+    mode,
+    metadata: {
+      provider: event.provider_id,
+      model: event.model,
+    },
+    timestamp: event.emitted_at,
+  };
+}
+
+function upsertMessage(messages: ChatMessage[], message: ChatMessage) {
+  const index = messages.findIndex(item => item.id === message.id);
+  if (index === -1) return [...messages, message];
+  return messages.map(item => item.id === message.id ? message : item);
+}
+
+function updateMessage(messages: ChatMessage[], id: string, update: (message: ChatMessage) => ChatMessage) {
+  return messages.map(message => message.id === id ? update(message) : message);
+}
+
+function upsertToolCall(trace: StreamTrace | undefined, toolCall: ToolCallTrace, synthetic: boolean): StreamTrace {
+  const current = trace ?? { synthetic, toolCalls: [], toolResults: [] };
+  const existing = current.toolCalls.findIndex(item => item.id === toolCall.id);
+  return {
+    ...current,
+    synthetic,
+    toolCalls: existing === -1
+      ? [...current.toolCalls, toolCall]
+      : current.toolCalls.map(item => item.id === toolCall.id ? toolCall : item),
+  };
+}
+
+function upsertToolResult(trace: StreamTrace | undefined, toolResult: ToolResultTrace, synthetic: boolean): StreamTrace {
+  const current = trace ?? { synthetic, toolCalls: [], toolResults: [] };
+  const existing = current.toolResults.findIndex(item => item.tool_call_id === toolResult.tool_call_id);
+  return {
+    ...current,
+    synthetic,
+    toolResults: existing === -1
+      ? [...current.toolResults, toolResult]
+      : current.toolResults.map(item => item.tool_call_id === toolResult.tool_call_id ? toolResult : item),
+  };
+}
+
+function ReasoningTrace({ reasoning }: { reasoning: string }) {
+  if (!reasoning.trim()) return null;
+  return (
+    <div className="mt-2 rounded-md border border-border/60 bg-background/70 p-2 text-[11px] text-muted-foreground">
+      <p className="mb-1 font-medium text-foreground">Visible reasoning</p>
+      <p className="whitespace-pre-wrap">{reasoning}</p>
+    </div>
+  );
+}
+
+function ToolTrace({ trace }: { trace: StreamTrace }) {
+  if (trace.toolCalls.length === 0 && trace.toolResults.length === 0) return null;
+  return (
+    <div className="mt-2 rounded-md border border-border/60 bg-background/70 p-2 text-[11px]">
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <p className="font-medium text-foreground">Tool activity</p>
+        {trace.synthetic && (
+          <span className="text-[10px] text-muted-foreground">single-step provider</span>
+        )}
+      </div>
+      <div className="space-y-1">
+        {trace.toolCalls.map(call => {
+          const result = trace.toolResults.find(item => item.tool_call_id === call.id);
+          return (
+            <div key={call.id} className="rounded border border-border/50 px-2 py-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium">{call.name}</span>
+                <span className={result?.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}>
+                  {result?.status ?? call.status}
+                </span>
+              </div>
+              <p className="mt-0.5 line-clamp-2 text-muted-foreground">{previewData(call.arguments_preview)}</p>
+              {result && (
+                <p className="mt-0.5 line-clamp-2 text-muted-foreground">
+                  {result.error ? `Error: ${result.error}` : previewData(result.result_preview)}
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApply: () => Promise<void> }) {
@@ -293,4 +520,36 @@ function previewData(data: unknown) {
   } catch {
     return 'Preview unavailable';
   }
+}
+
+function maskForDisplay(value: unknown, depth = 0): unknown {
+  if (depth >= 5) return '...';
+  if (Array.isArray(value)) {
+    return value.slice(0, 12).map(item => maskForDisplay(item, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).slice(0, 24);
+    return Object.fromEntries(entries.map(([key, item]) => [
+      key,
+      isSecretKey(key) ? '***' : maskForDisplay(item, depth + 1),
+    ]));
+  }
+  if (typeof value === 'string') {
+    if (looksLikeSecret(value)) return '***';
+    return value.length > 240 ? `${value.slice(0, 240)}...` : value;
+  }
+  return value;
+}
+
+function isSecretKey(key: string) {
+  const normalized = key.toLowerCase();
+  return ['authorization', 'api_key', 'apikey', 'token', 'secret', 'password', 'key']
+    .some(part => normalized.includes(part));
+}
+
+function looksLikeSecret(value: string) {
+  const trimmed = value.trim();
+  return trimmed.startsWith('Bearer ')
+    || trimmed.startsWith('sk-')
+    || (trimmed.length >= 32 && /^[A-Za-z0-9_.=:-]+$/.test(trimmed));
 }

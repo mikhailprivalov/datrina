@@ -268,6 +268,54 @@ export interface MessageMetadata {
   tokens?: { prompt: number; completion: number };
   latency_ms?: number;
   build_proposal?: BuildProposal;
+  reasoning?: string;
+}
+
+export type ChatEventKind =
+  | 'message_started'
+  | 'content_delta'
+  | 'reasoning_delta'
+  | 'reasoning_snapshot'
+  | 'tool_call_requested'
+  | 'tool_execution_started'
+  | 'tool_result'
+  | 'build_proposal_parsed'
+  | 'message_completed'
+  | 'message_failed';
+
+export interface ChatEventEnvelope {
+  kind: ChatEventKind;
+  session_id: string;
+  message_id: string;
+  sequence: number;
+  provider_id?: string;
+  model?: string;
+  content_delta?: string;
+  reasoning_delta?: string;
+  reasoning?: string;
+  tool_call?: ToolCallTrace;
+  tool_result?: ToolResultTrace;
+  build_proposal?: BuildProposal;
+  final_message?: ChatMessage;
+  error?: string;
+  synthetic: boolean;
+  emitted_at: number;
+}
+
+export interface ToolCallTrace {
+  id: string;
+  name: string;
+  arguments_preview: unknown;
+  policy_decision: 'accepted' | 'rejected';
+  status: 'requested' | 'running' | 'success' | 'error';
+}
+
+export interface ToolResultTrace {
+  tool_call_id: string;
+  name: string;
+  status: 'requested' | 'running' | 'success' | 'error';
+  result_preview?: unknown;
+  error?: string;
 }
 
 export interface BuildProposal {
@@ -425,6 +473,10 @@ export const chatApi = {
     call<ChatSession>('create_session', { req: { mode, dashboard_id: dashboardId } }),
   sendMessage: (sessionId: string, content: string) =>
     call<ChatMessage>('send_message', { sessionId, req: { content } }),
+  sendMessageStream: (sessionId: string, content: string) =>
+    call<ChatMessage>('send_message_stream', { sessionId, req: { content } }),
+  cancelResponse: (sessionId: string) =>
+    call<boolean>('cancel_chat_response', { sessionId }),
   deleteSession: (id: string) => call<boolean>('delete_session', { id }),
 };
 

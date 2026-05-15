@@ -1071,7 +1071,7 @@ Parallelism:
 
 ### W14 - Chat Streaming, Reasoning Trace, And Tool Visibility
 
-Status: planned
+Status: implemented with external-provider validation residual
 
 Depends on: W13
 
@@ -1175,6 +1175,25 @@ Validation record:
 
 - W14 validation must be recorded in
   `docs/W14_CHAT_STREAMING_TRACE_UI.md`.
+
+Completion notes:
+
+- W14 validation is recorded in
+  `docs/W14_CHAT_STREAMING_TRACE_UI.md`.
+- Chat now has a typed Rust `chat:event` envelope mirrored in TypeScript for
+  message start, assistant content delta, visible reasoning delta/snapshot,
+  tool call requested, tool execution started, tool result/error, build proposal
+  parsed, message completed, and message failed.
+- OpenAI-compatible providers use Rust-owned SSE streaming through
+  `AIEngine`; `local_mock` and Ollama use honest synthetic single-step events.
+- React renders incremental assistant content, separated visible reasoning,
+  masked live tool activity, parsed proposal previews, completion, failure, and
+  cancellation state from Tauri events.
+- The W12/W13 bounded one-resume tool loop and explicit Build Chat apply
+  confirmation boundary are unchanged.
+- Live real streaming-provider and tool-calling Build Chat acceptance still
+  requires user-provided credentials or a reachable local real provider in this
+  checkout; `local_mock` remains dev/test-only evidence.
 
 Parallelism:
 
