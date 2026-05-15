@@ -6,6 +6,7 @@ use crate::models::chat::{
     SendMessageRequest, ToolResult,
 };
 use crate::models::dashboard::BuildProposal;
+use crate::models::mcp::{MCPServer, MCPTransport};
 use crate::models::ApiResult;
 use crate::modules::ai::AIToolSpec;
 use crate::AppState;
@@ -124,12 +125,40 @@ pub async fn send_message(
         }
     };
 
-    let provider_messages = match grounded_messages(&state, &session).await {
+    let prompt_mcp_server = match extract_prompt_mcp_server(&req.content) {
+        Some(server) => {
+            if let Err(e) = state.tool_engine.validate_mcp_server(&server) {
+                return Ok(ApiResult::err(format!(
+                    "Prompt MCP server is not allowed by tool policy: {}",
+                    e
+                )));
+            }
+            if let Err(e) = state.storage.save_mcp_server(&server).await {
+                return Ok(ApiResult::err(format!(
+                    "Failed to save prompt MCP server: {}",
+                    e
+                )));
+            }
+            Some(server)
+        }
+        None => None,
+    };
+
+    let mut provider_messages = match grounded_messages(&state, &session).await {
         Ok(messages) => messages,
         Err(e) => return Ok(ApiResult::err(e.to_string())),
     };
+    if let Some(server) = prompt_mcp_server.as_ref() {
+        provider_messages.push(system_message(format!(
+            "The user supplied a stdio MCP server for this build request. It has been configured and enabled with server_id '{}'. Inspect and use its available tools through the mcp_tool function. For widgets backed by this MCP, return datasource_plan.kind='mcp_tool' and datasource_plan.server_id='{}'.",
+            server.id, server.id
+        )));
+    }
 
-    let tool_specs = chat_tool_specs(&state).await;
+    let tool_specs = match chat_tool_specs(&state, prompt_mcp_server.is_some()).await {
+        Ok(specs) => specs,
+        Err(e) => return Ok(ApiResult::err(format!("MCP tool discovery failed: {}", e))),
+    };
     let ai_response = match state
         .ai_engine
         .complete_chat_with_tools(&provider, &provider_messages, &tool_specs)
@@ -356,7 +385,10 @@ Required JSON shape:
 Every widget must include datasource_plan. Use builtin_tool/http_request for reachable public HTTP data, mcp_tool for a configured stdio MCP server when available, or provider_prompt when the datasource should be produced by the active Rust-mediated provider. Do not return only literal static data as the datasource."#.to_string()
 }
 
-async fn chat_tool_specs(state: &State<'_, AppState>) -> Vec<AIToolSpec> {
+async fn chat_tool_specs(
+    state: &State<'_, AppState>,
+    require_mcp: bool,
+) -> anyhow::Result<Vec<AIToolSpec>> {
     let mut specs = vec![AIToolSpec {
         name: "http_request".to_string(),
         description: "Make a policy-gated HTTP request through Datrina's Rust ToolEngine. Localhost, private networks, and blocked schemes are denied.".to_string(),
@@ -373,8 +405,20 @@ async fn chat_tool_specs(state: &State<'_, AppState>) -> Vec<AIToolSpec> {
         }),
     }];
 
-    let mcp_tools = match reconnect_enabled_mcp_servers(state).await {
-        Ok(tools) => tools,
+    let mcp_tools = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(20),
+        reconnect_enabled_mcp_servers(state),
+    )
+    .await
+    {
+        Ok(Ok(tools)) => tools,
+        Ok(Err(error)) if require_mcp => return Err(error),
+        Ok(Err(_)) => Vec::new(),
+        Err(_) if require_mcp => {
+            return Err(anyhow::anyhow!(
+                "timed out while connecting enabled MCP servers"
+            ));
+        }
         Err(_) => Vec::new(),
     };
     if !mcp_tools.is_empty() {
@@ -401,7 +445,7 @@ async fn chat_tool_specs(state: &State<'_, AppState>) -> Vec<AIToolSpec> {
             }),
         });
     }
-    specs
+    Ok(specs)
 }
 
 async fn execute_chat_tool(
@@ -524,6 +568,61 @@ fn extract_json_object(content: &str) -> Option<&str> {
         return None;
     }
     Some(&content[start..=end])
+}
+
+fn extract_prompt_mcp_server(content: &str) -> Option<MCPServer> {
+    let normalized = content.replace(['—', '–'], "--");
+    let command = normalized
+        .split_whitespace()
+        .find(|part| part.contains("yandex-mcp-store-proxy"))?
+        .trim_matches(|ch: char| matches!(ch, ')' | '(' | ':' | ',' | ';'))
+        .to_string();
+
+    let args = normalized.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let (_, args_text) = trimmed.split_once("args:")?;
+        Some(split_prompt_args(args_text.trim()))
+    })?;
+
+    if args.is_empty() {
+        return None;
+    }
+
+    Some(MCPServer {
+        id: "prompt-yandex-mcp-store-proxy".to_string(),
+        name: "Prompt Yandex MCP store proxy".to_string(),
+        transport: MCPTransport::Stdio,
+        is_enabled: true,
+        command: Some(command),
+        args: Some(args),
+        env: None,
+        url: None,
+    })
+}
+
+fn split_prompt_args(value: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in value.chars() {
+        match (quote, ch) {
+            (Some(active), c) if c == active => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    args
 }
 
 #[tauri::command]

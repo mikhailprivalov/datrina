@@ -1069,6 +1069,123 @@ Parallelism:
 - All lanes must integrate through one final W13 acceptance pass against the same
   live provider and one durable dashboard/runtime scenario.
 
+### W14 - Chat Streaming, Reasoning Trace, And Tool Visibility
+
+Status: planned
+
+Depends on: W13
+
+Owner role: chat runtime and observability agent
+
+Ownership:
+
+- `datrina/src/lib/api.ts`
+- `datrina/src/App.tsx`
+- `datrina/src/components/layout/ChatPanel.tsx`
+- `datrina/src/components/layout/*` only if shared shell state is required
+- `datrina/src-tauri/src/commands/chat.rs`
+- `datrina/src-tauri/src/models/chat.rs`
+- `datrina/src-tauri/src/modules/ai.rs`
+- `datrina/src-tauri/src/modules/mcp_manager.rs`
+- `datrina/src-tauri/src/modules/tool_engine.rs`
+- `datrina/src-tauri/src/modules/workflow_engine.rs` only if workflow/chat
+  event envelope reuse is required
+- targeted validation/docs updates under `datrina/docs/`,
+  `datrina/README.md`, and `datrina/docs/RESIDUAL_BACKLOG.md`
+
+Scope:
+
+- Audit the current chat request/response path before implementation:
+  `ChatPanel -> chatApi.sendMessage -> send_message -> AIEngine -> provider
+  response -> persisted ChatMessage`.
+- Define one typed chat streaming event envelope over Tauri events. At minimum it
+  must represent: message started, assistant content delta, provider reasoning
+  summary delta or snapshot when the provider exposes one, tool call requested,
+  tool execution started, tool result/error, build proposal parsed, message
+  completed, and message failed.
+- Implement streaming for providers that support streamed OpenAI-compatible chat
+  completions. Non-streaming providers such as `local_mock` may use the same
+  event envelope with synthetic single-step events, but the UI must not pretend
+  they are live provider streams.
+- Preserve Rust ownership of provider calls, secrets, tool execution, MCP
+  lifecycle, and persistence. React may render stream state but must not call
+  providers or tools directly.
+- Display provider-supplied reasoning only as an explicit model/provider output
+  field such as reasoning summary, reasoning text, annotation, or equivalent
+  public trace. Do not request, fabricate, persist, or display hidden chain of
+  thought.
+- Show tool activity as first-class chat state: requested tool name, arguments
+  preview with secret masking, policy decision, running/success/error status,
+  result preview, and final assistant resume.
+- Keep the bounded tool loop explicit. If W14 expands beyond the W12/W13
+  one-resume loop, define the max iterations, cancellation behavior, timeout,
+  and UI state before changing runtime behavior.
+- Add cancellation/abort behavior for an in-flight streamed chat response if the
+  current provider/runtime path can support it safely. If not, record the exact
+  limitation and make the UI state honest.
+- Persist the final assistant message, tool calls, tool results, provider/model
+  metadata, token usage when available, and visible reasoning summaries when
+  available. Do not persist partial stream noise unless a deliberate resume
+  contract is added.
+- Keep build proposal parsing/apply semantics unchanged: streamed text may
+  preview progress, but dashboard changes still require a parsed proposal and
+  explicit user confirmation.
+
+Out of scope:
+
+- Node/Hono/Turborepo runtime inside `datrina`.
+- Public HTTP/REST or SSE server APIs.
+- React-owned direct LLM, MCP, or tool calls.
+- Remote MCP transport unless a separate hardening workstream accepts it first.
+- Arbitrary unbounded autonomous agents.
+- Exposing hidden chain-of-thought or prompting providers to reveal private
+  reasoning.
+- Replacing the existing workflow event system unless the new chat event
+  envelope can reuse it with a small typed extension.
+- Production packaging, signing, and distribution.
+
+Acceptance checks:
+
+- Tauri config JSON parse succeeds.
+- `bun run check:contract` passes.
+- `bun run typecheck` passes.
+- `bun run build` passes.
+- `cargo fmt --all --check` passes.
+- `cargo check --workspace --all-targets` passes.
+- The chat event envelope is typed on the Rust side and mirrored in TypeScript.
+- A real streaming-capable provider run shows assistant text incrementally in
+  React while the Rust command remains the only provider caller.
+- Tool calls are visible while running and after completion, including policy
+  denials and MCP/runtime failures.
+- Provider-supplied visible reasoning summaries/traces, when present, are
+  rendered in a clearly separated UI region. Hidden chain-of-thought is neither
+  requested nor displayed.
+- Build Chat can stream a provider-generated proposal and still requires
+  explicit confirmation before applying dashboard changes.
+- Non-streaming provider behavior remains honest and does not show fake token
+  streaming.
+- A failed provider stream leaves the chat session in a recoverable state with a
+  visible error and no fake assistant success message.
+- Secrets in provider config, MCP args/env, tool arguments, headers, and results
+  are masked before display.
+- README/docs/residual backlog are updated after validation so streaming,
+  reasoning trace, and tool visibility claims match implemented behavior.
+
+Validation record:
+
+- W14 validation must be recorded in
+  `docs/W14_CHAT_STREAMING_TRACE_UI.md`.
+
+Parallelism:
+
+- Start after W13.
+- Split only into non-overlapping lanes: provider streaming parser/runtime,
+  chat event contract, React stream rendering, and tool trace rendering.
+- Serialize all edits to `src/lib/api.ts`, `src-tauri/src/models/chat.rs`, and
+  command request/response/event shapes through one integration owner.
+- All lanes must integrate through one final W14 acceptance pass against one
+  streaming-capable provider and one tool-calling Build Chat scenario.
+
 ## Parallelization Model
 
 Recommended agent queue:
@@ -1090,6 +1207,10 @@ Recommended agent queue:
     executable datasource/workflow plans, MCP tool exposure, workflow reconnect,
     scheduler durability, reload verification, and one no-mock product loop from
     AI proposal to live widget refresh.
+11. Run W14 as the chat observability stream: typed Tauri streaming events,
+    visible provider-supplied reasoning summaries, live tool-call status/results,
+    cancellation/failure honesty, and Build Chat proposal streaming without
+    bypassing explicit apply confirmation.
 
 Do not give two agents simultaneous ownership of `src/lib/api.ts`, `src-tauri/src/models/*`, or command request/response shapes. Contract drift is already the main risk.
 

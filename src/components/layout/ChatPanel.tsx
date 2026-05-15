@@ -18,6 +18,7 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
   const [isLoading, setIsLoading] = useState(false);
   const [session, setSession] = useState<ChatSession | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     const create = async () => {
@@ -36,9 +37,20 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  useEffect(() => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 128)}px`;
+  }, [input]);
+
+  const handleInputChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(normalizeChatInput(event.target.value));
+  };
+
   const handleSend = async () => {
     if (!input.trim() || !session || isLoading) return;
-    const content = input.trim();
+    const content = normalizeChatInput(input).trim();
     setInput('');
     setIsLoading(true);
 
@@ -184,11 +196,16 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
       <div className="p-3 border-t border-border">
         <div className="flex items-end gap-2">
           <textarea
+            ref={inputRef}
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={handleInputChange}
             onKeyDown={handleKeyDown}
             aria-label={mode === 'build' ? 'Ask for build guidance' : 'Ask about the data'}
-            className="flex-1 resize-none rounded-xl border border-border bg-muted/50 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 min-h-[40px] max-h-32"
+            autoCapitalize="off"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
+            className="flex-1 resize-none overflow-y-auto rounded-xl border border-border bg-muted/50 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 min-h-[40px] max-h-32"
             rows={1}
           />
           <button
@@ -205,6 +222,10 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
       </div>
     </aside>
   );
+}
+
+function normalizeChatInput(value: string) {
+  return value.replace(/[—–]/g, '--');
 }
 
 function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApply: () => Promise<void> }) {

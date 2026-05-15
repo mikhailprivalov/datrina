@@ -328,6 +328,7 @@ impl Default for ToolEngine {
                 "bun".to_string(),
                 "bunx".to_string(),
                 "uvx".to_string(),
+                "yandex-mcp-store-proxy".to_string(),
             ],
         )
     }

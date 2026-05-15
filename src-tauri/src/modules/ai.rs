@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use reqwest::Client;
+use reqwest::{header, Client};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -157,7 +157,11 @@ impl AIEngine {
             payload["tool_choice"] = json!("auto");
         }
 
-        let mut request = self.client.post(endpoint).json(&payload);
+        let mut request = self
+            .client
+            .post(endpoint)
+            .header(header::ACCEPT_ENCODING, "identity")
+            .json(&payload);
 
         if matches!(provider.kind, ProviderKind::Openrouter) {
             request = request
@@ -178,7 +182,10 @@ impl AIEngine {
             .await
             .map_err(|e| anyhow!("provider_network_error: {}", e))?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| anyhow!("provider_body_error status={}: {}", status, e))?;
         if !status.is_success() {
             return Err(anyhow!(
                 "provider_http_error status={}: {}",
@@ -233,6 +240,7 @@ impl AIEngine {
         let response = self
             .client
             .post(endpoint)
+            .header(header::ACCEPT_ENCODING, "identity")
             .json(&json!({
                 "model": provider.default_model,
                 "stream": false,
@@ -243,7 +251,10 @@ impl AIEngine {
             .map_err(|e| anyhow!("provider_network_error: {}", e))?;
 
         let status = response.status();
-        let body = response.text().await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| anyhow!("provider_body_error status={}: {}", status, e))?;
         if !status.is_success() {
             return Err(anyhow!(
                 "provider_http_error status={}: {}",
@@ -268,12 +279,16 @@ impl AIEngine {
 
     async fn test_openai_compatible(&self, provider: &LLMProvider) -> Result<()> {
         let endpoint = openai_chat_endpoint(&provider.base_url)?;
-        let mut request = self.client.post(endpoint).json(&json!({
-            "model": provider.default_model,
-            "stream": false,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "ping"}],
-        }));
+        let mut request = self
+            .client
+            .post(endpoint)
+            .header(header::ACCEPT_ENCODING, "identity")
+            .json(&json!({
+                "model": provider.default_model,
+                "stream": false,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }));
 
         if matches!(provider.kind, ProviderKind::Openrouter) {
             request = request
@@ -297,7 +312,10 @@ impl AIEngine {
             Ok(())
         } else {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .map_err(|e| anyhow!("provider_body_error status={}: {}", status, e))?;
             Err(anyhow!(
                 "provider_http_error status={}: {}",
                 status,

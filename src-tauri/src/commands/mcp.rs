@@ -11,6 +11,19 @@ fn mask_env(mut server: MCPServer) -> MCPServer {
             *value = "********".to_string();
         }
     }
+    if let Some(args) = server.args.as_mut() {
+        let mut mask_next = false;
+        for arg in args {
+            if mask_next {
+                *arg = "********".to_string();
+                mask_next = false;
+                continue;
+            }
+            if matches!(arg.as_str(), "-O" | "--oauth" | "--token" | "--api-key") {
+                mask_next = true;
+            }
+        }
+    }
     server
 }
 
