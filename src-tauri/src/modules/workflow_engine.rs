@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use tracing::{error, info};
 
-use crate::models::chat::{ChatMessage, ChatMode, MessageRole};
+use crate::models::chat::{ChatMessage, ChatMessagePart, ChatMode, MessageRole};
 use crate::models::provider::LLMProvider;
 use crate::models::workflow::{
     NodeKind, RunStatus, TriggerKind, Workflow, WorkflowEdge, WorkflowEventEnvelope,
@@ -506,6 +506,13 @@ fn runtime_chat_message(role: MessageRole, content: &str) -> ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role,
         content: content.to_string(),
+        parts: if content.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![ChatMessagePart::Text {
+                text: content.to_string(),
+            }]
+        },
         mode: ChatMode::Context,
         tool_calls: None,
         tool_results: None,

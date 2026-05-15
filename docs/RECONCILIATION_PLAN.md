@@ -1205,6 +1205,143 @@ Parallelism:
 - All lanes must integrate through one final W14 acceptance pass against one
   streaming-capable provider and one tool-calling Build Chat scenario.
 
+### W15 - Chat Runtime Replacement And Message Parts Model
+
+Status: implemented with external-provider validation residual
+
+Depends on: W14
+
+Owner role: chat runtime architecture and frontend integration agent
+
+Ownership:
+
+- `datrina/package.json`
+- `datrina/bun.lockb` or the active package lock if dependency changes are made
+- `datrina/src/lib/api.ts`
+- `datrina/src/App.tsx`
+- `datrina/src/components/layout/ChatPanel.tsx`
+- new chat runtime/components under `datrina/src/components/chat/` or
+  `datrina/src/lib/chat/` if introduced
+- `datrina/src-tauri/src/commands/chat.rs`
+- `datrina/src-tauri/src/models/chat.rs`
+- `datrina/src-tauri/src/modules/ai.rs`
+- `datrina/src-tauri/src/modules/tool_engine.rs`
+- targeted validation/docs updates under `datrina/docs/`,
+  `datrina/README.md`, and `datrina/docs/RESIDUAL_BACKLOG.md`
+
+Scope:
+
+- Replace the current custom chat render/state assembly with a message-parts
+  model that treats assistant text, visible reasoning, provider-opaque reasoning
+  state, tool calls, tool results, errors, and Build Chat proposals as typed
+  parts of one assistant run instead of scattered `messages`, metadata, and
+  `streamTraces` state.
+- Evaluate and adopt a production chat UI/runtime layer such as `assistant-ui`
+  with a custom Tauri/Rust adapter, or document why a local minimal runtime is
+  required. The chosen layer must support typed message parts, reasoning display,
+  tool-call lifecycle rendering, cancellation/error states, and custom proposal
+  parts.
+- Map the existing Rust-owned `chat:event` stream to a canonical agent event
+  protocol shape inspired by AG-UI or AI SDK UI streams: run start/finish/error,
+  text start/delta/end, reasoning start/delta/end, tool call start/args/end,
+  tool result, custom Build Chat proposal, abort/cancel, and recoverable
+  failure.
+- Preserve the accepted runtime boundary: React renders and submits user input;
+  Rust remains the only owner of provider calls, provider secrets, MCP process
+  lifecycle, tool execution, policy decisions, persistence, and proposal apply.
+- Store provider-visible reasoning summaries separately from provider-opaque
+  reasoning continuation data. Opaque reasoning blobs or provider-specific
+  reasoning details may be persisted/round-tripped only as backend-owned state
+  and must not be displayed as hidden chain-of-thought.
+- Keep tool activity first-class in the UI: requested tool name, argument
+  preview with masking, policy decision, running/success/error state, result
+  preview, and assistant resume after the bounded tool loop.
+- Keep Build Chat apply semantics unchanged. Generated dashboard/workflow
+  changes must remain preview-only until explicit user confirmation, even if the
+  proposal is carried as a typed message part.
+- Remove or quarantine obsolete chat state helpers once the replacement runtime
+  owns message-part assembly. Do not leave two active chat state machines.
+- Update README/docs/residual backlog after implementation so chat, reasoning,
+  tool visibility, and external-provider validation claims match the new
+  runtime.
+
+Out of scope:
+
+- Node/Hono/Turborepo runtime inside `datrina`.
+- Public HTTP/REST or SSE server APIs.
+- React-owned direct LLM, MCP, or tool calls.
+- Remote MCP transport unless a separate hardening workstream accepts it first.
+- Unbounded autonomous tool loops or new agent orchestration semantics.
+- Exposing hidden chain-of-thought or prompting providers to reveal private
+  reasoning.
+- Rewriting dashboard, workflow, scheduler, provider settings, or MCP manager
+  behavior except where required to preserve existing chat contracts.
+- Production packaging, signing, and distribution.
+
+Acceptance checks:
+
+- Tauri config JSON parse succeeds.
+- `bun run check:contract` passes.
+- `bun run typecheck` passes.
+- `bun run build` passes.
+- `cargo fmt --all --check` passes.
+- `cargo check --workspace --all-targets` passes.
+- The chosen chat runtime/dependency decision is documented in the W15
+  validation record with the reason it fits Tauri/Rust ownership.
+- `ChatPanel` no longer manually assembles independent reasoning/tool trace
+  state from every event kind; rendering is driven by typed message parts or a
+  runtime adapter with equivalent typed state.
+- The Rust `ChatMessage`/event model can represent text, visible reasoning,
+  provider-opaque reasoning state, tool calls, tool results, Build Chat
+  proposals, cancellation, and failures without lossy metadata-only fields.
+- A local no-key path such as `local_mock` still works honestly without fake live
+  token streaming.
+- A real streaming-capable provider run, when credentials/service are available,
+  renders incremental assistant text, visible provider-supplied reasoning when
+  present, tool lifecycle, final assistant resume, and recoverable errors.
+- Tool arguments/results/secrets remain masked before display.
+- Build Chat proposal preview and explicit apply confirmation still work after
+  the runtime replacement.
+- No React code path calls providers, MCP, or tools directly.
+
+Validation record:
+
+- W15 validation must be recorded in
+  `docs/W15_CHAT_RUNTIME_REPLACEMENT.md`.
+
+Completion notes:
+
+- W15 validation is recorded in
+  `docs/W15_CHAT_RUNTIME_REPLACEMENT.md`.
+- The chat UI now uses a local typed message-parts runtime adapter under
+  `src/lib/chat/runtime.ts`; `ChatPanel` renders parts and no longer owns a
+  second `messages`/metadata/`streamTraces` state machine.
+- The Rust `ChatMessage` model now carries typed parts for assistant text,
+  visible reasoning, backend-owned opaque reasoning state references, tool
+  calls, tool results, Build Chat proposals, recoverable errors, and
+  cancellation.
+- `chat:event` now carries a canonical `agent_event` protocol shape for run,
+  text, reasoning, tool, proposal, cancellation, and failure events while
+  preserving the W14 event names for compatibility.
+- No new React-side provider, MCP, or tool runtime was added; Rust remains the
+  owner of provider calls, secrets, MCP lifecycle, tool policy/execution,
+  persistence, and proposal apply.
+- Live real streaming-provider and tool-calling Build Chat acceptance still
+  requires user-provided credentials or a reachable local real provider in this
+  checkout; `local_mock` remains dev/test-only evidence.
+
+Parallelism:
+
+- Start after W14.
+- Split only into non-overlapping lanes: chat runtime/dependency evaluation,
+  Rust message-part/event model, frontend runtime adapter/components, and final
+  validation/docs.
+- Serialize all edits to `src/lib/api.ts`, `src-tauri/src/models/chat.rs`, and
+  command request/response/event shapes through one integration owner.
+- All lanes must integrate through one final W15 acceptance pass against one
+  no-key path and, when available, one streaming-capable provider with a
+  tool-calling Build Chat scenario.
+
 ## Parallelization Model
 
 Recommended agent queue:
@@ -1230,6 +1367,9 @@ Recommended agent queue:
     visible provider-supplied reasoning summaries, live tool-call status/results,
     cancellation/failure honesty, and Build Chat proposal streaming without
     bypassing explicit apply confirmation.
+12. Run W15 as the chat runtime replacement stream: replace the custom chat
+    state machine with typed message parts and a production UI/runtime adapter
+    while preserving the Rust-owned provider/tool/MCP boundary.
 
 Do not give two agents simultaneous ownership of `src/lib/api.ts`, `src-tauri/src/models/*`, or command request/response shapes. Contract drift is already the main risk.
 

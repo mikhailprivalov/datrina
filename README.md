@@ -22,10 +22,16 @@ Implemented and validated in the reconciliation baseline:
 - Provider add/update/re-key/enable/disable/test flows through Rust commands; provider secrets are not returned to React.
 - Context chat is grounded with the selected dashboard, widgets, and workflow run state before provider execution.
 - Build chat requests provider-generated structured dashboard/widget proposals with explicit executable datasource plans, previews them in the UI, and applies them only after explicit confirmation through Rust commands.
-- OpenAI-compatible chat providers stream assistant content through typed Tauri `chat:event` events while Rust remains the only provider caller.
+- OpenAI-compatible chat providers stream assistant content through typed Tauri
+  `chat:event` events with canonical agent-event payloads and React-side typed
+  message parts while Rust remains the only provider caller.
 - Provider-supplied public reasoning fields, when present, render in a separated visible reasoning region without requesting or exposing hidden chain-of-thought.
 - Proposal apply can create chart, table, text, gauge, and image widgets with persisted datasource workflows backed by `ToolEngine`, stdio MCP, or Rust-mediated provider execution.
-- Provider-driven chat tool calling emits OpenAI-compatible tool schemas, executes safe built-in `http_request` calls and configured stdio MCP tool calls through the Rust policy gateway, streams masked tool activity, persists visible tool results/errors, and resumes once for the final assistant response.
+- Provider-driven chat tool calling emits OpenAI-compatible tool schemas,
+  executes safe built-in `http_request` calls and configured stdio MCP tool
+  calls through the Rust policy gateway, streams masked typed tool activity
+  parts, persists visible tool results/errors, and resumes once for the final
+  assistant response.
 - Dashboard widget creation UI for local text and gauge widgets, each backed by a deterministic persisted workflow.
 - Workflow `llm` nodes execute through the same Rust AI provider runtime used by chat.
 - Workflow MCP/built-in tool nodes reconnect persisted enabled stdio MCP servers before execution, then execute through the Rust `ToolEngine`/MCP gateway or fail with explicit policy/runtime errors.
@@ -164,6 +170,7 @@ Agent execution and reconciliation history live in `docs/`:
 - `docs/W12_PROVIDER_DRIVEN_AGENTIC_DASHBOARD_BUILDER.md`: W12 provider proposal validation record.
 - `docs/W13_DURABLE_REAL_RUNTIME_PIPELINE.md`: W13 durable runtime validation record.
 - `docs/W14_CHAT_STREAMING_TRACE_UI.md`: W14 chat streaming and observability validation record.
+- `docs/W15_CHAT_RUNTIME_REPLACEMENT.md`: W15 chat runtime and message-parts validation record.
 
 ## Project Structure
 

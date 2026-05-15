@@ -242,12 +242,42 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
+  parts?: ChatMessagePart[];
   mode: 'build' | 'context';
   tool_calls?: ToolCall[];
   tool_results?: ToolResult[];
   metadata?: MessageMetadata;
   timestamp: number;
 }
+
+export type ChatMessagePart =
+  | { type: 'text'; text: string }
+  | { type: 'visible_reasoning'; text: string }
+  | {
+      type: 'provider_opaque_reasoning_state';
+      state_id: string;
+      provider_id?: string;
+      model?: string;
+    }
+  | {
+      type: 'tool_call';
+      id: string;
+      name: string;
+      arguments_preview: unknown;
+      policy_decision: 'accepted' | 'rejected';
+      status: 'requested' | 'running' | 'success' | 'error';
+    }
+  | {
+      type: 'tool_result';
+      tool_call_id: string;
+      name: string;
+      status: 'requested' | 'running' | 'success' | 'error';
+      result_preview?: unknown;
+      error?: string;
+    }
+  | { type: 'build_proposal'; proposal: BuildProposal }
+  | { type: 'error'; message: string; recoverable: boolean }
+  | { type: 'cancellation'; reason: string };
 
 export interface ToolCall {
   id: string;
@@ -281,13 +311,50 @@ export type ChatEventKind =
   | 'tool_result'
   | 'build_proposal_parsed'
   | 'message_completed'
-  | 'message_failed';
+  | 'message_failed'
+  | 'message_cancelled';
+
+export type AgentEvent =
+  | { type: 'run_started' }
+  | { type: 'run_finished' }
+  | { type: 'run_error'; message: string; recoverable: boolean }
+  | { type: 'text_start' }
+  | { type: 'text_delta'; text: string }
+  | { type: 'text_end' }
+  | { type: 'reasoning_start' }
+  | { type: 'reasoning_delta'; text: string }
+  | { type: 'reasoning_end'; text: string }
+  | {
+      type: 'tool_call_start';
+      id: string;
+      name: string;
+      arguments_preview: unknown;
+      policy_decision: 'accepted' | 'rejected';
+    }
+  | {
+      type: 'tool_call_end';
+      id: string;
+      name: string;
+      status: 'requested' | 'running' | 'success' | 'error';
+    }
+  | {
+      type: 'tool_result';
+      tool_call_id: string;
+      name: string;
+      status: 'requested' | 'running' | 'success' | 'error';
+      result_preview?: unknown;
+      error?: string;
+    }
+  | { type: 'build_proposal'; proposal: BuildProposal }
+  | { type: 'abort_cancel'; reason: string }
+  | { type: 'recoverable_failure'; message: string };
 
 export interface ChatEventEnvelope {
   kind: ChatEventKind;
   session_id: string;
   message_id: string;
   sequence: number;
+  agent_event?: AgentEvent;
   provider_id?: string;
   model?: string;
   content_delta?: string;

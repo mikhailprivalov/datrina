@@ -25,7 +25,7 @@ This backlog records deferred features from the reconciliation plan. Items here 
 
 - Extend chat beyond the current bounded one-resume tool loop only after explicit UX and policy limits are defined.
 - Preserve the current no-key behavior: use clearly labeled `local_mock` dev/test mode for deterministic success, otherwise return unavailable/error state.
-- Rerun W13/W14 real-provider acceptance with user-provided credentials/service availability before treating external provider behavior as live-validated in this checkout.
+- Rerun W13-W15 real-provider acceptance with user-provided credentials/service availability before treating external provider behavior as live-validated in this checkout.
 - Add live token streaming support for Ollama only if product scope needs it; current Ollama chat events are honest synthetic single-step events.
 
 ## Dashboard And Widgets

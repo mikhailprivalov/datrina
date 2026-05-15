@@ -866,45 +866,120 @@ fn extract_output<'a>(node_results: &'a Value, output_key: &str) -> Option<&'a V
 }
 
 fn widget_runtime_data(widget: &Widget, output: &Value) -> AnyResult<Value> {
+    let normalized = normalize_datasource_output(output);
     match widget {
         Widget::Gauge { .. } => {
-            let value = output
+            let value = normalized
                 .as_f64()
-                .or_else(|| output.get("value").and_then(Value::as_f64))
+                .or_else(|| normalized.get("value").and_then(Value::as_f64))
+                .or_else(|| find_number(&normalized))
                 .ok_or_else(|| anyhow!("Gauge workflow output must be a number"))?;
             Ok(json!({ "kind": "gauge", "value": value }))
         }
         Widget::Text { .. } => {
-            let content = output
+            let content = normalized
                 .as_str()
                 .map(ToString::to_string)
-                .unwrap_or_else(|| output.to_string());
+                .unwrap_or_else(|| pretty_json(&normalized));
             Ok(json!({ "kind": "text", "content": content }))
         }
         Widget::Table { .. } => {
-            let rows = output
-                .as_array()
-                .ok_or_else(|| anyhow!("Table workflow output must be an array"))?;
+            let rows = coerce_rows(&normalized)
+                .ok_or_else(|| anyhow!("Table workflow output must be an array or object"))?;
             Ok(json!({ "kind": "table", "rows": rows }))
         }
         Widget::Chart { .. } => {
-            let rows = output
-                .as_array()
-                .ok_or_else(|| anyhow!("Chart workflow output must be an array"))?;
+            let rows = coerce_rows(&normalized)
+                .ok_or_else(|| anyhow!("Chart workflow output must be an array or object"))?;
             Ok(json!({ "kind": "chart", "rows": rows }))
         }
         Widget::Image { .. } => {
-            let src = output
+            let src = normalized
                 .as_str()
-                .or_else(|| output.get("src").and_then(Value::as_str))
+                .or_else(|| normalized.get("src").and_then(Value::as_str))
                 .ok_or_else(|| anyhow!("Image workflow output must be a string or src object"))?;
             Ok(json!({
                 "kind": "image",
                 "src": src,
-                "alt": output.get("alt").and_then(Value::as_str),
+                "alt": normalized.get("alt").and_then(Value::as_str),
             }))
         }
     }
+}
+
+fn normalize_datasource_output(output: &Value) -> Value {
+    if let Some(unwrapped) = unwrap_mcp_content(output) {
+        return unwrapped;
+    }
+    if let Some(text) = output.as_str() {
+        return parse_json_or_string(text);
+    }
+    output.clone()
+}
+
+fn unwrap_mcp_content(value: &Value) -> Option<Value> {
+    let content = value.get("content")?.as_array()?;
+    let text_parts = content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    if text_parts.is_empty() {
+        return None;
+    }
+    let text = text_parts.join("\n");
+    Some(parse_json_or_string(&text))
+}
+
+fn parse_json_or_string(text: &str) -> Value {
+    serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.to_string()))
+}
+
+fn coerce_rows(value: &Value) -> Option<Vec<Value>> {
+    if let Some(array) = value.as_array() {
+        return Some(array.iter().map(row_value).collect());
+    }
+
+    if let Some(object) = value.as_object() {
+        if let Some(array) = object.values().find_map(Value::as_array) {
+            return Some(array.iter().map(row_value).collect());
+        }
+        return Some(vec![row_value(value)]);
+    }
+
+    Some(vec![json!({ "value": value.clone() })])
+}
+
+fn row_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let row = object
+                .iter()
+                .map(|(key, value)| (key.clone(), cell_value(value)))
+                .collect::<serde_json::Map<_, _>>();
+            Value::Object(row)
+        }
+        _ => json!({ "value": cell_value(value) }),
+    }
+}
+
+fn cell_value(value: &Value) -> Value {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+        _ => Value::String(pretty_json(value)),
+    }
+}
+
+fn find_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::Array(items) => items.iter().find_map(find_number),
+        Value::Object(object) => object.values().find_map(find_number),
+        _ => None,
+    }
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn local_mvp_slice(now: i64) -> (Vec<Widget>, Vec<Workflow>) {

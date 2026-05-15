@@ -4,9 +4,10 @@ use tauri::{AppHandle, Emitter, State};
 use tracing::info;
 
 use crate::models::chat::{
-    ChatEventEnvelope, ChatEventKind, ChatMessage, ChatMode, ChatSession, CreateSessionRequest,
-    MessageMetadata, MessageRole, SendMessageRequest, ToolCallTrace, ToolPolicyDecision,
-    ToolResult, ToolResultTrace, ToolTraceStatus, CHAT_EVENT_CHANNEL,
+    AgentEvent, ChatEventEnvelope, ChatEventKind, ChatMessage, ChatMessagePart, ChatMode,
+    ChatSession, CreateSessionRequest, MessageMetadata, MessageRole, SendMessageRequest,
+    ToolCallTrace, ToolPolicyDecision, ToolResult, ToolResultTrace, ToolTraceStatus,
+    CHAT_EVENT_CHANNEL,
 };
 use crate::models::dashboard::BuildProposal;
 use crate::models::mcp::{MCPServer, MCPTransport};
@@ -86,6 +87,7 @@ pub async fn send_message(
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::User,
         content: req.content.clone(),
+        parts: text_parts(&req.content),
         mode: session.mode.clone(),
         tool_calls: None,
         tool_results: None,
@@ -147,18 +149,15 @@ pub async fn send_message(
         None => None,
     };
 
-    let mut provider_messages = match grounded_messages(&state, &session).await {
+    let mut provider_messages = match grounded_messages(state.inner(), &session).await {
         Ok(messages) => messages,
         Err(e) => return Ok(ApiResult::err(e.to_string())),
     };
     if let Some(server) = prompt_mcp_server.as_ref() {
-        provider_messages.push(system_message(format!(
-            "The user supplied a stdio MCP server for this build request. It has been configured and enabled with server_id '{}'. Inspect and use its available tools through the mcp_tool function. For widgets backed by this MCP, return datasource_plan.kind='mcp_tool' and datasource_plan.server_id='{}'.",
-            server.id, server.id
-        )));
+        provider_messages.push(system_message(prompt_mcp_system_message(server)));
     }
 
-    let tool_specs = match chat_tool_specs(&state, prompt_mcp_server.is_some()).await {
+    let tool_specs = match chat_tool_specs(state.inner(), prompt_mcp_server.is_some()).await {
         Ok(specs) => specs,
         Err(e) => return Ok(ApiResult::err(format!("MCP tool discovery failed: {}", e))),
     };
@@ -171,7 +170,7 @@ pub async fn send_message(
         Err(e) => return Ok(ApiResult::err(format!("AI provider call failed: {}", e))),
     };
 
-    let mut persisted_tool_calls = ai_response.tool_calls.clone();
+    let mut persisted_tool_calls = Vec::new();
     let mut persisted_tool_results = Vec::new();
     let mut final_content = ai_response.content.clone();
     let mut final_model = ai_response.model.clone();
@@ -181,14 +180,22 @@ pub async fn send_message(
     let mut final_reasoning = ai_response.reasoning.clone();
 
     if !ai_response.tool_calls.is_empty() {
+        let assistant_tool_content = if ai_response.content.trim().is_empty() {
+            "Tool call requested by provider.".to_string()
+        } else {
+            ai_response.content.clone()
+        };
         let assistant_tool_msg = ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: MessageRole::Assistant,
-            content: if ai_response.content.trim().is_empty() {
-                "Tool call requested by provider.".to_string()
-            } else {
-                ai_response.content.clone()
-            },
+            content: assistant_tool_content.clone(),
+            parts: assistant_parts(
+                &assistant_tool_content,
+                ai_response.reasoning.as_ref(),
+                &ai_response.tool_calls,
+                &[],
+                None,
+            ),
             mode: session.mode.clone(),
             tool_calls: Some(ai_response.tool_calls.clone()),
             tool_results: None,
@@ -205,13 +212,15 @@ pub async fn send_message(
         session.messages.push(assistant_tool_msg);
 
         for call in &ai_response.tool_calls {
-            persisted_tool_results.push(execute_chat_tool(&state, call).await);
+            persisted_tool_results.push(execute_chat_tool(state.inner(), call).await);
         }
 
+        let tool_content = serde_json::to_string(&persisted_tool_results).unwrap_or_default();
         let tool_msg = ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: MessageRole::Tool,
-            content: serde_json::to_string(&persisted_tool_results).unwrap_or_default(),
+            content: tool_content,
+            parts: tool_result_parts(&persisted_tool_results),
             mode: session.mode.clone(),
             tool_calls: None,
             tool_results: Some(persisted_tool_results.clone()),
@@ -220,7 +229,7 @@ pub async fn send_message(
         };
         session.messages.push(tool_msg);
 
-        let resumed_messages = match grounded_messages(&state, &session).await {
+        let resumed_messages = match grounded_messages(state.inner(), &session).await {
             Ok(messages) => messages,
             Err(e) => return Ok(ApiResult::err(e.to_string())),
         };
@@ -251,14 +260,22 @@ pub async fn send_message(
         None
     };
 
+    let assistant_content = build_proposal
+        .as_ref()
+        .and_then(|proposal| proposal.summary.clone())
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or(final_content);
     let assistant_msg = ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::Assistant,
-        content: build_proposal
-            .as_ref()
-            .and_then(|proposal| proposal.summary.clone())
-            .filter(|summary| !summary.trim().is_empty())
-            .unwrap_or(final_content),
+        content: assistant_content.clone(),
+        parts: assistant_parts(
+            &assistant_content,
+            final_reasoning.as_ref(),
+            &persisted_tool_calls,
+            &persisted_tool_results,
+            build_proposal.as_ref(),
+        ),
         mode: session.mode.clone(),
         tool_calls: if persisted_tool_calls.is_empty() {
             None
@@ -310,6 +327,7 @@ pub async fn send_message_stream(
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::User,
         content: req.content.clone(),
+        parts: text_parts(&req.content),
         mode: session.mode.clone(),
         tool_calls: None,
         tool_results: None,
@@ -371,6 +389,7 @@ pub async fn send_message_stream(
             session_id: session_id.clone(),
             message_id: assistant_message_id.clone(),
             sequence: next_sequence(&mut sequence),
+            agent_event: Some(AgentEvent::RunStarted),
             provider_id: Some(provider.id.clone()),
             model: Some(provider.default_model.clone()),
             content_delta: None,
@@ -386,31 +405,53 @@ pub async fn send_message_stream(
         },
     );
 
-    let result = send_message_stream_inner(
-        &app,
-        &state,
-        &mut session,
-        &provider,
-        &req,
-        &assistant_message_id,
-        &abort_flag,
-        &mut sequence,
-        synthetic_stream,
-    )
-    .await;
+    let draft = ChatMessage {
+        id: assistant_message_id.clone(),
+        role: MessageRole::Assistant,
+        content: String::new(),
+        parts: Vec::new(),
+        mode: session.mode.clone(),
+        tool_calls: None,
+        tool_results: None,
+        metadata: Some(MessageMetadata {
+            model: Some(provider.default_model.clone()),
+            provider: Some(provider.id.clone()),
+            tokens: None,
+            latency_ms: None,
+            build_proposal: None,
+            reasoning: None,
+        }),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    };
 
-    state.chat_abort_flags.remove(&session_id);
+    let app_for_task = app.clone();
+    let state_for_task = state.inner().clone();
+    let session_id_for_task = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = send_message_stream_inner(
+            &app_for_task,
+            &state_for_task,
+            &mut session,
+            &provider,
+            &req,
+            &assistant_message_id,
+            &abort_flag,
+            &mut sequence,
+            synthetic_stream,
+        )
+        .await;
 
-    match result {
-        Ok(message) => Ok(ApiResult::ok(message)),
-        Err(error) => {
+        state_for_task.chat_abort_flags.remove(&session_id_for_task);
+
+        if let Err(error) = result {
             emit_chat_event(
-                &app,
+                &app_for_task,
                 ChatEventEnvelope {
-                    kind: ChatEventKind::MessageFailed,
-                    session_id: session_id.clone(),
+                    kind: failed_event_kind(&error),
+                    session_id: session_id_for_task,
                     message_id: assistant_message_id,
                     sequence: next_sequence(&mut sequence),
+                    agent_event: Some(failed_agent_event(&error)),
                     provider_id: Some(provider.id),
                     model: Some(provider.default_model),
                     content_delta: None,
@@ -425,9 +466,10 @@ pub async fn send_message_stream(
                     emitted_at: chrono::Utc::now().timestamp_millis(),
                 },
             );
-            Ok(ApiResult::err(error.to_string()))
         }
-    }
+    });
+
+    Ok(ApiResult::ok(draft))
 }
 
 #[tauri::command]
@@ -445,7 +487,7 @@ pub async fn cancel_chat_response(
 
 async fn send_message_stream_inner(
     app: &AppHandle,
-    state: &State<'_, AppState>,
+    state: &AppState,
     session: &mut ChatSession,
     provider: &crate::models::provider::LLMProvider,
     req: &SendMessageRequest,
@@ -474,10 +516,7 @@ async fn send_message_stream_inner(
 
     let mut provider_messages = grounded_messages(state, session).await?;
     if let Some(server) = prompt_mcp_server.as_ref() {
-        provider_messages.push(system_message(format!(
-            "The user supplied a stdio MCP server for this build request. It has been configured and enabled with server_id '{}'. Inspect and use its available tools through the mcp_tool function. For widgets backed by this MCP, return datasource_plan.kind='mcp_tool' and datasource_plan.server_id='{}'.",
-            server.id, server.id
-        )));
+        provider_messages.push(system_message(prompt_mcp_system_message(server)));
     }
 
     let tool_specs = chat_tool_specs(state, prompt_mcp_server.is_some())
@@ -501,6 +540,14 @@ async fn send_message_stream_inner(
             &tool_specs,
             |event| match event {
                 AIStreamEvent::ContentDelta(delta) => {
+                    if content_seen.is_empty() {
+                        info!(
+                            "chat first content delta: session={} message={} chars={}",
+                            emit_session_id,
+                            emit_message_id,
+                            delta.chars().count()
+                        );
+                    }
                     content_seen.push_str(&delta);
                     emit_chat_event(
                         &emit_app,
@@ -509,6 +556,9 @@ async fn send_message_stream_inner(
                             session_id: emit_session_id.clone(),
                             message_id: emit_message_id.clone(),
                             sequence: next_sequence(sequence),
+                            agent_event: Some(AgentEvent::TextDelta {
+                                text: delta.clone(),
+                            }),
                             provider_id: Some(provider_id.clone()),
                             model: Some(model.clone()),
                             content_delta: Some(delta),
@@ -525,6 +575,14 @@ async fn send_message_stream_inner(
                     );
                 }
                 AIStreamEvent::ReasoningDelta(delta) => {
+                    if reasoning_seen.is_empty() {
+                        info!(
+                            "chat first reasoning delta: session={} message={} chars={}",
+                            emit_session_id,
+                            emit_message_id,
+                            delta.chars().count()
+                        );
+                    }
                     reasoning_seen.push_str(&delta);
                     emit_chat_event(
                         &emit_app,
@@ -533,6 +591,9 @@ async fn send_message_stream_inner(
                             session_id: emit_session_id.clone(),
                             message_id: emit_message_id.clone(),
                             sequence: next_sequence(sequence),
+                            agent_event: Some(AgentEvent::ReasoningDelta {
+                                text: delta.clone(),
+                            }),
                             provider_id: Some(provider_id.clone()),
                             model: Some(model.clone()),
                             content_delta: None,
@@ -553,8 +614,16 @@ async fn send_message_stream_inner(
         )
         .await
         .map_err(|e| anyhow::anyhow!("AI provider stream failed: {}", e))?;
+    info!(
+        "chat stream first pass complete: session={} message={} content_chars={} reasoning_chars={} tool_calls={}",
+        session.id,
+        assistant_message_id,
+        ai_response.content.chars().count(),
+        ai_response.reasoning.as_ref().map(|value| value.chars().count()).unwrap_or(0),
+        ai_response.tool_calls.len()
+    );
 
-    let mut persisted_tool_calls = ai_response.tool_calls.clone();
+    let mut persisted_tool_calls = Vec::new();
     let mut persisted_tool_results = Vec::new();
     let mut final_content = ai_response.content.clone();
     let mut final_model = ai_response.model.clone();
@@ -574,6 +643,9 @@ async fn send_message_stream_inner(
                 session_id: session.id.clone(),
                 message_id: assistant_message_id.to_string(),
                 sequence: next_sequence(sequence),
+                agent_event: Some(AgentEvent::ReasoningEnd {
+                    text: reasoning_seen.clone(),
+                }),
                 provider_id: Some(provider.id.clone()),
                 model: Some(provider.default_model.clone()),
                 content_delta: None,
@@ -590,31 +662,58 @@ async fn send_message_stream_inner(
         );
     }
 
-    if !ai_response.tool_calls.is_empty() {
+    let mut pending_tool_response = Some(ai_response);
+    let mut tool_iteration = 0_u8;
+    while pending_tool_response
+        .as_ref()
+        .is_some_and(|response| !response.tool_calls.is_empty())
+    {
+        let response_with_tools = pending_tool_response
+            .take()
+            .expect("pending response was checked above");
+        tool_iteration += 1;
+        if tool_iteration > 1 {
+            final_content = "Stopped because the provider requested more tools after the bounded one-resume chat loop.".to_string();
+            break;
+        }
+        persisted_tool_calls.extend(response_with_tools.tool_calls.clone());
+        let assistant_tool_content = if response_with_tools.content.trim().is_empty() {
+            "Tool call requested by provider.".to_string()
+        } else {
+            response_with_tools.content.clone()
+        };
         let assistant_tool_msg = ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: MessageRole::Assistant,
-            content: if ai_response.content.trim().is_empty() {
-                "Tool call requested by provider.".to_string()
-            } else {
-                ai_response.content.clone()
-            },
+            content: assistant_tool_content.clone(),
+            parts: assistant_parts(
+                &assistant_tool_content,
+                response_with_tools.reasoning.as_ref(),
+                &response_with_tools.tool_calls,
+                &[],
+                None,
+            ),
             mode: session.mode.clone(),
-            tool_calls: Some(ai_response.tool_calls.clone()),
+            tool_calls: Some(response_with_tools.tool_calls.clone()),
             tool_results: None,
             metadata: Some(MessageMetadata {
-                model: Some(ai_response.model.clone()),
-                provider: Some(ai_response.provider_id.clone()),
-                tokens: ai_response.tokens.clone(),
-                latency_ms: Some(ai_response.latency_ms),
+                model: Some(response_with_tools.model.clone()),
+                provider: Some(response_with_tools.provider_id.clone()),
+                tokens: response_with_tools.tokens.clone(),
+                latency_ms: Some(response_with_tools.latency_ms),
                 build_proposal: None,
-                reasoning: ai_response.reasoning.clone(),
+                reasoning: response_with_tools.reasoning.clone(),
             }),
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         session.messages.push(assistant_tool_msg);
 
-        for call in &ai_response.tool_calls {
+        let mut current_tool_results = Vec::new();
+        for call in &response_with_tools.tool_calls {
+            info!(
+                "chat tool call started: session={} message={} iteration={} tool={}",
+                session.id, assistant_message_id, tool_iteration, call.name
+            );
             emit_tool_call_event(
                 app,
                 session,
@@ -636,6 +735,18 @@ async fn send_message_stream_inner(
                 synthetic_stream,
             );
             let result = execute_chat_tool(state, call).await;
+            info!(
+                "chat tool call finished: session={} message={} iteration={} tool={} status={}",
+                session.id,
+                assistant_message_id,
+                tool_iteration,
+                call.name,
+                if result.error.is_some() {
+                    "error"
+                } else {
+                    "success"
+                }
+            );
             emit_tool_result_event(
                 app,
                 session,
@@ -645,31 +756,52 @@ async fn send_message_stream_inner(
                 &result,
                 synthetic_stream,
             );
+            current_tool_results.push(result.clone());
             persisted_tool_results.push(result);
         }
 
+        let tool_content = serde_json::to_string(&current_tool_results).unwrap_or_default();
         let tool_msg = ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: MessageRole::Tool,
-            content: serde_json::to_string(&persisted_tool_results).unwrap_or_default(),
+            content: tool_content,
+            parts: tool_result_parts(&current_tool_results),
             mode: session.mode.clone(),
             tool_calls: None,
-            tool_results: Some(persisted_tool_results.clone()),
+            tool_results: Some(current_tool_results),
             metadata: None,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         session.messages.push(tool_msg);
 
         let resumed_messages = grounded_messages(state, session).await?;
+        info!(
+            "chat stream resume started: session={} message={} iteration={} total_tool_results={}",
+            session.id,
+            assistant_message_id,
+            tool_iteration,
+            persisted_tool_results.len()
+        );
         let resume_cancel = abort_flag.clone();
+        let mut resume_content_seen = String::new();
         let resumed = state
             .ai_engine
             .complete_chat_with_tools_streaming(
                 provider,
                 &resumed_messages,
-                &[],
+                &tool_specs,
                 |event| match event {
                     AIStreamEvent::ContentDelta(delta) => {
+                        if resume_content_seen.is_empty() {
+                            info!(
+                                "chat resume first content delta: session={} message={} iteration={} chars={}",
+                                session.id,
+                                assistant_message_id,
+                                tool_iteration,
+                                delta.chars().count()
+                            );
+                        }
+                        resume_content_seen.push_str(&delta);
                         emit_chat_event(
                             app,
                             ChatEventEnvelope {
@@ -677,6 +809,9 @@ async fn send_message_stream_inner(
                                 session_id: session.id.clone(),
                                 message_id: assistant_message_id.to_string(),
                                 sequence: next_sequence(sequence),
+                                agent_event: Some(AgentEvent::TextDelta {
+                                    text: delta.clone(),
+                                }),
                                 provider_id: Some(provider.id.clone()),
                                 model: Some(provider.default_model.clone()),
                                 content_delta: Some(delta),
@@ -701,6 +836,9 @@ async fn send_message_stream_inner(
                                 session_id: session.id.clone(),
                                 message_id: assistant_message_id.to_string(),
                                 sequence: next_sequence(sequence),
+                                agent_event: Some(AgentEvent::ReasoningDelta {
+                                    text: delta.clone(),
+                                }),
                                 provider_id: Some(provider.id.clone()),
                                 model: Some(provider.default_model.clone()),
                                 content_delta: None,
@@ -723,21 +861,56 @@ async fn send_message_stream_inner(
 
         match resumed {
             Ok(response) => {
-                final_content = response.content;
-                final_model = response.model;
-                final_provider_id = response.provider_id;
-                final_tokens = response.tokens;
+                info!(
+                    "chat stream resume complete: session={} message={} iteration={} content_chars={} reasoning_chars={} tool_calls={}",
+                    session.id,
+                    assistant_message_id,
+                    tool_iteration,
+                    response.content.chars().count(),
+                    response.reasoning.as_ref().map(|value| value.chars().count()).unwrap_or(0),
+                    response.tool_calls.len()
+                );
+                final_content = response.content.clone();
+                final_model = response.model.clone();
+                final_provider_id = response.provider_id.clone();
+                final_tokens = response.tokens.clone();
                 final_latency_ms = response.latency_ms;
                 final_reasoning = response
                     .reasoning
+                    .clone()
                     .or_else(|| non_empty(reasoning_seen.clone()));
-                persisted_tool_calls.extend(response.tool_calls);
+                pending_tool_response = Some(response);
             }
             Err(e) => {
+                info!(
+                    "chat stream resume failed: session={} message={} iteration={} error={}",
+                    session.id, assistant_message_id, tool_iteration, e
+                );
                 final_content =
                     format!("Tool result was recorded, but provider resume failed: {e}");
+                pending_tool_response = None;
             }
         }
+
+        if !pending_tool_response
+            .as_ref()
+            .is_some_and(|response| !response.tool_calls.is_empty())
+        {
+            break;
+        }
+    }
+
+    if let Some(final_response) =
+        pending_tool_response.filter(|response| response.tool_calls.is_empty())
+    {
+        final_content = final_response.content;
+        final_model = final_response.model;
+        final_provider_id = final_response.provider_id;
+        final_tokens = final_response.tokens;
+        final_latency_ms = final_response.latency_ms;
+        final_reasoning = final_response
+            .reasoning
+            .or_else(|| non_empty(reasoning_seen.clone()));
     }
 
     let build_proposal = if matches!(session.mode, ChatMode::Build) {
@@ -754,6 +927,9 @@ async fn send_message_stream_inner(
                 session_id: session.id.clone(),
                 message_id: assistant_message_id.to_string(),
                 sequence: next_sequence(sequence),
+                agent_event: Some(AgentEvent::BuildProposal {
+                    proposal: proposal.clone(),
+                }),
                 provider_id: Some(final_provider_id.clone()),
                 model: Some(final_model.clone()),
                 content_delta: None,
@@ -770,14 +946,22 @@ async fn send_message_stream_inner(
         );
     }
 
+    let assistant_content = build_proposal
+        .as_ref()
+        .and_then(|proposal| proposal.summary.clone())
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or(final_content);
     let assistant_msg = ChatMessage {
         id: assistant_message_id.to_string(),
         role: MessageRole::Assistant,
-        content: build_proposal
-            .as_ref()
-            .and_then(|proposal| proposal.summary.clone())
-            .filter(|summary| !summary.trim().is_empty())
-            .unwrap_or(final_content),
+        content: assistant_content.clone(),
+        parts: assistant_parts(
+            &assistant_content,
+            final_reasoning.as_ref(),
+            &persisted_tool_calls,
+            &persisted_tool_results,
+            build_proposal.as_ref(),
+        ),
         mode: session.mode.clone(),
         tool_calls: if persisted_tool_calls.is_empty() {
             None
@@ -803,6 +987,22 @@ async fn send_message_stream_inner(
     session.updated_at = chrono::Utc::now().timestamp_millis();
 
     state.storage.update_chat_session(session).await?;
+    info!(
+        "chat message completed: session={} message={} content_chars={} has_proposal={} has_reasoning={}",
+        session.id,
+        assistant_message_id,
+        assistant_msg.content.chars().count(),
+        assistant_msg
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.build_proposal.as_ref())
+            .is_some(),
+        assistant_msg
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.reasoning.as_ref())
+            .is_some()
+    );
 
     emit_chat_event(
         app,
@@ -811,6 +1011,7 @@ async fn send_message_stream_inner(
             session_id: session.id.clone(),
             message_id: assistant_message_id.to_string(),
             sequence: next_sequence(sequence),
+            agent_event: Some(AgentEvent::RunFinished),
             provider_id: assistant_msg
                 .metadata
                 .as_ref()
@@ -848,8 +1049,11 @@ fn next_sequence(sequence: &mut u32) -> u32 {
 }
 
 fn emit_chat_event(app: &AppHandle, event: ChatEventEnvelope) {
-    if let Err(error) = app.emit(CHAT_EVENT_CHANNEL, event) {
-        tracing::warn!("failed to emit chat event: {}", error);
+    if let Err(window_error) = app.emit_to("main", CHAT_EVENT_CHANNEL, event.clone()) {
+        tracing::warn!("failed to emit chat event to main window: {}", window_error);
+        if let Err(app_error) = app.emit(CHAT_EVENT_CHANNEL, event) {
+            tracing::warn!("failed to emit app-wide chat event: {}", app_error);
+        }
     }
 }
 
@@ -863,16 +1067,31 @@ fn emit_tool_call_event(
     status: ToolTraceStatus,
     synthetic_stream: bool,
 ) {
+    let arguments_preview = preview_json(&call.arguments);
+    let event_kind = match &status {
+        ToolTraceStatus::Requested => ChatEventKind::ToolCallRequested,
+        _ => ChatEventKind::ToolExecutionStarted,
+    };
     emit_chat_event(
         app,
         ChatEventEnvelope {
-            kind: match status {
-                ToolTraceStatus::Requested => ChatEventKind::ToolCallRequested,
-                _ => ChatEventKind::ToolExecutionStarted,
-            },
+            kind: event_kind,
             session_id: session.id.clone(),
             message_id: assistant_message_id.to_string(),
             sequence: next_sequence(sequence),
+            agent_event: Some(match &status {
+                ToolTraceStatus::Requested => AgentEvent::ToolCallStart {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments_preview: arguments_preview.clone(),
+                    policy_decision: ToolPolicyDecision::Accepted,
+                },
+                _ => AgentEvent::ToolCallEnd {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    status: status.clone(),
+                },
+            }),
             provider_id: Some(provider.id.clone()),
             model: Some(provider.default_model.clone()),
             content_delta: None,
@@ -881,7 +1100,7 @@ fn emit_tool_call_event(
             tool_call: Some(ToolCallTrace {
                 id: call.id.clone(),
                 name: call.name.clone(),
-                arguments_preview: preview_json(&call.arguments),
+                arguments_preview,
                 policy_decision: ToolPolicyDecision::Accepted,
                 status,
             }),
@@ -904,6 +1123,12 @@ fn emit_tool_result_event(
     result: &ToolResult,
     synthetic_stream: bool,
 ) {
+    let status = if result.error.is_some() {
+        ToolTraceStatus::Error
+    } else {
+        ToolTraceStatus::Success
+    };
+    let result_preview = Some(preview_json(&result.result));
     emit_chat_event(
         app,
         ChatEventEnvelope {
@@ -911,6 +1136,13 @@ fn emit_tool_result_event(
             session_id: session.id.clone(),
             message_id: assistant_message_id.to_string(),
             sequence: next_sequence(sequence),
+            agent_event: Some(AgentEvent::ToolResult {
+                tool_call_id: result.tool_call_id.clone(),
+                name: result.name.clone(),
+                status: status.clone(),
+                result_preview: result_preview.clone(),
+                error: result.error.clone(),
+            }),
             provider_id: Some(provider.id.clone()),
             model: Some(provider.default_model.clone()),
             content_delta: None,
@@ -920,12 +1152,8 @@ fn emit_tool_result_event(
             tool_result: Some(ToolResultTrace {
                 tool_call_id: result.tool_call_id.clone(),
                 name: result.name.clone(),
-                status: if result.error.is_some() {
-                    ToolTraceStatus::Error
-                } else {
-                    ToolTraceStatus::Success
-                },
-                result_preview: Some(preview_json(&result.result)),
+                status,
+                result_preview,
                 error: result.error.clone(),
             }),
             build_proposal: None,
@@ -942,6 +1170,97 @@ fn non_empty(value: String) -> Option<String> {
         None
     } else {
         Some(value)
+    }
+}
+
+fn text_parts(content: &str) -> Vec<ChatMessagePart> {
+    if content.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![ChatMessagePart::Text {
+            text: content.to_string(),
+        }]
+    }
+}
+
+fn assistant_parts(
+    content: &str,
+    reasoning: Option<&String>,
+    tool_calls: &[crate::models::chat::ToolCall],
+    tool_results: &[ToolResult],
+    build_proposal: Option<&BuildProposal>,
+) -> Vec<ChatMessagePart> {
+    let mut parts = text_parts(content);
+    if let Some(reasoning) = reasoning.filter(|value| !value.trim().is_empty()) {
+        parts.push(ChatMessagePart::VisibleReasoning {
+            text: reasoning.clone(),
+        });
+    }
+    for call in tool_calls {
+        let result_status = tool_results
+            .iter()
+            .find(|result| result.tool_call_id == call.id)
+            .map(|result| {
+                if result.error.is_some() {
+                    ToolTraceStatus::Error
+                } else {
+                    ToolTraceStatus::Success
+                }
+            })
+            .unwrap_or(ToolTraceStatus::Requested);
+        parts.push(ChatMessagePart::ToolCall {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments_preview: preview_json(&call.arguments),
+            policy_decision: ToolPolicyDecision::Accepted,
+            status: result_status,
+        });
+    }
+    parts.extend(tool_result_parts(tool_results));
+    if let Some(proposal) = build_proposal {
+        parts.push(ChatMessagePart::BuildProposal {
+            proposal: proposal.clone(),
+        });
+    }
+    parts
+}
+
+fn tool_result_parts(tool_results: &[ToolResult]) -> Vec<ChatMessagePart> {
+    tool_results
+        .iter()
+        .map(|result| ChatMessagePart::ToolResult {
+            tool_call_id: result.tool_call_id.clone(),
+            name: result.name.clone(),
+            status: if result.error.is_some() {
+                ToolTraceStatus::Error
+            } else {
+                ToolTraceStatus::Success
+            },
+            result_preview: Some(preview_json(&result.result)),
+            error: result.error.clone(),
+        })
+        .collect()
+}
+
+fn failed_event_kind(error: &anyhow::Error) -> ChatEventKind {
+    if error.to_string().contains("chat_stream_cancelled") {
+        ChatEventKind::MessageCancelled
+    } else {
+        ChatEventKind::MessageFailed
+    }
+}
+
+fn failed_agent_event(error: &anyhow::Error) -> AgentEvent {
+    let message = error.to_string();
+    if message.contains("chat_stream_cancelled") {
+        AgentEvent::AbortCancel {
+            reason: "cancelled by user".to_string(),
+        }
+    } else {
+        AgentEvent::RunError {
+            message,
+            recoverable: true,
+        }
     }
 }
 
@@ -1024,7 +1343,7 @@ fn looks_like_secret(value: &str) -> bool {
 }
 
 async fn grounded_messages(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session: &ChatSession,
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
@@ -1085,7 +1404,8 @@ fn system_message(content: String) -> ChatMessage {
     ChatMessage {
         id: "runtime-system-context".to_string(),
         role: MessageRole::System,
-        content,
+        content: content.clone(),
+        parts: text_parts(&content),
         mode: ChatMode::Context,
         tool_calls: None,
         tool_results: None,
@@ -1121,13 +1441,19 @@ Required JSON shape:
     }
   ]
 }
-Every widget must include datasource_plan. Use builtin_tool/http_request for reachable public HTTP data, mcp_tool for a configured stdio MCP server when available, or provider_prompt when the datasource should be produced by the active Rust-mediated provider. Do not return only literal static data as the datasource."#.to_string()
+Every widget must include datasource_plan. Use builtin_tool/http_request for reachable public HTTP data, mcp_tool for a configured stdio MCP server when available, or provider_prompt when the datasource should be produced by the active Rust-mediated provider. Do not return only literal static data as the datasource.
+
+When the user supplies an MCP server in the prompt and asks to build a dashboard from it, first call mcp_tool to inspect the real tool result. Use the observed result shape to choose the widget type, datasource_plan.arguments, and datasource_plan.output_path. Prefer a compact table or text widget for release/status data. Use the exact server_id and tool_name from the tool list."#.to_string()
 }
 
-async fn chat_tool_specs(
-    state: &State<'_, AppState>,
-    require_mcp: bool,
-) -> anyhow::Result<Vec<AIToolSpec>> {
+fn prompt_mcp_system_message(server: &MCPServer) -> String {
+    format!(
+        "The user supplied a stdio MCP server for this build request. It has been configured and enabled with server_id '{}'. You must inspect and use its available tools through the mcp_tool function before returning the final dashboard proposal. For widgets backed by this MCP, return datasource_plan.kind='mcp_tool', datasource_plan.server_id='{}', the exact working datasource_plan.tool_name, and the arguments that produced the useful result.",
+        server.id, server.id
+    )
+}
+
+async fn chat_tool_specs(state: &AppState, require_mcp: bool) -> anyhow::Result<Vec<AIToolSpec>> {
     let mut specs = vec![AIToolSpec {
         name: "http_request".to_string(),
         description: "Make a policy-gated HTTP request through Datrina's Rust ToolEngine. Localhost, private networks, and blocked schemes are denied.".to_string(),
@@ -1161,15 +1487,11 @@ async fn chat_tool_specs(
         Err(_) => Vec::new(),
     };
     if !mcp_tools.is_empty() {
-        let available = mcp_tools
-            .iter()
-            .map(|tool| format!("{}.{}", tool.server_id, tool.name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let available = describe_mcp_tools(&mcp_tools);
         specs.push(AIToolSpec {
             name: "mcp_tool".to_string(),
             description: format!(
-                "Call a connected or reconnectable stdio MCP tool through Datrina's Rust policy gateway. Available tools: {}",
+                "Call a connected or reconnectable stdio MCP tool through Datrina's Rust policy gateway. Use exact server_id and tool_name values. Available tools:\n{}",
                 available
             ),
             parameters: serde_json::json!({
@@ -1187,10 +1509,24 @@ async fn chat_tool_specs(
     Ok(specs)
 }
 
-async fn execute_chat_tool(
-    state: &State<'_, AppState>,
-    call: &crate::models::chat::ToolCall,
-) -> ToolResult {
+fn describe_mcp_tools(tools: &[crate::models::mcp::MCPTool]) -> String {
+    tools
+        .iter()
+        .take(12)
+        .map(|tool| {
+            format!(
+                "- server_id: {}; tool_name: {}; description: {}; input_schema: {}",
+                tool.server_id,
+                tool.name,
+                tool.description,
+                preview_json(&tool.input_schema)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn execute_chat_tool(state: &AppState, call: &crate::models::chat::ToolCall) -> ToolResult {
     let outcome = match call.name.as_str() {
         "http_request" => {
             let method = call
@@ -1247,7 +1583,7 @@ async fn execute_chat_tool(
 }
 
 async fn execute_mcp_tool(
-    state: &State<'_, AppState>,
+    state: &AppState,
     server_id: &str,
     tool_name: &str,
     arguments: Option<serde_json::Value>,
@@ -1264,17 +1600,42 @@ async fn execute_mcp_tool(
         state.tool_engine.validate_mcp_server(&server)?;
         state.mcp_manager.connect(server).await?;
     }
+    let tool_name = resolve_mcp_tool_name(state, server_id, tool_name).await;
     state
         .tool_engine
-        .validate_mcp_tool_call(server_id, tool_name)?;
+        .validate_mcp_tool_call(server_id, &tool_name)?;
     state
         .mcp_manager
-        .call_tool(server_id, tool_name, arguments)
+        .call_tool(server_id, &tool_name, arguments)
         .await
 }
 
+async fn resolve_mcp_tool_name(state: &AppState, server_id: &str, requested: &str) -> String {
+    let requested = requested.trim();
+    let tools = state.mcp_manager.list_tools().await;
+    if tools
+        .iter()
+        .any(|tool| tool.server_id == server_id && tool.name == requested)
+    {
+        return requested.to_string();
+    }
+
+    tools
+        .iter()
+        .find(|tool| {
+            tool.server_id == server_id
+                && tool
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|suffix| suffix == requested)
+        })
+        .map(|tool| tool.name.clone())
+        .unwrap_or_else(|| requested.to_string())
+}
+
 async fn reconnect_enabled_mcp_servers(
-    state: &State<'_, AppState>,
+    state: &AppState,
 ) -> anyhow::Result<Vec<crate::models::mcp::MCPTool>> {
     let servers = state.storage.list_mcp_servers().await?;
     let mut all_tools = Vec::new();

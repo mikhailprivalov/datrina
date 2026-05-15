@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Global application state
+#[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<Storage>,
     pub mcp_manager: Arc<MCPManager>,
