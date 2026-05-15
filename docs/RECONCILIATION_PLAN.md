@@ -772,6 +772,126 @@ Parallelism:
 - Serial cleanup after W10. Do not overlap with work that changes system command
   registration or Tauri plugin bootstrap.
 
+### W12 - Provider-Driven Agentic Dashboard Builder
+
+Status: planned
+
+Depends on: W11
+
+Owner role: agentic product completion agent
+
+Ownership:
+
+- `datrina/src/lib/api.ts`
+- `datrina/src/App.tsx`
+- `datrina/src/components/layout/*`
+- `datrina/src/components/widgets/*`
+- `datrina/src-tauri/src/commands/chat.rs`
+- `datrina/src-tauri/src/commands/dashboard.rs`
+- `datrina/src-tauri/src/commands/mcp.rs`
+- `datrina/src-tauri/src/commands/provider.rs`
+- `datrina/src-tauri/src/commands/tool.rs`
+- `datrina/src-tauri/src/commands/workflow.rs`
+- `datrina/src-tauri/src/models/*`
+- `datrina/src-tauri/src/modules/ai.rs`
+- `datrina/src-tauri/src/modules/mcp_manager.rs`
+- `datrina/src-tauri/src/modules/tool_engine.rs`
+- `datrina/src-tauri/src/modules/workflow_engine.rs`
+- targeted validation/docs updates under `datrina/docs/`, `datrina/README.md`,
+  and `datrina/docs/RESIDUAL_BACKLOG.md`
+
+Scope:
+
+- Keep W0-W11 accepted reconciliation history unchanged while closing the
+  shortest path to a real no-mock local-first product.
+- Make real-provider behavior the primary W12 acceptance lane. `local_mock` may
+  remain only as an explicitly labeled dev/test smoke mode, not as acceptance
+  evidence for AI-backed behavior.
+- Implement provider-driven chat tool calling end to end: tool schema emission,
+  tool-call parsing, policy-gated `ToolEngine`/MCP execution, tool-result
+  messages, persisted/audited execution state, visible errors, and a bounded
+  resume loop.
+- Make MCP stdio enable fail on initialize or `tools/list` timeout/error instead
+  of storing a fake connected state.
+- Add an explicit reconnect or autoconnect path for persisted enabled stdio MCP
+  servers needed by chat or workflow execution after app restart.
+- Replace fixed Build Chat apply buttons with provider-generated structured
+  dashboard/widget/workflow proposals.
+- Show a preview or diff for generated proposals, require explicit user
+  confirmation, and apply mutations only through Rust commands.
+- Persist generated dashboards, widgets, workflows, and datasource bindings;
+  verify that reload preserves the applied result and that widgets refresh
+  through real runtime data paths.
+- Cover the product-critical widget authoring path needed by generated
+  proposals: chart, table, text, gauge, and image create/edit behavior should be
+  usable enough to render refreshed runtime data without sample-only product
+  paths.
+- Keep unsupported or post-MVP features explicit, but no key W12 product path may
+  end in mock success, hidden placeholder behavior, or a generic unavailable
+  state.
+
+Out of scope:
+
+- Node/Hono/Turborepo runtime inside `datrina`.
+- Public HTTP/REST API.
+- Remote MCP transport.
+- Plugin SDK/marketplace.
+- Arbitrary sandboxed JavaScript.
+- DuckDB analytics.
+- OAuth/team auth, cloud sync, and mobile companion app.
+- Production packaging, signing, icon sets, and platform distribution checks.
+- Advanced workflow queue, priority, retry, and dead-letter behavior beyond the
+  bounded resume behavior needed by provider tool calls.
+
+Acceptance checks:
+
+- Tauri config JSON parse succeeds.
+- `bun run check:contract` passes.
+- `bun run typecheck` passes.
+- `bun run build` passes.
+- `cargo fmt --all --check` passes.
+- `cargo check --workspace --all-targets` passes.
+- A real provider can be configured, updated/tested, selected, and used for W12
+  acceptance without relying on `local_mock`.
+- Context chat with the real provider returns a provider-backed response with
+  visible provider/model metadata, latency, and token usage when returned.
+- Build Chat produces a provider-generated structured proposal instead of
+  hardcoded local apply actions.
+- Proposal preview shows dashboard, widget, workflow, and datasource changes
+  before apply.
+- Proposal apply requires explicit user confirmation, runs through Rust commands,
+  persists the result, refreshes runtime data, and survives app reload.
+- Chat tool calling works end to end against at least one safe built-in tool or
+  configured stdio MCP tool through `ToolEngine` policy gates.
+- Denied tool calls return typed policy/runtime errors and are persisted as tool
+  results instead of being hidden or reported as success.
+- The bounded resume loop works: assistant tool call, Rust tool execution, tool
+  result message, follow-up provider call, and final assistant message.
+- MCP stdio enable cannot report connected status after initialize or
+  `tools/list` timeout/error.
+- Persisted enabled stdio MCP servers can be reconnected explicitly or
+  automatically for chat/workflow execution after app restart.
+- W12-created widgets can be created, edited, persisted, reloaded, refreshed, and
+  rendered without sample-only data in the product path.
+- `local_mock` remains clearly labeled as local deterministic dev/test behavior
+  wherever exposed.
+- `rg -n "TODO|not implemented|placeholder|unsupported|local_mock" src src-tauri/src`
+  returns only dev/test labels, explicit post-MVP exclusions, or residuals
+  outside the W12 product path.
+- README/docs/residual backlog are updated after validation and no longer imply
+  mock-backed or unsupported core functions are complete.
+
+Parallelism:
+
+- Start after W11.
+- Split implementation into non-overlapping lanes only when command/model/API
+  shape changes are serialized through the W12 integration owner.
+- Do not run concurrent agents over `src/lib/api.ts`, `src-tauri/src/models/*`,
+  or command request/response shapes.
+- Tool/MCP hardening, provider/tool-call runtime, Build Chat proposal/apply UI,
+  and widget authoring can be investigated in parallel but must integrate through
+  one final W12 acceptance pass.
+
 ## Parallelization Model
 
 Recommended agent queue:
@@ -786,6 +906,9 @@ Recommended agent queue:
    residuals into real end-to-end runtime behavior.
 8. Run W11 as a narrow production-readiness cleanup for the opener plugin
    migration.
+9. Run W12 as the no-mock agentic product completion stream: provider-driven
+   tool calls, generated dashboard proposals, persisted apply, MCP runtime
+   honesty, and usable widget authoring.
 
 Do not give two agents simultaneous ownership of `src/lib/api.ts`, `src-tauri/src/models/*`, or command request/response shapes. Contract drift is already the main risk.
 
