@@ -66,6 +66,8 @@ Default order:
 8. `W9` docs and residual closeout.
 9. `W10` end-to-end product runtime after W9 when the task is to make the
    product work beyond the accepted reconciliation slice.
+10. Later `W11+` product-readiness and runtime streams follow
+    `docs/RECONCILIATION_PLAN.md` in order.
 
 When multiple agents are used, split by ownership paths from the plan. Do not
 run concurrent agents over `src/lib/api.ts`, `src-tauri/src/models/*`, or

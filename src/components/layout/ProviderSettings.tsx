@@ -20,7 +20,7 @@ interface Props {
 
 const PROVIDER_TEMPLATES: Record<ProviderKind, CreateProviderRequest> = {
   local_mock: {
-    name: 'Local mock',
+    name: 'Local mock dev/test',
     kind: 'local_mock',
     base_url: 'local://mock',
     default_model: 'local_mock',
@@ -283,7 +283,7 @@ export function ProviderSettings({
                   onClick={() => selectKind('local_mock')}
                   className="rounded-lg border border-border px-4 py-2 text-sm transition-colors hover:bg-muted"
                 >
-                  Use local mock
+                  Use local mock dev/test
                 </button>
               )}
             </div>
@@ -372,7 +372,7 @@ export function ProviderSettings({
 function labelForKind(kind: ProviderKind) {
   switch (kind) {
     case 'local_mock':
-      return 'Local mock';
+      return 'Local mock dev/test';
     case 'openrouter':
       return 'OpenRouter';
     case 'ollama':

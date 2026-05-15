@@ -46,6 +46,9 @@ pub async fn execute_workflow(
         Ok(provider) => provider,
         Err(e) => return Ok(ApiResult::err(e.to_string())),
     };
+    if let Err(e) = reconnect_enabled_mcp_servers(&state).await {
+        return Ok(ApiResult::err(e.to_string()));
+    }
     let engine = WorkflowEngine::with_runtime(
         state.tool_engine.as_ref(),
         state.mcp_manager.as_ref(),
@@ -103,6 +106,9 @@ pub async fn create_workflow(
     state: State<'_, AppState>,
     workflow: Workflow,
 ) -> Result<ApiResult<bool>, String> {
+    if let Err(e) = state.scheduler.lock().await.unschedule(&workflow.id).await {
+        return Ok(ApiResult::err(e.to_string()));
+    }
     Ok(match state.storage.create_workflow(&workflow).await {
         Ok(()) => {
             if let Err(e) = schedule_if_cron(&app, &state, workflow.clone()).await {
@@ -117,13 +123,29 @@ pub async fn create_workflow(
 
 #[tauri::command]
 pub async fn delete_workflow(
+    _app: AppHandle,
     state: State<'_, AppState>,
     id: String,
 ) -> Result<ApiResult<bool>, String> {
+    if let Err(e) = state.scheduler.lock().await.unschedule(&id).await {
+        return Ok(ApiResult::err(e.to_string()));
+    }
     Ok(match state.storage.delete_workflow(&id).await {
         Ok(()) => ApiResult::ok(true),
         Err(e) => ApiResult::err(e.to_string()),
     })
+}
+
+async fn reconnect_enabled_mcp_servers(state: &State<'_, AppState>) -> anyhow::Result<()> {
+    let servers = state.storage.list_mcp_servers().await?;
+    for server in servers.into_iter().filter(|server| server.is_enabled) {
+        if state.mcp_manager.is_connected(&server.id).await {
+            continue;
+        }
+        state.tool_engine.validate_mcp_server(&server)?;
+        state.mcp_manager.connect(server).await?;
+    }
+    Ok(())
 }
 
 async fn schedule_if_cron(

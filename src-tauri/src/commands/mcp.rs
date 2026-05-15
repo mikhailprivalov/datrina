@@ -83,6 +83,16 @@ pub async fn enable_server(
 }
 
 #[tauri::command]
+pub async fn reconnect_enabled_servers(
+    state: State<'_, AppState>,
+) -> Result<ApiResult<Vec<MCPTool>>, String> {
+    Ok(match reconnect_enabled_servers_inner(&state).await {
+        Ok(tools) => ApiResult::ok(tools),
+        Err(e) => ApiResult::err(e.to_string()),
+    })
+}
+
+#[tauri::command]
 pub async fn disable_server(
     state: State<'_, AppState>,
     id: String,
@@ -95,6 +105,9 @@ pub async fn disable_server(
 
 #[tauri::command]
 pub async fn list_tools(state: State<'_, AppState>) -> Result<ApiResult<Vec<MCPTool>>, String> {
+    if let Err(e) = reconnect_enabled_servers_inner(&state).await {
+        return Ok(ApiResult::err(e.to_string()));
+    }
     let tools = state.mcp_manager.list_tools().await;
     Ok(ApiResult::ok(tools))
 }
@@ -104,6 +117,21 @@ pub async fn call_tool(
     state: State<'_, AppState>,
     req: CallToolRequest,
 ) -> Result<ApiResult<serde_json::Value>, String> {
+    if !state.mcp_manager.is_connected(&req.server_id).await {
+        let server = match state.storage.get_mcp_server(&req.server_id).await {
+            Ok(Some(server)) if server.is_enabled => server,
+            Ok(Some(_)) => return Ok(ApiResult::err("MCP server is disabled".to_string())),
+            Ok(None) => return Ok(ApiResult::err("MCP server not found".to_string())),
+            Err(e) => return Ok(ApiResult::err(e.to_string())),
+        };
+        if let Err(e) = state.tool_engine.validate_mcp_server(&server) {
+            return Ok(ApiResult::err(e.to_string()));
+        }
+        if let Err(e) = state.mcp_manager.connect(server).await {
+            return Ok(ApiResult::err(e.to_string()));
+        }
+    }
+
     if let Err(e) = state
         .tool_engine
         .validate_mcp_tool_call(&req.server_id, &req.tool_name)
@@ -121,4 +149,21 @@ pub async fn call_tool(
             Err(e) => ApiResult::err(e.to_string()),
         },
     )
+}
+
+async fn reconnect_enabled_servers_inner(
+    state: &State<'_, AppState>,
+) -> anyhow::Result<Vec<MCPTool>> {
+    let servers = state.storage.list_mcp_servers().await?;
+    let mut all_tools = Vec::new();
+    for server in servers.into_iter().filter(|server| server.is_enabled) {
+        if state.mcp_manager.is_connected(&server.id).await {
+            continue;
+        }
+        state.tool_engine.validate_mcp_server(&server)?;
+        let tools = state.mcp_manager.connect(server).await?;
+        all_tools.extend(tools);
+    }
+    all_tools.extend(state.mcp_manager.list_tools().await);
+    Ok(all_tools)
 }

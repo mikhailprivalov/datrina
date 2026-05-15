@@ -267,6 +267,38 @@ export interface MessageMetadata {
   provider?: string;
   tokens?: { prompt: number; completion: number };
   latency_ms?: number;
+  build_proposal?: BuildProposal;
+}
+
+export interface BuildProposal {
+  id: string;
+  title: string;
+  summary?: string;
+  dashboard_name?: string;
+  dashboard_description?: string;
+  widgets: BuildWidgetProposal[];
+}
+
+export interface BuildWidgetProposal {
+  widget_type: WidgetType;
+  title: string;
+  data?: unknown;
+  datasource_plan?: BuildDatasourcePlan;
+  config?: Record<string, unknown>;
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+}
+
+export interface BuildDatasourcePlan {
+  kind: 'builtin_tool' | 'mcp_tool' | 'provider_prompt';
+  tool_name?: string;
+  server_id?: string;
+  arguments?: Record<string, unknown>;
+  prompt?: string;
+  output_path?: string;
+  refresh_cron?: string;
 }
 
 export interface LLMProvider {
@@ -374,6 +406,11 @@ export const dashboardApi = {
     content?: string;
     value?: number;
   }) => call<Dashboard>('apply_build_change', { req }),
+  applyBuildProposal: (req: {
+    proposal: BuildProposal;
+    dashboard_id?: string;
+    confirmed: boolean;
+  }) => call<Dashboard>('apply_build_proposal', { req }),
   delete: (id: string) => call<boolean>('delete_dashboard', { id }),
   refreshWidget: (dashboardId: string, widgetId: string) =>
     call<WidgetRefreshResult>('refresh_widget', { dashboardId, widgetId }),
@@ -398,6 +435,7 @@ export const mcpApi = {
   addServer: (server: MCPServer) => call<boolean>('add_server', { server }),
   removeServer: (id: string) => call<boolean>('remove_server', { id }),
   enableServer: (id: string) => call<MCPTool[]>('enable_server', { id }),
+  reconnectEnabledServers: () => call<MCPTool[]>('reconnect_enabled_servers'),
   disableServer: (id: string) => call<boolean>('disable_server', { id }),
   listTools: () => call<MCPTool[]>('list_tools'),
   callTool: (serverId: string, toolName: string, args?: Record<string, unknown>) =>

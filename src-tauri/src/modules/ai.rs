@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-use crate::models::chat::{ChatMessage, MessageRole};
+use crate::models::chat::{ChatMessage, MessageRole, ToolCall};
 use crate::models::provider::{
     LLMProvider, ProviderKind, ProviderRuntimeStatus, ProviderTestResult,
 };
@@ -20,6 +20,14 @@ pub struct AIResponse {
     pub model: String,
     pub tokens: Option<crate::models::chat::TokenUsage>,
     pub latency_ms: u64,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AIToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 impl Default for AIEngine {
@@ -39,6 +47,15 @@ impl AIEngine {
         provider: &LLMProvider,
         messages: &[ChatMessage],
     ) -> Result<AIResponse> {
+        self.complete_chat_with_tools(provider, messages, &[]).await
+    }
+
+    pub async fn complete_chat_with_tools(
+        &self,
+        provider: &LLMProvider,
+        messages: &[ChatMessage],
+        tools: &[AIToolSpec],
+    ) -> Result<AIResponse> {
         validate_provider(provider)?;
 
         let started = Instant::now();
@@ -46,10 +63,12 @@ impl AIEngine {
             ProviderKind::LocalMock => AICompletion {
                 content: local_mock_response(messages),
                 tokens: Some(local_mock_tokens(messages)),
+                tool_calls: vec![],
             },
             ProviderKind::Ollama => self.complete_ollama(provider, messages).await?,
             ProviderKind::Openrouter | ProviderKind::Custom => {
-                self.complete_openai_compatible(provider, messages).await?
+                self.complete_openai_compatible(provider, messages, tools)
+                    .await?
             }
         };
 
@@ -59,6 +78,7 @@ impl AIEngine {
             model: provider.default_model.clone(),
             tokens: completion.tokens,
             latency_ms: started.elapsed().as_millis() as u64,
+            tool_calls: completion.tool_calls,
         })
     }
 
@@ -111,13 +131,33 @@ impl AIEngine {
         &self,
         provider: &LLMProvider,
         messages: &[ChatMessage],
+        tools: &[AIToolSpec],
     ) -> Result<AICompletion> {
         let endpoint = openai_chat_endpoint(&provider.base_url)?;
-        let mut request = self.client.post(endpoint).json(&json!({
+        let mut payload = json!({
             "model": provider.default_model,
             "stream": false,
             "messages": to_openai_messages(messages),
-        }));
+        });
+
+        if !tools.is_empty() {
+            payload["tools"] = json!(tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>());
+            payload["tool_choice"] = json!("auto");
+        }
+
+        let mut request = self.client.post(endpoint).json(&payload);
 
         if matches!(provider.kind, ProviderKind::Openrouter) {
             request = request
@@ -149,18 +189,38 @@ impl AIEngine {
 
         let parsed: OpenAIChatResponse =
             serde_json::from_str(&body).map_err(|e| anyhow!("provider_parse_error: {}", e))?;
-        let content = parsed
+        let message = parsed
             .choices
             .into_iter()
-            .find_map(|choice| choice.message.content)
-            .filter(|content| !content.trim().is_empty())
-            .ok_or_else(|| anyhow!("provider_empty_response: missing assistant content"))?;
+            .next()
+            .ok_or_else(|| anyhow!("provider_empty_response: missing assistant message"))?
+            .message;
+        let tool_calls = message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|call| {
+                let args = serde_json::from_str(&call.function.arguments).ok()?;
+                Some(ToolCall {
+                    id: call.id,
+                    name: call.function.name,
+                    arguments: args,
+                })
+            })
+            .collect::<Vec<_>>();
+        let content = message.content.unwrap_or_default();
+        if content.trim().is_empty() && tool_calls.is_empty() {
+            return Err(anyhow!(
+                "provider_empty_response: missing assistant content and tool calls"
+            ));
+        }
         Ok(AICompletion {
             content,
             tokens: parsed.usage.map(|usage| crate::models::chat::TokenUsage {
                 prompt: usage.prompt_tokens.unwrap_or(0),
                 completion: usage.completion_tokens.unwrap_or(0),
             }),
+            tool_calls,
         })
     }
 
@@ -202,6 +262,7 @@ impl AIEngine {
         Ok(AICompletion {
             content: parsed.message.content,
             tokens: None,
+            tool_calls: vec![],
         })
     }
 
@@ -264,6 +325,7 @@ impl AIEngine {
 struct AICompletion {
     content: String,
     tokens: Option<crate::models::chat::TokenUsage>,
+    tool_calls: Vec<ToolCall>,
 }
 
 pub fn validate_provider(provider: &LLMProvider) -> Result<()> {
@@ -333,17 +395,47 @@ fn join_url(base_url: &str, path: &str) -> Result<String> {
 }
 
 fn to_openai_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
-    messages
-        .iter()
-        .filter_map(|message| match message.role {
-            MessageRole::User => Some(json!({"role": "user", "content": message.content})),
+    let mut result = Vec::new();
+    for message in messages {
+        match message.role {
+            MessageRole::User => result.push(json!({"role": "user", "content": message.content})),
             MessageRole::Assistant => {
-                Some(json!({"role": "assistant", "content": message.content}))
+                let mut value = json!({"role": "assistant", "content": message.content});
+                if let Some(tool_calls) = &message.tool_calls {
+                    value["tool_calls"] = json!(tool_calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments.to_string(),
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>());
+                }
+                result.push(value);
             }
-            MessageRole::System => Some(json!({"role": "system", "content": message.content})),
-            MessageRole::Tool => None,
-        })
-        .collect()
+            MessageRole::System => {
+                result.push(json!({"role": "system", "content": message.content}))
+            }
+            MessageRole::Tool => {
+                if let Some(tool_results) = &message.tool_results {
+                    for tool_result in tool_results {
+                        result.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_result.tool_call_id,
+                            "name": tool_result.name,
+                            "content": serde_json::to_string(tool_result).unwrap_or_else(|_| message.content.clone()),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    result
 }
 
 fn to_ollama_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
@@ -398,6 +490,19 @@ struct OpenAIChoice {
 #[derive(Deserialize)]
 struct OpenAIMessage {
     content: Option<String>,
+    tool_calls: Option<Vec<OpenAIToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIToolCall {
+    id: String,
+    function: OpenAIFunctionCall,
+}
+
+#[derive(Deserialize)]
+struct OpenAIFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]

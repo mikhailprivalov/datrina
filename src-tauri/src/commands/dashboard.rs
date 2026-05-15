@@ -4,17 +4,21 @@ use tauri::{AppHandle, Emitter, State};
 use tracing::info;
 
 use crate::models::dashboard::{
-    AddWidgetRequest, ApplyBuildChangeRequest, BuildChangeAction, CreateDashboardRequest,
-    CreateDashboardTemplate, Dashboard, DashboardWidgetType, UpdateDashboardRequest,
+    AddWidgetRequest, ApplyBuildChangeRequest, ApplyBuildProposalRequest, BuildChangeAction,
+    BuildDatasourcePlan, BuildDatasourcePlanKind, BuildWidgetProposal, BuildWidgetType,
+    CreateDashboardRequest, CreateDashboardTemplate, Dashboard, DashboardWidgetType,
+    UpdateDashboardRequest,
 };
 use crate::models::widget::{
-    DatasourceConfig, GaugeConfig, GaugeThreshold, TextAlign, TextConfig, TextFormat, Widget,
+    ChartConfig, ChartKind, ColumnFormat, DatasourceConfig, GaugeConfig, GaugeThreshold,
+    ImageConfig, ImageFit, TableColumn, TableConfig, TextAlign, TextConfig, TextFormat, Widget,
 };
 use crate::models::workflow::{
     NodeKind, RunStatus, TriggerKind, Workflow, WorkflowEdge, WorkflowNode, WorkflowTrigger,
     WORKFLOW_EVENT_CHANNEL,
 };
 use crate::models::ApiResult;
+use crate::modules::scheduler::ScheduledRuntime;
 use crate::modules::workflow_engine::WorkflowEngine;
 use crate::AppState;
 
@@ -182,6 +186,24 @@ pub async fn apply_build_change(
 }
 
 #[tauri::command]
+pub async fn apply_build_proposal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: ApplyBuildProposalRequest,
+) -> Result<ApiResult<Dashboard>, String> {
+    if !req.confirmed {
+        return Ok(ApiResult::err(
+            "Build proposal apply requires explicit confirmation".to_string(),
+        ));
+    }
+
+    Ok(match apply_build_proposal_inner(&app, &state, req).await {
+        Ok(dashboard) => ApiResult::ok(dashboard),
+        Err(e) => ApiResult::err(e.to_string()),
+    })
+}
+
+#[tauri::command]
 pub async fn delete_dashboard(
     state: State<'_, AppState>,
     id: String,
@@ -257,6 +279,412 @@ async fn add_widget_to_dashboard(
     Ok(dashboard)
 }
 
+async fn apply_build_proposal_inner(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    req: ApplyBuildProposalRequest,
+) -> AnyResult<Dashboard> {
+    if req.proposal.widgets.is_empty() {
+        return Err(anyhow!("Build proposal contains no widgets to apply"));
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut dashboard = match req.dashboard_id.as_deref() {
+        Some(id) => state
+            .storage
+            .get_dashboard(id)
+            .await?
+            .ok_or_else(|| anyhow!("Dashboard not found"))?,
+        None => Dashboard {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: req
+                .proposal
+                .dashboard_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| req.proposal.title.clone()),
+            description: req
+                .proposal
+                .dashboard_description
+                .clone()
+                .or(req.proposal.summary.clone()),
+            layout: vec![],
+            workflows: vec![],
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        },
+    };
+
+    let mut next_y = dashboard
+        .layout
+        .iter()
+        .map(widget_position_bottom)
+        .max()
+        .unwrap_or(0);
+
+    for widget_proposal in &req.proposal.widgets {
+        let (widget, workflow) = proposal_widget(widget_proposal, next_y, now)?;
+        next_y = widget_position_bottom(&widget);
+        state.storage.create_workflow(&workflow).await?;
+        schedule_workflow_if_cron(app, state, workflow.clone()).await?;
+        dashboard.workflows.push(workflow);
+        dashboard.layout.push(widget);
+    }
+    dashboard.updated_at = now;
+
+    if req.dashboard_id.is_some() {
+        state.storage.update_dashboard(&dashboard).await?;
+    } else {
+        state.storage.create_dashboard(&dashboard).await?;
+    }
+
+    Ok(dashboard)
+}
+
+fn proposal_widget(
+    proposal: &BuildWidgetProposal,
+    default_y: i32,
+    now: i64,
+) -> AnyResult<(Widget, Workflow)> {
+    if proposal.title.trim().is_empty() {
+        return Err(anyhow!("Build proposal widget title is required"));
+    }
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let widget_id = uuid::Uuid::new_v4().to_string();
+    let plan = proposal.datasource_plan.as_ref().ok_or_else(|| {
+        anyhow!(
+            "Build proposal widget '{}' must include an executable datasource_plan",
+            proposal.title
+        )
+    })?;
+    let workflow = datasource_plan_workflow(
+        workflow_id.clone(),
+        format!("Generated live datasource: {}", proposal.title),
+        proposal,
+        plan,
+        now,
+    )?;
+    let datasource = Some(DatasourceConfig {
+        workflow_id,
+        output_key: "output.data".to_string(),
+        post_process: None,
+    });
+    let x = proposal.x.unwrap_or(0);
+    let y = proposal.y.unwrap_or(default_y);
+
+    let widget = match proposal.widget_type {
+        BuildWidgetType::Text => Widget::Text {
+            id: widget_id,
+            title: proposal.title.clone(),
+            x,
+            y,
+            w: proposal.w.unwrap_or(6),
+            h: proposal.h.unwrap_or(3),
+            config: proposal_config(proposal).unwrap_or(TextConfig {
+                format: TextFormat::Markdown,
+                font_size: 14,
+                color: None,
+                align: TextAlign::Left,
+            }),
+            datasource,
+        },
+        BuildWidgetType::Gauge => Widget::Gauge {
+            id: widget_id,
+            title: proposal.title.clone(),
+            x,
+            y,
+            w: proposal.w.unwrap_or(4),
+            h: proposal.h.unwrap_or(4),
+            config: proposal_config(proposal).unwrap_or(GaugeConfig {
+                min: 0.0,
+                max: 100.0,
+                unit: None,
+                thresholds: None,
+                show_value: true,
+            }),
+            datasource,
+        },
+        BuildWidgetType::Table => Widget::Table {
+            id: widget_id,
+            title: proposal.title.clone(),
+            x,
+            y,
+            w: proposal.w.unwrap_or(8),
+            h: proposal.h.unwrap_or(5),
+            config: proposal_config(proposal)
+                .unwrap_or_else(|| table_config_from_data(&proposal.data)),
+            datasource,
+        },
+        BuildWidgetType::Chart => Widget::Chart {
+            id: widget_id,
+            title: proposal.title.clone(),
+            x,
+            y,
+            w: proposal.w.unwrap_or(8),
+            h: proposal.h.unwrap_or(5),
+            config: proposal_config(proposal).unwrap_or(ChartConfig {
+                kind: ChartKind::Bar,
+                x_axis: first_object_key(&proposal.data),
+                y_axis: numeric_object_keys(&proposal.data),
+                colors: None,
+                stacked: false,
+                show_legend: true,
+            }),
+            datasource,
+            refresh_interval: None,
+        },
+        BuildWidgetType::Image => Widget::Image {
+            id: widget_id,
+            title: proposal.title.clone(),
+            x,
+            y,
+            w: proposal.w.unwrap_or(6),
+            h: proposal.h.unwrap_or(4),
+            config: proposal_config(proposal).unwrap_or(ImageConfig {
+                fit: ImageFit::Contain,
+                border_radius: 4,
+            }),
+            datasource,
+        },
+    };
+
+    Ok((widget, workflow))
+}
+
+fn proposal_config<T: serde::de::DeserializeOwned>(proposal: &BuildWidgetProposal) -> Option<T> {
+    proposal
+        .config
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+fn datasource_plan_workflow(
+    workflow_id: String,
+    name: String,
+    proposal: &BuildWidgetProposal,
+    plan: &BuildDatasourcePlan,
+    now: i64,
+) -> AnyResult<Workflow> {
+    let (source_node, source_kind_label) = datasource_source_node(plan)?;
+    let output_path = plan
+        .output_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty());
+
+    let mut nodes = vec![source_node];
+    let mut edges = Vec::new();
+    let output_input_node = if let Some(path) = output_path {
+        nodes.push(WorkflowNode {
+            id: "shape".to_string(),
+            kind: NodeKind::Transform,
+            label: "Pick widget data from datasource result".to_string(),
+            position: None,
+            config: Some(json!({
+                "input_key": "source",
+                "transform": "pick_path",
+                "path": path
+            })),
+        });
+        edges.push(WorkflowEdge {
+            id: "source-to-shape".to_string(),
+            source: "source".to_string(),
+            target: "shape".to_string(),
+            condition: None,
+        });
+        "shape"
+    } else {
+        "source"
+    };
+
+    nodes.push(WorkflowNode {
+        id: "output".to_string(),
+        kind: NodeKind::Output,
+        label: "Widget output".to_string(),
+        position: None,
+        config: Some(json!({
+            "input_node": output_input_node,
+            "output_key": "data"
+        })),
+    });
+    edges.push(WorkflowEdge {
+        id: format!("{}-to-output", output_input_node),
+        source: output_input_node.to_string(),
+        target: "output".to_string(),
+        condition: None,
+    });
+
+    let trigger = plan
+        .refresh_cron
+        .as_deref()
+        .filter(|cron| !cron.trim().is_empty())
+        .map(|cron| WorkflowTrigger {
+            kind: TriggerKind::Cron,
+            config: Some(crate::models::workflow::TriggerConfig {
+                cron: Some(cron.to_string()),
+                event: None,
+            }),
+        })
+        .unwrap_or(WorkflowTrigger {
+            kind: TriggerKind::Manual,
+            config: None,
+        });
+
+    Ok(Workflow {
+        id: workflow_id,
+        name,
+        description: Some(format!(
+            "Live datasource workflow generated for '{}' through {}.",
+            proposal.title, source_kind_label
+        )),
+        nodes,
+        edges,
+        trigger,
+        is_enabled: true,
+        last_run: None,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn datasource_source_node(plan: &BuildDatasourcePlan) -> AnyResult<(WorkflowNode, &'static str)> {
+    match plan.kind {
+        BuildDatasourcePlanKind::BuiltinTool => {
+            let tool_name = plan
+                .tool_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| anyhow!("builtin_tool datasource_plan requires tool_name"))?;
+            Ok((
+                WorkflowNode {
+                    id: "source".to_string(),
+                    kind: NodeKind::McpTool,
+                    label: format!("Built-in tool: {}", tool_name),
+                    position: None,
+                    config: Some(json!({
+                        "server_id": "builtin",
+                        "tool_name": tool_name,
+                        "arguments": plan.arguments.clone().unwrap_or_else(|| json!({}))
+                    })),
+                },
+                "built-in ToolEngine execution",
+            ))
+        }
+        BuildDatasourcePlanKind::McpTool => {
+            let server_id = plan
+                .server_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| anyhow!("mcp_tool datasource_plan requires server_id"))?;
+            let tool_name = plan
+                .tool_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| anyhow!("mcp_tool datasource_plan requires tool_name"))?;
+            Ok((
+                WorkflowNode {
+                    id: "source".to_string(),
+                    kind: NodeKind::McpTool,
+                    label: format!("MCP tool: {}", tool_name),
+                    position: None,
+                    config: Some(json!({
+                        "server_id": server_id,
+                        "tool_name": tool_name,
+                        "arguments": plan.arguments.clone().unwrap_or_else(|| json!({}))
+                    })),
+                },
+                "stdio MCP tool execution",
+            ))
+        }
+        BuildDatasourcePlanKind::ProviderPrompt => {
+            let prompt = plan
+                .prompt
+                .as_deref()
+                .filter(|prompt| !prompt.trim().is_empty())
+                .ok_or_else(|| anyhow!("provider_prompt datasource_plan requires prompt"))?;
+            Ok((
+                WorkflowNode {
+                    id: "source".to_string(),
+                    kind: NodeKind::Llm,
+                    label: "Provider datasource prompt".to_string(),
+                    position: None,
+                    config: Some(json!({ "prompt": prompt })),
+                },
+                "Rust-mediated provider execution",
+            ))
+        }
+    }
+}
+
+fn table_config_from_data(data: &Value) -> TableConfig {
+    let columns = data
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_object)
+        .map(|row| {
+            row.keys()
+                .map(|key| TableColumn {
+                    key: key.clone(),
+                    header: title_case(key),
+                    width: None,
+                    format: ColumnFormat::Text,
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|columns| !columns.is_empty())
+        .unwrap_or_else(|| {
+            vec![TableColumn {
+                key: "value".to_string(),
+                header: "Value".to_string(),
+                width: None,
+                format: ColumnFormat::Text,
+            }]
+        });
+
+    TableConfig {
+        columns,
+        page_size: 10,
+        sortable: true,
+        filterable: false,
+    }
+}
+
+fn first_object_key(data: &Value) -> Option<String> {
+    data.as_array()
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_object)
+        .and_then(|row| row.keys().next().cloned())
+}
+
+fn numeric_object_keys(data: &Value) -> Option<Vec<String>> {
+    let keys = data
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_object)
+        .map(|row| {
+            row.iter()
+                .filter_map(|(key, value)| value.as_f64().map(|_| key.clone()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|keys| !keys.is_empty());
+    keys
+}
+
+fn title_case(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn refresh_widget_inner(
     app: AppHandle,
     state: &State<'_, AppState>,
@@ -297,6 +725,7 @@ async fn refresh_widget_inner(
             .ok_or_else(|| anyhow!("Datasource workflow not found"))?,
     };
 
+    reconnect_enabled_mcp_servers(state).await?;
     let engine = WorkflowEngine::with_runtime(
         state.tool_engine.as_ref(),
         state.mcp_manager.as_ref(),
@@ -356,6 +785,49 @@ async fn active_provider(
         })
         .or_else(|| providers.iter().find(|provider| provider.is_enabled))
         .cloned())
+}
+
+async fn reconnect_enabled_mcp_servers(state: &State<'_, AppState>) -> AnyResult<()> {
+    let servers = state.storage.list_mcp_servers().await?;
+    for server in servers.into_iter().filter(|server| server.is_enabled) {
+        if state.mcp_manager.is_connected(&server.id).await {
+            continue;
+        }
+        state.tool_engine.validate_mcp_server(&server)?;
+        state.mcp_manager.connect(server).await?;
+    }
+    Ok(())
+}
+
+async fn schedule_workflow_if_cron(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    workflow: Workflow,
+) -> AnyResult<()> {
+    let cron = match workflow
+        .trigger
+        .config
+        .as_ref()
+        .and_then(|config| config.cron.as_deref())
+        .filter(|cron| !cron.trim().is_empty())
+    {
+        Some(cron) => cron.to_string(),
+        None => return Ok(()),
+    };
+    let runtime = ScheduledRuntime {
+        app: app.clone(),
+        storage: state.storage.clone(),
+        tool_engine: state.tool_engine.clone(),
+        mcp_manager: state.mcp_manager.clone(),
+        ai_engine: state.ai_engine.clone(),
+        provider: active_provider(state).await?,
+    };
+    state
+        .scheduler
+        .lock()
+        .await
+        .schedule_cron(workflow, &cron, runtime)
+        .await
 }
 
 fn widget_position_bottom(widget: &Widget) -> i32 {

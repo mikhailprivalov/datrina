@@ -272,6 +272,13 @@ impl<'a> WorkflowEngine<'a> {
                             .ok_or_else(|| anyhow!("Transform 'pick' requires key"))?;
                         Ok(input_data.get(key).cloned().unwrap_or(Value::Null))
                     }
+                    "pick_path" => {
+                        let path = config
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow!("Transform 'pick_path' requires path"))?;
+                        Ok(pick_path(&input_data, path).cloned().unwrap_or(Value::Null))
+                    }
                     other => Err(anyhow!("Unsupported transform '{}'", other)),
                 }
             }
@@ -474,6 +481,18 @@ impl<'a> WorkflowEngine<'a> {
             _ => false,
         }
     }
+}
+
+fn pick_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        if let Ok(index) = segment.parse::<usize>() {
+            current = current.as_array()?.get(index)?;
+        } else {
+            current = current.get(segment)?;
+        }
+    }
+    Some(current)
 }
 
 impl<'a> Default for WorkflowEngine<'a> {

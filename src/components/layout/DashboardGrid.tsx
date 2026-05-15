@@ -1,7 +1,7 @@
 import { Responsive, WidthProvider } from 'react-grid-layout';
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
-import type { Dashboard, Widget, WidgetRuntimeData } from '../../lib/api';
+import type { Dashboard, Widget, WidgetRuntimeData, WorkflowRun } from '../../lib/api';
 import { ChartWidget } from '../widgets/ChartWidget';
 import { TextWidget } from '../widgets/TextWidget';
 import { TableWidget } from '../widgets/TableWidget';
@@ -15,6 +15,7 @@ interface Props {
   dashboard: Dashboard;
   widgetData: Record<string, WidgetRuntimeData | undefined>;
   widgetErrors: Record<string, string | undefined>;
+  workflowRuns: Record<string, WorkflowRun | undefined>;
   refreshingWidgetId: string | null;
   onRefreshWidget: (widgetId: string) => void;
   onLayoutCommit: (layout: Widget[]) => void;
@@ -25,6 +26,7 @@ export function DashboardGrid({
   dashboard,
   widgetData,
   widgetErrors,
+  workflowRuns,
   refreshingWidgetId,
   onRefreshWidget,
   onLayoutCommit,
@@ -89,6 +91,7 @@ export function DashboardGrid({
             <div className="widget-drag-handle flex items-center justify-between px-3 py-2 border-b border-border/50 cursor-move">
               <span className="text-sm font-medium truncate">{widget.title}</span>
               <div className="flex items-center gap-1">
+                <WorkflowBadge widget={widget} run={workflowRuns[widget.datasource?.workflow_id ?? '']} />
                 <button
                   className="p-1 rounded hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   title="Refresh widget data"
@@ -113,6 +116,26 @@ export function DashboardGrid({
         ))}
       </ResponsiveGridLayout>
     </div>
+  );
+}
+
+function WorkflowBadge({ widget, run }: { widget: Widget; run?: WorkflowRun }) {
+  if (!widget.datasource) {
+    return null;
+  }
+  const status = run?.status ?? 'idle';
+  const title = run?.error ? `Last refresh failed: ${run.error}` : `Last refresh: ${status}`;
+  const tone = status === 'success'
+    ? 'bg-emerald-500/15 text-emerald-700'
+    : status === 'error'
+      ? 'bg-destructive/15 text-destructive'
+      : status === 'running'
+        ? 'bg-blue-500/15 text-blue-700'
+        : 'bg-muted text-muted-foreground';
+  return (
+    <span title={title} className={`rounded px-1.5 py-0.5 text-[10px] ${tone}`}>
+      {status}
+    </span>
   );
 }
 

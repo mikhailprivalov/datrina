@@ -34,9 +34,36 @@ impl AppState {
         let mcp_manager = Arc::new(MCPManager::new());
         let mut scheduler = Scheduler::new();
         scheduler.start().await?;
-        let scheduler = Arc::new(Mutex::new(scheduler));
         let tool_engine = Arc::new(ToolEngine::default());
         let ai_engine = Arc::new(AIEngine::default());
+        let app_handle = app.handle().clone();
+        let provider = active_provider_for_startup(storage.as_ref()).await?;
+        for workflow in storage
+            .list_workflows()
+            .await?
+            .into_iter()
+            .filter(|workflow| workflow.is_enabled)
+        {
+            let cron = workflow
+                .trigger
+                .config
+                .as_ref()
+                .and_then(|config| config.cron.as_deref())
+                .filter(|cron| !cron.trim().is_empty())
+                .map(ToString::to_string);
+            if let Some(cron) = cron {
+                let runtime = modules::scheduler::ScheduledRuntime {
+                    app: app_handle.clone(),
+                    storage: storage.clone(),
+                    tool_engine: tool_engine.clone(),
+                    mcp_manager: mcp_manager.clone(),
+                    ai_engine: ai_engine.clone(),
+                    provider: provider.clone(),
+                };
+                scheduler.schedule_cron(workflow, &cron, runtime).await?;
+            }
+        }
+        let scheduler = Arc::new(Mutex::new(scheduler));
 
         Ok(Self {
             storage,
@@ -46,6 +73,25 @@ impl AppState {
             ai_engine,
         })
     }
+}
+
+async fn active_provider_for_startup(
+    storage: &Storage,
+) -> anyhow::Result<Option<models::provider::LLMProvider>> {
+    let providers = storage.list_providers().await?;
+    let active_provider_id = storage
+        .get_config("active_provider_id")
+        .await?
+        .filter(|id| !id.trim().is_empty());
+    Ok(active_provider_id
+        .as_deref()
+        .and_then(|id| {
+            providers
+                .iter()
+                .find(|provider| provider.id == id && provider.is_enabled)
+        })
+        .or_else(|| providers.iter().find(|provider| provider.is_enabled))
+        .cloned())
 }
 
 // ─── Generate Tauri Command Handler ──────────────────────────────────────────
@@ -61,6 +107,7 @@ macro_rules! generate_handler {
             $crate::commands::dashboard::update_dashboard,
             $crate::commands::dashboard::add_dashboard_widget,
             $crate::commands::dashboard::apply_build_change,
+            $crate::commands::dashboard::apply_build_proposal,
             $crate::commands::dashboard::delete_dashboard,
             $crate::commands::dashboard::refresh_widget,
             // Chat commands
@@ -74,6 +121,7 @@ macro_rules! generate_handler {
             $crate::commands::mcp::add_server,
             $crate::commands::mcp::remove_server,
             $crate::commands::mcp::enable_server,
+            $crate::commands::mcp::reconnect_enabled_servers,
             $crate::commands::mcp::disable_server,
             $crate::commands::mcp::list_tools,
             $crate::commands::mcp::call_tool,

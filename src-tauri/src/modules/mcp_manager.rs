@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::models::mcp::{ConnectionStatus, MCPServer, MCPServerStatus, MCPTool, MCPTransport};
 use crate::models::Id;
@@ -37,11 +37,9 @@ impl MCPManager {
 
         match server.transport {
             MCPTransport::Stdio => self.connect_stdio(&server).await,
-            MCPTransport::Http => {
-                // HTTP transport - tools discovered via endpoint
-                info!("HTTP MCP transport for {} not yet implemented", server.id);
-                Ok(vec![])
-            }
+            MCPTransport::Http => Err(anyhow!(
+                "HTTP MCP transport is unsupported; configure a stdio MCP server"
+            )),
         }
     }
 
@@ -117,12 +115,26 @@ impl MCPManager {
             Ok(Ok(Some(line))) => {
                 let parsed: Value = serde_json::from_str(&line)?;
                 if parsed.get("error").is_some() {
-                    error!("MCP initialize error: {}", line);
+                    let _ = process.kill().await;
+                    return Err(anyhow!("MCP initialize error: {}", line));
+                }
+                if parsed.get("result").is_none() {
+                    let _ = process.kill().await;
+                    return Err(anyhow!("MCP initialize response missing result"));
                 }
             }
-            Ok(Ok(None)) => warn!("MCP server closed connection during init"),
-            Ok(Err(e)) => error!("MCP read error: {}", e),
-            Err(_) => warn!("MCP initialize timeout"),
+            Ok(Ok(None)) => {
+                let _ = process.kill().await;
+                return Err(anyhow!("MCP server closed connection during init"));
+            }
+            Ok(Err(e)) => {
+                let _ = process.kill().await;
+                return Err(anyhow!("MCP initialize read error: {}", e));
+            }
+            Err(_) => {
+                let _ = process.kill().await;
+                return Err(anyhow!("MCP initialize timeout"));
+            }
         }
 
         // Send initialized notification
@@ -155,6 +167,10 @@ impl MCPManager {
         match tools_response {
             Ok(Ok(Some(line))) => {
                 let parsed: Value = serde_json::from_str(&line)?;
+                if let Some(error) = parsed.get("error") {
+                    let _ = process.kill().await;
+                    return Err(anyhow!("MCP tools/list error: {}", error));
+                }
                 if let Some(result) = parsed.get("result") {
                     if let Some(tool_list) = result.get("tools").and_then(|t| t.as_array()) {
                         for tool_val in tool_list {
@@ -174,10 +190,27 @@ impl MCPManager {
                                 });
                             }
                         }
+                    } else {
+                        let _ = process.kill().await;
+                        return Err(anyhow!("MCP tools/list response missing tools array"));
                     }
+                } else {
+                    let _ = process.kill().await;
+                    return Err(anyhow!("MCP tools/list response missing result"));
                 }
             }
-            _ => warn!("Could not discover tools for {}", server.name),
+            Ok(Ok(None)) => {
+                let _ = process.kill().await;
+                return Err(anyhow!("MCP server closed connection during tools/list"));
+            }
+            Ok(Err(e)) => {
+                let _ = process.kill().await;
+                return Err(anyhow!("MCP tools/list read error: {}", e));
+            }
+            Err(_) => {
+                let _ = process.kill().await;
+                return Err(anyhow!("MCP tools/list timeout"));
+            }
         }
 
         info!(
@@ -296,6 +329,10 @@ impl MCPManager {
     pub async fn list_tools(&self) -> Vec<MCPTool> {
         let connections = self.connections.lock().await;
         connections.values().flat_map(|c| c.tools.clone()).collect()
+    }
+
+    pub async fn is_connected(&self, server_id: &str) -> bool {
+        self.connections.lock().await.contains_key(server_id)
     }
 
     /// Get status of all servers

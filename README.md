@@ -1,6 +1,6 @@
 # Datrina The Lenswright
 
-Datrina is a local-first Tauri v2 desktop app for building and refreshing AI-assisted dashboards. The current product runtime is a desktop application with a React UI, Rust command backend, SQLite persistence, Rust-mediated chat providers, explicit build-apply commands, policy-gated tool/workflow execution, and deterministic local dashboard paths.
+Datrina is a local-first Tauri v2 desktop app for building and refreshing AI-assisted dashboards. The current product runtime is a desktop application with a React UI, Rust command backend, SQLite persistence, Rust-mediated chat providers, provider-generated build proposals, explicit proposal confirmation, policy-gated tool/workflow execution, and deterministic local dev/test dashboard paths.
 
 The active implementation boundary is:
 
@@ -18,23 +18,27 @@ Implemented and validated in the reconciliation baseline:
 - Five widget renderers: chart, text, table, image, and gauge.
 - Built-in `local_mvp` dashboard template with a deterministic local datasource workflow and gauge widget.
 - Widget refresh through Rust, including persisted workflow run state and `workflow:event` emission.
-- Rust-mediated provider and chat boundary for OpenRouter, Ollama, OpenAI-compatible custom providers, and deterministic `local_mock`.
+- Rust-mediated provider and chat boundary for OpenRouter, Ollama, OpenAI-compatible custom providers, and deterministic `local_mock` dev/test smoke behavior.
 - Provider add/update/re-key/enable/disable/test flows through Rust commands; provider secrets are not returned to React.
 - Context chat is grounded with the selected dashboard, widgets, and workflow run state before provider execution.
-- Build chat changes are applied only through explicit UI controls backed by Rust commands.
+- Build chat requests provider-generated structured dashboard/widget proposals with explicit executable datasource plans, previews them in the UI, and applies them only after explicit confirmation through Rust commands.
+- Proposal apply can create chart, table, text, gauge, and image widgets with persisted datasource workflows backed by `ToolEngine`, stdio MCP, or Rust-mediated provider execution.
+- Provider-driven chat tool calling emits OpenAI-compatible tool schemas, executes safe built-in `http_request` calls and configured stdio MCP tool calls through the Rust policy gateway, persists visible tool results/errors, and resumes once for the final assistant response.
 - Dashboard widget creation UI for local text and gauge widgets, each backed by a deterministic persisted workflow.
 - Workflow `llm` nodes execute through the same Rust AI provider runtime used by chat.
-- Workflow MCP/built-in tool nodes execute through the Rust `ToolEngine`/MCP gateway or fail with explicit policy/runtime errors.
-- Scheduler cron jobs created through workflow commands execute through the same persisted workflow run path as manual execution.
-- Honest no-key chat behavior: without an enabled provider or `local_mock`, chat returns an unavailable/error state instead of fake assistant output.
+- Workflow MCP/built-in tool nodes reconnect persisted enabled stdio MCP servers before execution, then execute through the Rust `ToolEngine`/MCP gateway or fail with explicit policy/runtime errors.
+- Scheduler cron jobs are started, restored from persisted workflows at app startup, updated/unscheduled when workflow commands change jobs, and execute through the same persisted workflow run path as manual execution.
+- React surfaces workflow refresh state from `workflow:event` so operators can see running, success, and error outcomes without opening storage.
+- Honest no-key chat behavior: without an enabled provider or `local_mock` dev/test provider, chat returns an unavailable/error state instead of fake assistant output.
 - Stdio MCP server configuration, persisted server records, process lifecycle plumbing, and validation through the Rust tool policy gateway.
+- Stdio MCP enable fails on initialize or `tools/list` timeout/error; enabled persisted stdio servers are reconnected explicitly through the MCP command or automatically before tool listing/calls.
 - Tool security baseline with one Rust gateway for built-in tools, stdio MCP process validation, network URL policy, and audit logging.
 
 In-progress or intentionally limited in the MVP:
 
-- Widget post-process steps are unavailable in the MVP vertical slice.
-- Chat is one provider response at a time. Provider-driven tool schema emission, streaming chat events, and multi-step agent resume loops are not enabled.
-- Real-provider behavior requires user-provided credentials/service availability; credential-free validation uses `local_mock`.
+- Widget post-process steps are unavailable in the current product path.
+- Chat supports a bounded one-resume tool loop for safe built-in HTTP requests and configured stdio MCP tools; streaming chat events and arbitrary multi-step agent loops are not enabled.
+- Real-provider behavior requires user-provided credentials/service availability; credential-free validation uses `local_mock` dev/test mode and is not live acceptance evidence.
 - Provider and MCP secrets are Rust-owned and masked before reaching React, but the MVP fallback stores them as local-only plaintext SQLite data under the Tauri app data directory. Encrypted OS keychain/keyring storage is a production follow-up.
 - Production packaging is not restored in the baseline; bundle packaging and final icon sets are deferred.
 
@@ -47,8 +51,6 @@ Planned, not MVP-supported:
 - DuckDB analytics.
 - OAuth, teams, cloud sync, and multi-user auth.
 - Advanced workflow queues, retries, dead-letter behavior, cancellation commands, and a visual workflow editor.
-- Generated dashboard creation from chat.
-- Scheduled widget auto-refresh.
 - Production distribution packages.
 
 ## Architecture
@@ -149,13 +151,15 @@ Allowed stdio process commands in the current policy baseline:
 
 Agent execution and reconciliation history live in `docs/`:
 
-- `docs/RECONCILIATION_PLAN.md`: historical W0-W11 execution contract.
+- `docs/RECONCILIATION_PLAN.md`: historical reconciliation execution contract.
 - `docs/DECISIONS.md`: accepted P0 runtime decisions and post-MVP exclusions.
 - `docs/W*_*.md`: accepted baseline reports from individual workstreams.
 - `docs/RESIDUAL_BACKLOG.md`: concise backlog for deferred work after the MVP baseline.
 - `docs/W9_DOCS_CLOSEOUT.md`: W9 closeout and validation record.
 - `docs/W10_END_TO_END_PRODUCT_RUNTIME.md`: W10 implementation and validation record.
 - `docs/W11_OPENER_PLUGIN_MIGRATION.md`: W11 opener migration validation record.
+- `docs/W12_PROVIDER_DRIVEN_AGENTIC_DASHBOARD_BUILDER.md`: W12 provider proposal validation record.
+- `docs/W13_DURABLE_REAL_RUNTIME_PIPELINE.md`: W13 durable runtime validation record.
 
 ## Project Structure
 

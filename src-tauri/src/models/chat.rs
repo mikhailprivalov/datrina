@@ -1,4 +1,5 @@
 use super::{Id, Timestamp};
+use crate::models::dashboard::BuildProposal;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +73,8 @@ pub struct MessageMetadata {
     pub tokens: Option<TokenUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_proposal: Option<BuildProposal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

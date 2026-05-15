@@ -7,7 +7,7 @@ import { TopBar } from './components/layout/TopBar';
 import { StatusBar } from './components/layout/StatusBar';
 import { ProviderSettings } from './components/layout/ProviderSettings';
 import { configApi, dashboardApi, providerApi } from './lib/api';
-import type { CreateProviderRequest, Dashboard, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WorkflowEventEnvelope } from './lib/api';
+import type { BuildProposal, CreateProviderRequest, Dashboard, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WorkflowEventEnvelope, WorkflowRun } from './lib/api';
 
 function App() {
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
@@ -22,6 +22,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [widgetData, setWidgetData] = useState<Record<string, WidgetRuntimeData | undefined>>({});
   const [widgetErrors, setWidgetErrors] = useState<Record<string, string | undefined>>({});
+  const [workflowRuns, setWorkflowRuns] = useState<Record<string, WorkflowRun | undefined>>({});
   const [refreshingWidgetId, setRefreshingWidgetId] = useState<string | null>(null);
   const [providers, setProviders] = useState<LLMProvider[]>([]);
   const [activeProviderId, setActiveProviderId] = useState<string | null>(null);
@@ -79,8 +80,27 @@ function App() {
     const unsubscribe = listen<WorkflowEventEnvelope>('workflow:event', event => {
       const workflowEvent = event.payload;
       if (workflowEvent.kind === 'run_started') {
+        setWorkflowRuns(prev => ({
+          ...prev,
+          [workflowEvent.workflow_id]: {
+            id: workflowEvent.run_id,
+            started_at: workflowEvent.emitted_at,
+            status: workflowEvent.status,
+          },
+        }));
         setStatusMessage('Workflow started...');
       } else if (workflowEvent.kind === 'run_finished') {
+        setWorkflowRuns(prev => ({
+          ...prev,
+          [workflowEvent.workflow_id]: {
+            id: workflowEvent.run_id,
+            started_at: prev[workflowEvent.workflow_id]?.started_at ?? workflowEvent.emitted_at,
+            finished_at: workflowEvent.emitted_at,
+            status: workflowEvent.status,
+            node_results: workflowEvent.payload as Record<string, unknown> | undefined,
+            error: workflowEvent.error,
+          },
+        }));
         setStatusMessage(
           workflowEvent.status === 'success'
             ? 'Workflow finished'
@@ -229,36 +249,32 @@ function App() {
     }
   };
 
-  const handleApplyBuildChange = async (action: 'create_local_dashboard' | 'add_text_widget' | 'add_gauge_widget') => {
+  const handleApplyBuildProposal = async (proposal: BuildProposal) => {
     setIsBusy(true);
     setError(null);
-    setStatusMessage('Applying build change...');
+    setStatusMessage('Applying build proposal...');
     try {
-      const updated = await dashboardApi.applyBuildChange({
-        action,
+      const updated = await dashboardApi.applyBuildProposal({
+        proposal,
         dashboard_id: activeDashboard?.id,
-        title: action === 'create_local_dashboard'
-          ? 'AI Build Dashboard'
-          : action === 'add_text_widget'
-            ? 'AI build note'
-            : 'AI build metric',
-        content: action === 'add_text_widget' ? '**Generated change**\n\nApplied after explicit confirmation.' : undefined,
-        value: action === 'add_gauge_widget' ? 76 : undefined,
+        confirmed: true,
       });
       setDashboards(prev => upsertDashboard(prev, updated));
       setActiveId(updated.id);
-      setStatusMessage('Build change applied');
-      if (updated.layout.length > 0) {
-        const widget = updated.layout[updated.layout.length - 1];
+      setStatusMessage('Build proposal applied');
+      const newWidgets = updated.layout.slice(Math.max(0, updated.layout.length - proposal.widgets.length));
+      for (const widget of newWidgets) {
         setRefreshingWidgetId(widget.id);
         const result = await dashboardApi.refreshWidget(updated.id, widget.id);
         if (result.data) {
           setWidgetData(prev => ({ ...prev, [widget.id]: result.data }));
+        } else if (result.error) {
+          setWidgetErrors(prev => ({ ...prev, [widget.id]: result.error }));
         }
       }
     } catch (err) {
-      setError(errorMessage(err, 'Failed to apply build change'));
-      setStatusMessage('Build apply failed');
+      setError(errorMessage(err, 'Failed to apply build proposal'));
+      setStatusMessage('Build proposal apply failed');
     } finally {
       setIsBusy(false);
       setRefreshingWidgetId(null);
@@ -461,6 +477,7 @@ function App() {
               dashboard={activeDashboard}
               widgetData={widgetData}
               widgetErrors={widgetErrors}
+              workflowRuns={workflowRuns}
               refreshingWidgetId={refreshingWidgetId}
               onRefreshWidget={handleRefreshWidget}
               onLayoutCommit={handleLayoutCommit}
@@ -482,7 +499,7 @@ function App() {
           canApplyToDashboard={Boolean(activeDashboard)}
           onClose={() => setIsChatOpen(false)}
           onModeChange={setChatMode}
-          onApplyBuildChange={handleApplyBuildChange}
+          onApplyBuildProposal={handleApplyBuildProposal}
         />
       )}
 

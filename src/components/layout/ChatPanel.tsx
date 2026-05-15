@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { chatApi } from '../../lib/api';
-import type { ChatMessage, ChatSession, LLMProvider } from '../../lib/api';
+import type { BuildProposal, ChatMessage, ChatSession, LLMProvider } from '../../lib/api';
 
 interface Props {
   mode: 'build' | 'context';
@@ -9,10 +9,10 @@ interface Props {
   canApplyToDashboard: boolean;
   onClose: () => void;
   onModeChange: (mode: 'build' | 'context') => void;
-  onApplyBuildChange: (action: 'create_local_dashboard' | 'add_text_widget' | 'add_gauge_widget') => Promise<void>;
+  onApplyBuildProposal: (proposal: BuildProposal) => Promise<void>;
 }
 
-export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboard, onClose, onModeChange, onApplyBuildChange }: Props) {
+export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboard, onClose, onModeChange, onApplyBuildProposal }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -111,36 +111,17 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
               {mode === 'build' ? 'Ask for build guidance' : 'Ask about your dashboard data'}
             </p>
             <p className="text-xs mt-1 opacity-70">
-              {mode === 'build' ? 'Generated changes are applied only after explicit confirmation.' : 'Requires a configured provider or local_mock provider.'}
+              {mode === 'build' ? 'Generated proposals are applied only after explicit confirmation.' : 'Requires a configured provider or local_mock dev/test provider.'}
             </p>
           </div>
         )}
 
         {mode === 'build' && (
           <div className="rounded-lg border border-border bg-background/70 p-3 text-xs">
-            <p className="mb-2 font-medium text-foreground">Generated changes</p>
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={() => onApplyBuildChange('create_local_dashboard')}
-                className="rounded-md bg-primary px-2.5 py-1.5 text-primary-foreground hover:bg-primary/90"
-              >
-                Apply dashboard
-              </button>
-              <button
-                onClick={() => onApplyBuildChange('add_text_widget')}
-                disabled={!canApplyToDashboard}
-                className="rounded-md border border-border px-2.5 py-1.5 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Add text
-              </button>
-              <button
-                onClick={() => onApplyBuildChange('add_gauge_widget')}
-                disabled={!canApplyToDashboard}
-                className="rounded-md border border-border px-2.5 py-1.5 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Add gauge
-              </button>
-            </div>
+            <p className="font-medium text-foreground">Build proposals</p>
+            <p className="mt-1 text-muted-foreground">
+              Ask the provider for a dashboard, widget, or workflow change. The next structured proposal will show a preview before apply{canApplyToDashboard ? '.' : ' or create a new dashboard.'}
+            </p>
           </div>
         )}
 
@@ -152,6 +133,12 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
                 : 'bg-muted text-foreground rounded-bl-md'
             }`}>
               {msg.content}
+              {msg.metadata?.build_proposal && (
+                <ProposalPreview
+                  proposal={msg.metadata.build_proposal}
+                  onApply={() => onApplyBuildProposal(msg.metadata!.build_proposal!)}
+                />
+              )}
               {msg.tool_calls && msg.tool_calls.length > 0 && (
                 <div className="mt-2 pt-2 border-t border-border/50">
                   <p className="text-xs opacity-70 flex items-center gap-1">
@@ -160,6 +147,19 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
                     </svg>
                     Used {msg.tool_calls.length} tool{msg.tool_calls.length > 1 ? 's' : ''}
                   </p>
+                  {msg.tool_results?.map(result => (
+                    <p key={result.tool_call_id} className="mt-1 text-[10px] opacity-70">
+                      {result.name}: {result.error ? `error - ${result.error}` : 'ok'}
+                    </p>
+                  ))}
+                </div>
+              )}
+              {msg.metadata && (msg.metadata.provider || msg.metadata.model || msg.metadata.latency_ms) && (
+                <div className="mt-2 border-t border-border/40 pt-1 text-[10px] opacity-60">
+                  {[msg.metadata.provider, msg.metadata.model, msg.metadata.latency_ms ? `${msg.metadata.latency_ms}ms` : undefined]
+                    .filter(Boolean)
+                    .join(' - ')}
+                  {msg.metadata.tokens ? ` - ${msg.metadata.tokens.prompt}/${msg.metadata.tokens.completion} tokens` : ''}
                 </div>
               )}
             </div>
@@ -205,4 +205,71 @@ export function ChatPanel({ mode, dashboardId, activeProvider, canApplyToDashboa
       </div>
     </aside>
   );
+}
+
+function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApply: () => Promise<void> }) {
+  const [isApplying, setIsApplying] = useState(false);
+
+  const apply = async () => {
+    setIsApplying(true);
+    try {
+      await onApply();
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 rounded-lg border border-border bg-background p-3 text-xs text-foreground">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-medium">{proposal.title}</p>
+          {proposal.dashboard_name && (
+            <p className="mt-0.5 text-muted-foreground">Dashboard: {proposal.dashboard_name}</p>
+          )}
+        </div>
+        <button
+          onClick={apply}
+          disabled={isApplying || proposal.widgets.length === 0}
+          className="rounded-md bg-primary px-2.5 py-1.5 text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {isApplying ? 'Applying...' : 'Apply'}
+        </button>
+      </div>
+
+      <div className="mt-2 space-y-1.5">
+        {proposal.widgets.map((widget, index) => (
+          <div key={`${widget.title}-${index}`} className="rounded-md border border-border/70 px-2 py-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-medium">{widget.title}</span>
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{widget.widget_type}</span>
+            </div>
+            <p className="mt-1 text-[10px] text-muted-foreground">Creates a persisted datasource workflow for runtime refresh.</p>
+            {widget.datasource_plan ? (
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                {widget.datasource_plan.kind}
+                {widget.datasource_plan.tool_name ? ` / ${widget.datasource_plan.tool_name}` : ''}
+                {widget.datasource_plan.server_id ? ` / ${widget.datasource_plan.server_id}` : ''}
+                {widget.datasource_plan.refresh_cron ? ` / ${widget.datasource_plan.refresh_cron}` : ''}
+              </p>
+            ) : (
+              <p className="mt-1 text-[10px] text-destructive">Missing executable datasource plan</p>
+            )}
+            <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{previewData(widget.data)}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function previewData(data: unknown) {
+  if (data === undefined || data === null) return 'No preview sample';
+  if (typeof data === 'string') return data;
+  if (typeof data === 'number') return String(data);
+  try {
+    return JSON.stringify(data);
+  } catch {
+    return 'Preview unavailable';
+  }
 }

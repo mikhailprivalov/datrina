@@ -18,22 +18,21 @@ This backlog records deferred features from the reconciliation plan. Items here 
 ## Tools And MCP
 
 - Expose built-in tool execution only through the existing Rust `ToolEngine` policy gateway.
-- Add provider-driven chat tool schema emission, parsing, tool-result messages, and bounded resume loops.
 - Add remote MCP transports only with a new hardening decision and validation gate.
 - Keep plugin SDK and marketplace behavior deferred until a dedicated product/runtime workstream exists.
 
 ## AI And Chat
 
 - Add typed Tauri streaming events if streaming chat becomes part of the product scope.
-- Expand build chat from deterministic apply controls to provider-generated structured change proposals.
-- Preserve the current no-key behavior: use `local_mock` for deterministic success, otherwise return unavailable/error state.
+- Extend chat beyond the current bounded one-resume tool loop only after explicit UX and policy limits are defined.
+- Preserve the current no-key behavior: use clearly labeled `local_mock` dev/test mode for deterministic success, otherwise return unavailable/error state.
+- Rerun W13 real-provider acceptance with user-provided credentials/service availability before treating external provider behavior as live-validated in this checkout.
 
 ## Dashboard And Widgets
 
-- Add full widget editing forms beyond the W10 local text/gauge add controls.
+- Add full manual widget editing forms beyond W12 generated proposal apply.
 - Implement widget post-process steps after the runtime contract and failure semantics are explicit.
-- Add scheduled widget auto-refresh wiring in React after scheduler-triggered workflow execution is surfaced in UI state.
-- Add provider-generated dashboard templates only after chat generation is validated as real behavior.
+- Add per-widget cron editing controls in React if scheduled refresh should be configured outside generated datasource plans or raw workflow commands.
 
 ## Deferred Research Promises
 
