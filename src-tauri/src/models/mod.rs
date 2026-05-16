@@ -1,7 +1,10 @@
 pub mod chat;
 pub mod dashboard;
 pub mod mcp;
+pub mod memory;
+pub mod pipeline;
 pub mod provider;
+pub mod validation;
 pub mod widget;
 pub mod workflow;
 

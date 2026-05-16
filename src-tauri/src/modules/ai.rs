@@ -43,7 +43,8 @@ impl Default for AIEngine {
         Self {
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(15))
-                .read_timeout(Duration::from_secs(180))
+                .read_timeout(Duration::from_secs(600))
+                .pool_idle_timeout(Duration::from_secs(15))
                 .no_gzip()
                 .no_brotli()
                 .no_zstd()
@@ -69,6 +70,38 @@ impl AIEngine {
         messages: &[ChatMessage],
         tools: &[AIToolSpec],
     ) -> Result<AIResponse> {
+        self.complete_chat_with_tools_inner(provider, messages, tools, None)
+            .await
+    }
+
+    /// W16: variant that asks OpenAI-compatible providers for a strict
+    /// JSON object response via `response_format: {"type":"json_object"}`.
+    /// Used on the proposal validation retry pass where we need a clean
+    /// `BuildProposal` JSON, not free-form text wrapping a JSON blob.
+    /// Falls back to plain completion silently for providers that don't
+    /// support the option (Ollama, LocalMock).
+    pub async fn complete_chat_with_tools_json_object(
+        &self,
+        provider: &LLMProvider,
+        messages: &[ChatMessage],
+        tools: &[AIToolSpec],
+    ) -> Result<AIResponse> {
+        self.complete_chat_with_tools_inner(
+            provider,
+            messages,
+            tools,
+            Some(json!({"type": "json_object"})),
+        )
+        .await
+    }
+
+    async fn complete_chat_with_tools_inner(
+        &self,
+        provider: &LLMProvider,
+        messages: &[ChatMessage],
+        tools: &[AIToolSpec],
+        response_format: Option<serde_json::Value>,
+    ) -> Result<AIResponse> {
         validate_provider(provider)?;
 
         let started = Instant::now();
@@ -81,7 +114,7 @@ impl AIEngine {
             },
             ProviderKind::Ollama => self.complete_ollama(provider, messages).await?,
             ProviderKind::Openrouter | ProviderKind::Custom => {
-                self.complete_openai_compatible(provider, messages, tools)
+                self.complete_openai_compatible(provider, messages, tools, response_format)
                     .await?
             }
         };
@@ -203,6 +236,7 @@ impl AIEngine {
         provider: &LLMProvider,
         messages: &[ChatMessage],
         tools: &[AIToolSpec],
+        response_format: Option<serde_json::Value>,
     ) -> Result<AICompletion> {
         let endpoint = openai_chat_endpoint(&provider.base_url)?;
         let mut payload = json!({
@@ -211,6 +245,10 @@ impl AIEngine {
             "messages": to_openai_messages(messages),
         });
         apply_openrouter_options(provider, &mut payload);
+
+        if let Some(format) = response_format {
+            payload["response_format"] = format;
+        }
 
         if !tools.is_empty() {
             payload["tools"] = json!(tools
@@ -388,12 +426,31 @@ impl AIEngine {
         let mut reasoning = String::new();
         let mut tool_builders: BTreeMap<u32, ToolCallBuilder> = BTreeMap::new();
         let mut tokens = None;
+        let mut first_chunk_received = false;
+        const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(60);
 
-        while let Some(chunk) = stream.next().await {
+        loop {
             if is_cancelled() {
                 return Err(anyhow!("chat_stream_cancelled"));
             }
+            let next_chunk = if first_chunk_received {
+                stream.next().await
+            } else {
+                match tokio::time::timeout(FIRST_BYTE_TIMEOUT, stream.next()).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "provider_first_byte_timeout: provider sent no data within {}s",
+                            FIRST_BYTE_TIMEOUT.as_secs()
+                        ));
+                    }
+                }
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
             let chunk = chunk.map_err(|e| anyhow!("provider_stream_error: {}", e))?;
+            first_chunk_received = true;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some((event_end, separator_len)) = find_sse_event_end(&buffer) {

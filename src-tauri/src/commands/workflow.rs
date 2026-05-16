@@ -162,6 +162,17 @@ async fn schedule_if_cron(
         Some(cron) => cron.to_string(),
         None => return Ok(()),
     };
+    let cron = match crate::commands::dashboard::normalize_cron_expression(&cron) {
+        Some(value) => value,
+        None => {
+            tracing::warn!(
+                "skipping scheduling for workflow '{}': cron '{}' is not parseable",
+                workflow.id,
+                cron
+            );
+            return Ok(());
+        }
+    };
     let provider = active_provider(state).await?;
     let runtime = ScheduledRuntime {
         app: app.clone(),

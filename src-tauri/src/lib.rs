@@ -2,6 +2,7 @@ pub mod commands;
 pub mod models;
 pub mod modules;
 
+use serde_json::json;
 use tauri::{App, Manager};
 use tracing::info;
 
@@ -9,10 +10,12 @@ use tracing::info;
 
 use modules::ai::AIEngine;
 use modules::mcp_manager::MCPManager;
+use modules::memory::MemoryEngine;
 use modules::scheduler::Scheduler;
 use modules::storage::Storage;
 use modules::tool_engine::ToolEngine;
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -25,6 +28,7 @@ pub struct AppState {
     pub scheduler: Arc<Mutex<Scheduler>>,
     pub tool_engine: Arc<ToolEngine>,
     pub ai_engine: Arc<AIEngine>,
+    pub memory_engine: Arc<MemoryEngine>,
     pub chat_abort_flags: Arc<dashmap::DashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -39,6 +43,7 @@ impl AppState {
         scheduler.start().await?;
         let tool_engine = Arc::new(ToolEngine::default());
         let ai_engine = Arc::new(AIEngine::default());
+        let memory_engine = Arc::new(MemoryEngine::new(storage.clone()));
         let app_handle = app.handle().clone();
         let provider = active_provider_for_startup(storage.as_ref()).await?;
         for workflow in storage
@@ -47,14 +52,22 @@ impl AppState {
             .into_iter()
             .filter(|workflow| workflow.is_enabled)
         {
-            let cron = workflow
+            let raw_cron = workflow
                 .trigger
                 .config
                 .as_ref()
                 .and_then(|config| config.cron.as_deref())
                 .filter(|cron| !cron.trim().is_empty())
                 .map(ToString::to_string);
-            if let Some(cron) = cron {
+            if let Some(raw_cron) = raw_cron {
+                let Some(cron) = commands::dashboard::normalize_cron_expression(&raw_cron) else {
+                    tracing::warn!(
+                        "skipping startup scheduling for workflow '{}': cron '{}' is not parseable",
+                        workflow.id,
+                        raw_cron
+                    );
+                    continue;
+                };
                 let runtime = modules::scheduler::ScheduledRuntime {
                     app: app_handle.clone(),
                     storage: storage.clone(),
@@ -74,6 +87,7 @@ impl AppState {
             scheduler,
             tool_engine,
             ai_engine,
+            memory_engine,
             chat_abort_flags: Arc::new(dashmap::DashMap::new()),
         })
     }
@@ -112,15 +126,18 @@ macro_rules! generate_handler {
             $crate::commands::dashboard::add_dashboard_widget,
             $crate::commands::dashboard::apply_build_change,
             $crate::commands::dashboard::apply_build_proposal,
+            $crate::commands::dashboard::dry_run_widget,
             $crate::commands::dashboard::delete_dashboard,
             $crate::commands::dashboard::refresh_widget,
             // Chat commands
             $crate::commands::chat::list_sessions,
+            $crate::commands::chat::list_session_summaries,
             $crate::commands::chat::get_session,
             $crate::commands::chat::create_session,
             $crate::commands::chat::send_message,
             $crate::commands::chat::send_message_stream,
             $crate::commands::chat::cancel_chat_response,
+            $crate::commands::chat::truncate_chat_messages,
             $crate::commands::chat::delete_session,
             // MCP commands
             $crate::commands::mcp::list_servers,
@@ -147,6 +164,13 @@ macro_rules! generate_handler {
             // Tool commands
             $crate::commands::tool::get_whitelist,
             $crate::commands::tool::execute_curl,
+            // Memory commands (W17)
+            $crate::commands::memory::list_memories,
+            $crate::commands::memory::delete_memory,
+            $crate::commands::memory::remember_memory,
+            $crate::commands::memory::recall_memories,
+            $crate::commands::memory::list_tool_shapes,
+            $crate::commands::memory::list_memory_kinds,
             // Config commands
             $crate::commands::config::get_config,
             $crate::commands::config::set_config,
@@ -163,8 +187,109 @@ pub async fn init_storage(app: &App) -> anyhow::Result<()> {
     let state = AppState::new(app).await?;
     info!("📦 Storage initialized");
 
+    if let Some(report_path) = std::env::var_os("DATRINA_E2E_REPORT") {
+        let report_path = PathBuf::from(report_path);
+        let app_handle = app.handle().clone();
+        let smoke_state = state.clone();
+        app.manage(state);
+        tauri::async_runtime::spawn(async move {
+            let code = match run_startup_e2e_smoke(smoke_state, report_path).await {
+                Ok(()) => 0,
+                Err(error) => {
+                    tracing::error!("Datrina startup e2e smoke failed: {error:?}");
+                    1
+                }
+            };
+            app_handle.exit(code);
+        });
+        return Ok(());
+    }
+
     app.manage(state);
     Ok(())
+}
+
+async fn run_startup_e2e_smoke(state: AppState, report_path: PathBuf) -> anyhow::Result<()> {
+    use crate::models::dashboard::Dashboard;
+    use crate::models::workflow::RunStatus;
+    use crate::modules::workflow_engine::WorkflowEngine;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let (layout, workflows) = commands::dashboard::local_mvp_slice(now);
+    let dashboard = Dashboard {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "Autopilot E2E Dashboard".to_string(),
+        description: Some("Created by DATRINA_E2E_REPORT startup smoke.".to_string()),
+        layout,
+        workflows,
+        is_default: false,
+        created_at: now,
+        updated_at: now,
+    };
+
+    for workflow in &dashboard.workflows {
+        state.storage.create_workflow(workflow).await?;
+    }
+    state.storage.create_dashboard(&dashboard).await?;
+
+    let workflow = dashboard
+        .workflows
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("local MVP dashboard has no workflow"))?;
+    let widget = dashboard
+        .layout
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("local MVP dashboard has no widget"))?;
+
+    let engine = WorkflowEngine::with_runtime(
+        state.tool_engine.as_ref(),
+        state.mcp_manager.as_ref(),
+        state.ai_engine.as_ref(),
+        active_provider_for_startup(state.storage.as_ref()).await?,
+    );
+    let execution = engine.execute(workflow, None).await?;
+    let run = execution.run;
+    state.storage.save_workflow_run(&workflow.id, &run).await?;
+    state
+        .storage
+        .update_workflow_last_run(&workflow.id, &run)
+        .await?;
+
+    let success = matches!(run.status, RunStatus::Success);
+    let output_value = run
+        .node_results
+        .as_ref()
+        .and_then(|value| value.pointer("/output/value"))
+        .cloned();
+
+    let report = json!({
+        "success": success && output_value == Some(json!(72)),
+        "dashboard_id": dashboard.id,
+        "widget_id": widget.id(),
+        "workflow_id": workflow.id,
+        "workflow_run_id": run.id,
+        "workflow_status": run.status,
+        "workflow_error": run.error,
+        "output_value": output_value,
+        "created_at": now
+    });
+
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+
+    if report
+        .get("success")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "startup e2e smoke did not produce value 72"
+        ))
+    }
 }
 
 pub fn init_mcp_manager(_app: &App) -> anyhow::Result<()> {

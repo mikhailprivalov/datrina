@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Default capability for the Datrina main webview: invoke commands, listen/emit Tauri events, and use built-in plugins.","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:webview:default","core:window:default","core:app:default","core:path:default","core:resources:default","core:image:default","core:menu:default","core:tray:default","dialog:default","fs:default","opener:default","os:default","process:default","sql:default","store:default"]}}

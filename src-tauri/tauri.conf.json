@@ -13,7 +13,7 @@
     "active": false,
     "targets": ["deb", "rpm", "msi", "dmg", "appimage"],
     "category": "Productivity",
-    "copyright": "2025 Datrina The Lenswright Team",
+    "copyright": "2026 Mikhail Privalov <n5250@yandex.com>",
     "licenseFile": "../LICENSE.md",
     "macOS": {
       "frameworks": [],

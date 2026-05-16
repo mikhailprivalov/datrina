@@ -4,6 +4,50 @@ Status: implemented with external-provider validation residual
 
 Date: 2026-05-15
 
+## Addendum 2026-05-15: Agent phase observability
+
+The chat event envelope now also carries `ChatEventKind::AgentPhase` /
+`AgentEvent::AgentPhase` for live agent run observability:
+
+- `mcp_reconnect` started/completed/failed wraps the MCP discovery step in
+  `send_message_stream_inner`, so the UI shows immediately that the chat
+  is reconnecting MCP servers instead of staring at a silent
+  "Waiting…" string.
+- `mcp_list_tools` started/completed/failed fires once per enabled stdio
+  MCP server during `reconnect_enabled_mcp_servers`, with per-server tool
+  counts on completion.
+- `provider_request` started/completed/failed wraps the OpenAI-compatible
+  streaming call, with content/reasoning/tool-call counts on completion.
+- `provider_first_byte` completed fires from inside the streaming
+  callback the first time content or reasoning arrives, with elapsed
+  time-to-first-byte.
+- `tool_resume` started/completed/failed wraps the bounded one-resume
+  provider call after a tool execution iteration.
+
+The streaming SSE reader in `AIEngine::complete_openai_compatible_streaming`
+also enforces a 60-second first-byte timeout
+(`provider_first_byte_timeout`) so a provider that opens the connection
+but never sends a chunk now fails honestly with a recoverable
+`RunError` instead of hanging on the per-read 180s timeout indefinitely.
+
+The spawn task wrapper in `send_message_stream` is now panic-safe via
+`futures::FutureExt::catch_unwind`. A panic anywhere in
+`send_message_stream_inner` converts into a `MessageFailed` event so the
+UI's `isLoading` state never silently sticks.
+
+Frontend: `ChatPanel` now renders an `AgentTimeline` component above the
+assistant text body. Each phase shows a spinner / check / x icon, a label,
+an elapsed counter that ticks every 250 ms while running, and the optional
+detail string (in red on failure). The timeline auto-collapses to a small
+"Agent steps (N)" disclosure as soon as the provider starts streaming
+text. The send button is gated on the Tauri listener having finished
+registering, eliminating the listener-race edge case that could drop the
+`MessageStarted` event.
+
+The legacy non-streaming `send_message` path keeps its own quiet
+`chat_tool_specs_silent` wrapper so it does not emit phase events for a
+chat session it cannot stream.
+
 ## Scope Handled
 
 - Added a typed Rust `chat:event` envelope and mirrored TypeScript types.

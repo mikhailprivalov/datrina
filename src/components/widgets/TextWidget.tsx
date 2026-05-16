@@ -1,4 +1,6 @@
 import type { CSSProperties } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { TextConfig, TextWidgetRuntimeData } from '../../lib/api';
 
 interface Props {
@@ -6,22 +8,13 @@ interface Props {
   data?: TextWidgetRuntimeData;
 }
 
-function renderInlineMarkdown(text: string) {
-  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) => {
-    if (part.startsWith('**') && part.endsWith('**')) {
-      return <strong key={index}>{part.slice(2, -2)}</strong>;
-    }
-    return <span key={index}>{part}</span>;
-  });
-}
-
 export function TextWidget({ config, data }: Props) {
-  const { format, font_size, color, align } = config;
-
+  const format = config.format ?? 'markdown';
+  const align = config.align ?? 'left';
   const style: CSSProperties = {
-    fontSize: font_size ? `${font_size}px` : '14px',
-    color: color ?? 'inherit',
-    textAlign: align ?? 'left',
+    fontSize: config.font_size ? `${config.font_size}px` : '13px',
+    color: config.color ?? 'inherit',
+    textAlign: align,
   };
   const content = data?.content;
 
@@ -33,32 +26,69 @@ export function TextWidget({ config, data }: Props) {
     );
   }
 
-  if (format === 'markdown') {
+  if (format === 'html') {
     return (
-      <div className="prose prose-sm max-w-none dark:prose-invert" style={style}>
-        {content.split('\n').map((line, index) => {
-          if (line.startsWith('# ')) {
-            return <h1 key={index} className="mb-2 text-lg font-bold">{renderInlineMarkdown(line.slice(2))}</h1>;
-          }
-          if (line.startsWith('- ')) {
-            return <li key={index} className="ml-4">{renderInlineMarkdown(line.slice(2))}</li>;
-          }
-          if (line.startsWith('> ')) {
-            return (
-              <blockquote key={index} className="border-l-2 border-primary/50 pl-3 italic text-muted-foreground">
-                {renderInlineMarkdown(line.slice(2))}
-              </blockquote>
-            );
-          }
-          return <p key={index}>{renderInlineMarkdown(line)}</p>;
-        })}
-      </div>
+      <div
+        className="text-sm leading-relaxed [&_a]:text-primary [&_a]:underline"
+        style={style}
+        dangerouslySetInnerHTML={{ __html: content }}
+      />
     );
   }
 
-  if (format === 'html') {
-    return <p className="text-sm leading-relaxed whitespace-pre-wrap" style={style}>{content}</p>;
+  if (format === 'plain') {
+    return (
+      <p className="text-sm leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere]" style={style}>
+        {content}
+      </p>
+    );
   }
 
-  return <p className="text-sm leading-relaxed whitespace-pre-wrap" style={style}>{content}</p>;
+  return (
+    <div className="space-y-1.5 break-words [overflow-wrap:anywhere] text-sm leading-relaxed" style={style}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="whitespace-pre-wrap">{children}</p>,
+          h1: ({ children }) => <h1 className="text-base font-semibold mt-1">{children}</h1>,
+          h2: ({ children }) => <h2 className="text-sm font-semibold mt-1">{children}</h2>,
+          h3: ({ children }) => <h3 className="text-sm font-medium mt-1">{children}</h3>,
+          h4: ({ children }) => <h4 className="text-xs font-medium mt-1 uppercase tracking-wide">{children}</h4>,
+          strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+          em: ({ children }) => <em className="italic">{children}</em>,
+          a: ({ href, children }) => (
+            <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary underline">
+              {children}
+            </a>
+          ),
+          ul: ({ children }) => <ul className="list-disc pl-5 space-y-0.5">{children}</ul>,
+          ol: ({ children }) => <ol className="list-decimal pl-5 space-y-0.5">{children}</ol>,
+          li: ({ children }) => <li className="leading-snug">{children}</li>,
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-2 border-border/70 pl-2 text-muted-foreground italic">{children}</blockquote>
+          ),
+          hr: () => <hr className="my-2 border-border/60" />,
+          code: ({ className, children, ...rest }) => {
+            const inline = !className;
+            if (inline) {
+              return <code className="rounded bg-foreground/10 px-1 py-0.5 text-[11px] font-mono" {...rest}>{children}</code>;
+            }
+            return <code className={`${className ?? ''} font-mono text-[11px]`} {...rest}>{children}</code>;
+          },
+          pre: ({ children }) => (
+            <pre className="overflow-x-auto rounded-md border border-border/60 bg-background/80 p-2 text-[11px]">{children}</pre>
+          ),
+          table: ({ children }) => (
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-[11px] border-collapse">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => <th className="border border-border/60 px-2 py-1 bg-background/50 text-left font-medium">{children}</th>,
+          td: ({ children }) => <td className="border border-border/60 px-2 py-1 align-top">{children}</td>,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
 }

@@ -6,6 +6,8 @@ import { ChatPanel } from './components/layout/ChatPanel';
 import { TopBar } from './components/layout/TopBar';
 import { StatusBar } from './components/layout/StatusBar';
 import { ProviderSettings } from './components/layout/ProviderSettings';
+import { McpSettings } from './components/layout/McpSettings';
+import { MemorySettings } from './components/layout/MemorySettings';
 import { configApi, dashboardApi, providerApi } from './lib/api';
 import type { BuildProposal, CreateProviderRequest, Dashboard, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WorkflowEventEnvelope, WorkflowRun } from './lib/api';
 
@@ -15,6 +17,22 @@ function App() {
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatMode, setChatMode] = useState<'build' | 'context'>('context');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    if (typeof window === 'undefined') return 'light';
+    const stored = window.localStorage.getItem('datrina:theme');
+    if (stored === 'dark' || stored === 'light') return stored;
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  });
+
+  useEffect(() => {
+    const root = window.document.documentElement;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+    window.localStorage.setItem('datrina:theme', theme);
+  }, [theme]);
   const [isReady, setIsReady] = useState(false);
   const [isProvidersReady, setIsProvidersReady] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
@@ -27,6 +45,8 @@ function App() {
   const [providers, setProviders] = useState<LLMProvider[]>([]);
   const [activeProviderId, setActiveProviderId] = useState<string | null>(null);
   const [isProviderSettingsOpen, setIsProviderSettingsOpen] = useState(false);
+  const [isMcpSettingsOpen, setIsMcpSettingsOpen] = useState(false);
+  const [isMemorySettingsOpen, setIsMemorySettingsOpen] = useState(false);
 
   const loadDashboards = useCallback(async () => {
     try {
@@ -449,9 +469,13 @@ function App() {
         dashboards={dashboards}
         activeId={activeId}
         onSelect={handleSelectDashboard}
-        onCreate={handleCreate}
+        onCreate={() => handleCreate('blank')}
         onDelete={handleDelete}
+        theme={theme}
+        onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
         onOpenSettings={() => setIsProviderSettingsOpen(true)}
+        onOpenMcpSettings={() => setIsMcpSettingsOpen(true)}
+        onOpenMemorySettings={() => setIsMemorySettingsOpen(true)}
         isCollapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
       />
@@ -482,6 +506,7 @@ function App() {
               onRefreshWidget={handleRefreshWidget}
               onLayoutCommit={handleLayoutCommit}
               onAddWidget={handleAddWidget}
+              onUpdateWidgets={handleLayoutCommit}
             />
           ) : (
             <EmptyState onCreate={() => handleCreate('local_mvp')} onBuild={() => { setChatMode('build'); setIsChatOpen(true); }} />
@@ -495,12 +520,21 @@ function App() {
         <ChatPanel
           mode={chatMode}
           dashboardId={activeId ?? undefined}
+          dashboardName={activeDashboard?.name}
           activeProvider={activeProvider}
           canApplyToDashboard={Boolean(activeDashboard)}
           onClose={() => setIsChatOpen(false)}
           onModeChange={setChatMode}
           onApplyBuildProposal={handleApplyBuildProposal}
         />
+      )}
+
+      {isMcpSettingsOpen && (
+        <McpSettings onClose={() => setIsMcpSettingsOpen(false)} />
+      )}
+
+      {isMemorySettingsOpen && (
+        <MemorySettings onClose={() => setIsMemorySettingsOpen(false)} />
       )}
 
       {(isProviderSettingsOpen || providers.length === 0) && (

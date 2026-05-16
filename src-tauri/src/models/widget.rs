@@ -61,6 +61,61 @@ pub enum Widget {
         #[serde(skip_serializing_if = "Option::is_none")]
         datasource: Option<DatasourceConfig>,
     },
+    Stat {
+        id: Id,
+        title: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        config: StatConfig,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        datasource: Option<DatasourceConfig>,
+    },
+    Logs {
+        id: Id,
+        title: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        config: LogsConfig,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        datasource: Option<DatasourceConfig>,
+    },
+    BarGauge {
+        id: Id,
+        title: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        config: BarGaugeConfig,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        datasource: Option<DatasourceConfig>,
+    },
+    StatusGrid {
+        id: Id,
+        title: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        config: StatusGridConfig,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        datasource: Option<DatasourceConfig>,
+    },
+    Heatmap {
+        id: Id,
+        title: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        config: HeatmapConfig,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        datasource: Option<DatasourceConfig>,
+    },
 }
 
 impl Widget {
@@ -71,6 +126,11 @@ impl Widget {
             Widget::Table { id, .. } => id,
             Widget::Image { id, .. } => id,
             Widget::Gauge { id, .. } => id,
+            Widget::Stat { id, .. } => id,
+            Widget::Logs { id, .. } => id,
+            Widget::BarGauge { id, .. } => id,
+            Widget::StatusGrid { id, .. } => id,
+            Widget::Heatmap { id, .. } => id,
         }
     }
 
@@ -81,6 +141,11 @@ impl Widget {
             Widget::Table { title, .. } => title,
             Widget::Image { title, .. } => title,
             Widget::Gauge { title, .. } => title,
+            Widget::Stat { title, .. } => title,
+            Widget::Logs { title, .. } => title,
+            Widget::BarGauge { title, .. } => title,
+            Widget::StatusGrid { title, .. } => title,
+            Widget::Heatmap { title, .. } => title,
         }
     }
 }
@@ -132,10 +197,11 @@ pub enum TextFormat {
     Html,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextAlign {
     Left,
+    #[default]
     Center,
     Right,
 }
@@ -159,6 +225,12 @@ pub struct TableColumn {
     pub width: Option<u16>,
     #[serde(default = "default_column_format")]
     pub format: ColumnFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thresholds: Option<Vec<GaugeThreshold>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_colors: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +241,11 @@ pub enum ColumnFormat {
     Date,
     Currency,
     Percent,
+    Status,
+    Progress,
+    Badge,
+    Link,
+    Sparkline,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +282,166 @@ pub struct GaugeThreshold {
     pub color: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u8>,
+    #[serde(default = "default_stat_color_mode")]
+    pub color_mode: StatColorMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thresholds: Option<Vec<GaugeThreshold>>,
+    #[serde(default = "default_true")]
+    pub show_sparkline: bool,
+    #[serde(default)]
+    pub graph_mode: StatGraphMode,
+    #[serde(default)]
+    pub align: TextAlign,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatColorMode {
+    #[default]
+    None,
+    Value,
+    Background,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatGraphMode {
+    #[default]
+    None,
+    Sparkline,
+}
+
+fn default_stat_color_mode() -> StatColorMode {
+    StatColorMode::Value
+}
+
+// ─── Logs ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsConfig {
+    #[serde(default = "default_max_entries")]
+    pub max_entries: u32,
+    #[serde(default = "default_true")]
+    pub show_timestamp: bool,
+    #[serde(default = "default_true")]
+    pub show_level: bool,
+    #[serde(default)]
+    pub wrap: bool,
+    #[serde(default)]
+    pub reverse: bool,
+}
+
+fn default_max_entries() -> u32 {
+    200
+}
+
+// ─── Bar Gauge ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarGaugeConfig {
+    #[serde(default)]
+    pub orientation: BarGaugeOrientation,
+    #[serde(default)]
+    pub display_mode: BarGaugeDisplayMode,
+    #[serde(default = "default_true")]
+    pub show_value: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thresholds: Option<Vec<GaugeThreshold>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarGaugeOrientation {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarGaugeDisplayMode {
+    #[default]
+    Gradient,
+    Basic,
+    Retro,
+}
+
+// ─── Status Grid ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusGridConfig {
+    #[serde(default = "default_status_columns")]
+    pub columns: u8,
+    #[serde(default)]
+    pub layout: StatusGridLayout,
+    #[serde(default = "default_true")]
+    pub show_label: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_colors: Option<std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusGridLayout {
+    #[default]
+    Grid,
+    Row,
+    Compact,
+}
+
+fn default_status_columns() -> u8 {
+    4
+}
+
+// ─── Heatmap ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeatmapConfig {
+    #[serde(default = "default_heatmap_scheme")]
+    pub color_scheme: HeatmapColorScheme,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default = "default_true")]
+    pub show_legend: bool,
+    #[serde(default)]
+    pub log_scale: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeatmapColorScheme {
+    #[default]
+    Viridis,
+    Magma,
+    Cool,
+    Warm,
+    GreenRed,
+}
+
+fn default_heatmap_scheme() -> HeatmapColorScheme {
+    HeatmapColorScheme::Viridis
 }
 
 // ─── Datasource ──────────────────────────────────────────────────────────────

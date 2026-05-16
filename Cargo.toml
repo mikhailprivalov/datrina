@@ -5,8 +5,8 @@ members = ["src-tauri"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Datrina The Lenswright Team"]
-license = "FSL-1.1"
+authors = ["Mikhail Privalov <n5250@yandex.com>"]
+license = "MIT"
 repository = "https://github.com/yourusername/datrina"
 
 [profile.release]

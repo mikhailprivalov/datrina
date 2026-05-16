@@ -212,9 +212,14 @@ impl<'a> WorkflowEngine<'a> {
                 let mcp_manager = self
                     .mcp_manager
                     .ok_or_else(|| anyhow!("MCP runtime is unavailable for workflow execution"))?;
-                mcp_manager
+                let raw = mcp_manager
                     .call_tool(server_id, tool_name, config.get("arguments").cloned())
-                    .await
+                    .await?;
+                // Stdio MCP servers wrap payloads as {"content":[{"text":"<json>"}]}.
+                // Unwrap and parse at the source so downstream pipeline steps
+                // see the actual data shape instead of having to navigate the
+                // wrapper themselves.
+                Ok(mcp_unwrap_content(&raw).unwrap_or(raw))
             }
 
             NodeKind::Llm => {
@@ -278,6 +283,16 @@ impl<'a> WorkflowEngine<'a> {
                             .and_then(|v| v.as_str())
                             .ok_or_else(|| anyhow!("Transform 'pick_path' requires path"))?;
                         Ok(pick_path(&input_data, path).cloned().unwrap_or(Value::Null))
+                    }
+                    "pipeline" => {
+                        let steps_value = config
+                            .get("steps")
+                            .ok_or_else(|| anyhow!("Transform 'pipeline' requires steps"))?;
+                        let steps: Vec<crate::models::pipeline::PipelineStep> =
+                            serde_json::from_value(steps_value.clone())
+                                .map_err(|e| anyhow!("Invalid pipeline steps: {}", e))?;
+                        run_pipeline(input_data, &steps, self.ai_engine, self.provider.as_ref())
+                            .await
                     }
                     other => Err(anyhow!("Unsupported transform '{}'", other)),
                 }
@@ -493,6 +508,566 @@ fn pick_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         }
     }
     Some(current)
+}
+
+/// Resolve a dotted path with `[index]` and `[*]` segments. Always returns
+/// an owned `Value`; `[*]` flattens an array into a Vec of matched values.
+fn resolve_path(value: &Value, path: &str) -> Value {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return value.clone();
+    }
+    let segments = split_path_segments(trimmed);
+    resolve_segments(value, &segments)
+}
+
+fn split_path_segments(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut chars = path.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '.' => {
+                if !buf.is_empty() {
+                    out.push(std::mem::take(&mut buf));
+                }
+            }
+            '[' => {
+                if !buf.is_empty() {
+                    out.push(std::mem::take(&mut buf));
+                }
+                let mut idx = String::new();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == ']' {
+                        break;
+                    }
+                    idx.push(c);
+                }
+                out.push(format!("[{}]", idx));
+            }
+            other => buf.push(other),
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+fn resolve_segments(value: &Value, segments: &[String]) -> Value {
+    if segments.is_empty() {
+        return value.clone();
+    }
+    let (head, rest) = segments.split_first().unwrap();
+    if head == "[*]" {
+        match value {
+            Value::Array(items) => {
+                let collected: Vec<Value> = items
+                    .iter()
+                    .map(|item| resolve_segments(item, rest))
+                    .collect();
+                // If `rest` contains another `[*]` we end up with an array
+                // of arrays. Flatten one level so chained wildcards behave
+                // like JMESPath flattening (`[*].issues[*]` -> flat list).
+                let needs_flatten = rest.iter().any(|s| s == "[*]");
+                if needs_flatten {
+                    let mut flat = Vec::with_capacity(collected.len());
+                    for item in collected {
+                        match item {
+                            Value::Array(nested) => flat.extend(nested),
+                            other => flat.push(other),
+                        }
+                    }
+                    Value::Array(flat)
+                } else {
+                    Value::Array(collected)
+                }
+            }
+            _ => Value::Null,
+        }
+    } else if let Some(idx_str) = head.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        if let Ok(idx) = idx_str.parse::<usize>() {
+            match value.as_array().and_then(|arr| arr.get(idx)) {
+                Some(next) => resolve_segments(next, rest),
+                None => Value::Null,
+            }
+        } else {
+            Value::Null
+        }
+    } else if let Ok(idx) = head.parse::<usize>() {
+        match value.as_array().and_then(|arr| arr.get(idx)) {
+            Some(next) => resolve_segments(next, rest),
+            None => Value::Null,
+        }
+    } else {
+        match value.get(head) {
+            Some(next) => resolve_segments(next, rest),
+            None => Value::Null,
+        }
+    }
+}
+
+async fn run_pipeline(
+    input: Value,
+    steps: &[crate::models::pipeline::PipelineStep],
+    ai_engine: Option<&crate::modules::ai::AIEngine>,
+    provider: Option<&crate::models::provider::LLMProvider>,
+) -> Result<Value> {
+    let mut current = input;
+    for step in steps {
+        current = apply_pipeline_step(current, step, ai_engine, provider).await?;
+    }
+    Ok(current)
+}
+
+async fn apply_pipeline_step(
+    current: Value,
+    step: &crate::models::pipeline::PipelineStep,
+    ai_engine: Option<&crate::modules::ai::AIEngine>,
+    provider: Option<&crate::models::provider::LLMProvider>,
+) -> Result<Value> {
+    use crate::models::pipeline::{LlmExpect, PipelineStep, SortOrder};
+    match step {
+        PipelineStep::Pick { path } => Ok(resolve_path(&current, path)),
+        PipelineStep::Filter { field, op, value } => {
+            let arr = current.as_array().cloned().unwrap_or_default();
+            let kept: Vec<Value> = arr
+                .into_iter()
+                .filter(|item| filter_predicate(item, field, op, value))
+                .collect();
+            Ok(Value::Array(kept))
+        }
+        PipelineStep::Sort { by, order } => {
+            let mut arr = current.as_array().cloned().unwrap_or_default();
+            arr.sort_by(|a, b| {
+                let av = resolve_path(a, by);
+                let bv = resolve_path(b, by);
+                compare_path_values(&av, &bv)
+            });
+            if matches!(order, SortOrder::Desc) {
+                arr.reverse();
+            }
+            Ok(Value::Array(arr))
+        }
+        PipelineStep::Limit { count } => {
+            let arr = current.as_array().cloned().unwrap_or_default();
+            Ok(Value::Array(arr.into_iter().take(*count).collect()))
+        }
+        PipelineStep::Map { fields, rename } => {
+            let arr = current.as_array().cloned().unwrap_or_default();
+            let mapped: Vec<Value> = arr
+                .into_iter()
+                .map(|item| map_item(&item, fields, rename))
+                .collect();
+            Ok(Value::Array(mapped))
+        }
+        PipelineStep::Aggregate {
+            group_by,
+            metric,
+            output_key,
+        } => {
+            let arr = current.as_array().cloned().unwrap_or_default();
+            if let Some(group_field) = group_by {
+                let mut groups: std::collections::BTreeMap<String, Vec<Value>> =
+                    std::collections::BTreeMap::new();
+                for item in arr {
+                    let key_val = resolve_path(&item, group_field);
+                    let key = match &key_val {
+                        Value::Null => String::new(),
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    groups.entry(key).or_default().push(item);
+                }
+                let rows: Vec<Value> = groups
+                    .into_iter()
+                    .map(|(group, items)| {
+                        let mut row = serde_json::Map::new();
+                        row.insert(group_field.clone(), Value::String(group));
+                        row.insert(output_key.clone(), aggregate_metric(&items, metric));
+                        Value::Object(row)
+                    })
+                    .collect();
+                Ok(Value::Array(rows))
+            } else {
+                let mut obj = serde_json::Map::new();
+                obj.insert(output_key.clone(), aggregate_metric(&arr, metric));
+                Ok(Value::Object(obj))
+            }
+        }
+        PipelineStep::Set { field, value } => {
+            let mut obj = current.as_object().cloned().unwrap_or_default();
+            obj.insert(field.clone(), value.clone());
+            Ok(Value::Object(obj))
+        }
+        PipelineStep::Head => Ok(match current {
+            Value::Array(items) => items.into_iter().next().unwrap_or(Value::Null),
+            other => other,
+        }),
+        PipelineStep::Tail => Ok(match current {
+            Value::Array(items) => items.into_iter().last().unwrap_or(Value::Null),
+            other => other,
+        }),
+        PipelineStep::Length => Ok(match &current {
+            Value::Array(items) => Value::from(items.len()),
+            Value::Object(map) => Value::from(map.len()),
+            Value::String(s) => Value::from(s.chars().count()),
+            Value::Null => Value::from(0),
+            _ => Value::from(1),
+        }),
+        PipelineStep::Flatten => Ok(match current {
+            Value::Array(items) => {
+                let mut flat = Vec::new();
+                for item in items {
+                    if let Value::Array(nested) = item {
+                        flat.extend(nested);
+                    } else {
+                        flat.push(item);
+                    }
+                }
+                Value::Array(flat)
+            }
+            other => other,
+        }),
+        PipelineStep::Unique { by } => Ok(match current {
+            Value::Array(items) => {
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut kept = Vec::new();
+                for item in items {
+                    let key = match by {
+                        Some(field) => item.get(field).cloned().unwrap_or(Value::Null).to_string(),
+                        None => item.to_string(),
+                    };
+                    if seen.insert(key) {
+                        kept.push(item);
+                    }
+                }
+                Value::Array(kept)
+            }
+            other => other,
+        }),
+        PipelineStep::Format {
+            template,
+            output_key,
+        } => {
+            let render_one = |scope: &Value| -> String { render_template(template, scope) };
+            let formatted = match &current {
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .map(|item| Value::String(render_one(item)))
+                        .collect(),
+                ),
+                _ => Value::String(render_one(&current)),
+            };
+            if let Some(key) = output_key {
+                let mut obj = current.as_object().cloned().unwrap_or_default();
+                obj.insert(key.clone(), formatted);
+                Ok(Value::Object(obj))
+            } else {
+                Ok(formatted)
+            }
+        }
+        PipelineStep::Coerce { to } => Ok(coerce_value(&current, to)),
+        PipelineStep::LlmPostprocess { prompt, expect } => {
+            let engine =
+                ai_engine.ok_or_else(|| anyhow!("LlmPostprocess requires an active provider"))?;
+            let provider =
+                provider.ok_or_else(|| anyhow!("LlmPostprocess requires an active provider"))?;
+            let system = match expect {
+                LlmExpect::Text => "You are a deterministic data postprocessor in a Datrina workflow pipeline. Read the JSON input and produce a CONCISE human-readable answer per the prompt. Respond with plain text or markdown; never wrap your answer in JSON.",
+                LlmExpect::Json => "You are a deterministic data postprocessor in a Datrina workflow pipeline. Read the JSON input and produce STRICT JSON per the prompt. Do not include markdown fences or commentary.",
+            };
+            let user = format!(
+                "Prompt: {}\nInput JSON:\n{}",
+                prompt,
+                serde_json::to_string_pretty(&current).unwrap_or_else(|_| current.to_string())
+            );
+            let messages = vec![
+                runtime_chat_message(MessageRole::System, system),
+                runtime_chat_message(MessageRole::User, &user),
+            ];
+            let response = engine.complete_chat(provider, &messages).await?;
+            match expect {
+                LlmExpect::Text => Ok(Value::String(response.content)),
+                LlmExpect::Json => serde_json::from_str(&response.content)
+                    .map_err(|e| anyhow!("LlmPostprocess: response was not valid JSON: {}", e)),
+            }
+        }
+    }
+}
+
+fn filter_predicate(
+    item: &Value,
+    field: &str,
+    op: &crate::models::pipeline::FilterOp,
+    value: &Value,
+) -> bool {
+    use crate::models::pipeline::FilterOp::*;
+    let field_value = if field.is_empty() {
+        item.clone()
+    } else {
+        resolve_path(item, field)
+    };
+    match op {
+        Eq => &field_value == value,
+        Ne => &field_value != value,
+        Gt | Gte | Lt | Lte => {
+            let lhs = field_value.as_f64();
+            let rhs = value.as_f64();
+            match (lhs, rhs) {
+                (Some(a), Some(b)) => match op {
+                    Gt => a > b,
+                    Gte => a >= b,
+                    Lt => a < b,
+                    Lte => a <= b,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        Contains => match (&field_value, value) {
+            (Value::String(s), Value::String(needle)) => s.contains(needle.as_str()),
+            (Value::Array(items), needle) => items.iter().any(|i| i == needle),
+            _ => false,
+        },
+        StartsWith => match (&field_value, value) {
+            (Value::String(s), Value::String(p)) => s.starts_with(p.as_str()),
+            _ => false,
+        },
+        EndsWith => match (&field_value, value) {
+            (Value::String(s), Value::String(p)) => s.ends_with(p.as_str()),
+            _ => false,
+        },
+        In => value
+            .as_array()
+            .map(|arr| arr.iter().any(|v| v == &field_value))
+            .unwrap_or(false),
+        NotIn => !value
+            .as_array()
+            .map(|arr| arr.iter().any(|v| v == &field_value))
+            .unwrap_or(false),
+        Exists => !field_value.is_null(),
+        NotExists => field_value.is_null(),
+        Truthy => is_truthy(&field_value),
+        Falsy => !is_truthy(&field_value),
+    }
+}
+
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|x| x != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}
+
+fn compare_path_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Number(an), Value::Number(bn)) => an
+            .as_f64()
+            .partial_cmp(&bn.as_f64())
+            .unwrap_or(Ordering::Equal),
+        (Value::String(an), Value::String(bn)) => {
+            // If both look like numbers, compare numerically; otherwise lexicographic.
+            if let (Ok(af), Ok(bf)) = (an.parse::<f64>(), bn.parse::<f64>()) {
+                af.partial_cmp(&bf).unwrap_or(Ordering::Equal)
+            } else {
+                an.cmp(bn)
+            }
+        }
+        _ => a.to_string().cmp(&b.to_string()),
+    }
+}
+
+fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(av), Some(bv)) => match (av, bv) {
+            (Value::Number(an), Value::Number(bn)) => an
+                .as_f64()
+                .partial_cmp(&bn.as_f64())
+                .unwrap_or(Ordering::Equal),
+            (Value::String(an), Value::String(bn)) => an.cmp(bn),
+            _ => av.to_string().cmp(&bv.to_string()),
+        },
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn map_item(
+    item: &Value,
+    fields: &[String],
+    rename: &std::collections::BTreeMap<String, String>,
+) -> Value {
+    let mut next = serde_json::Map::new();
+    if fields.is_empty() && rename.is_empty() {
+        return item.clone();
+    }
+    let source = item.as_object().cloned().unwrap_or_default();
+    let take_keys: Vec<String> = if fields.is_empty() {
+        source.keys().map(|k| k.to_string()).collect()
+    } else {
+        fields.to_vec()
+    };
+    for key in take_keys {
+        let value = resolve_path(item, &key);
+        let target_key = rename.get(&key).cloned().unwrap_or_else(|| key.clone());
+        next.insert(target_key, value);
+    }
+    Value::Object(next)
+}
+
+fn mcp_unwrap_content(value: &Value) -> Option<Value> {
+    let content = value.get("content")?.as_array()?;
+    let text_parts: Vec<&str> = content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect();
+    if text_parts.is_empty() {
+        return None;
+    }
+    let text = text_parts.join("\n");
+    Some(serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text)))
+}
+
+fn render_template(template: &str, scope: &Value) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut iter = template.chars().peekable();
+    while let Some(ch) = iter.next() {
+        if ch == '{' {
+            let mut name = String::new();
+            let mut closed = false;
+            while let Some(&next) = iter.peek() {
+                iter.next();
+                if next == '}' {
+                    closed = true;
+                    break;
+                }
+                name.push(next);
+            }
+            if closed {
+                let value = resolve_path(scope, name.trim());
+                let rendered = match value {
+                    Value::String(s) => s,
+                    Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                out.push_str(&rendered);
+            } else {
+                out.push('{');
+                out.push_str(&name);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn coerce_value(value: &Value, target: &crate::models::pipeline::CoerceTarget) -> Value {
+    use crate::models::pipeline::CoerceTarget;
+    match target {
+        CoerceTarget::Number => match value {
+            Value::Number(_) => value.clone(),
+            Value::String(s) => s
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .and_then(|f| serde_json::Number::from_f64(f).map(Value::Number))
+                .unwrap_or(Value::Null),
+            Value::Bool(b) => Value::from(if *b { 1 } else { 0 }),
+            Value::Null => Value::Null,
+            Value::Array(items) => Value::from(items.len()),
+            Value::Object(map) => Value::from(map.len()),
+        },
+        CoerceTarget::Integer => match value {
+            Value::Number(n) => n.as_i64().map(Value::from).unwrap_or_else(|| {
+                n.as_f64()
+                    .map(|f| Value::from(f.trunc() as i64))
+                    .unwrap_or(Value::Null)
+            }),
+            Value::String(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(Value::from)
+                .unwrap_or(Value::Null),
+            Value::Bool(b) => Value::from(if *b { 1 } else { 0 }),
+            Value::Null => Value::Null,
+            Value::Array(items) => Value::from(items.len() as i64),
+            Value::Object(map) => Value::from(map.len() as i64),
+        },
+        CoerceTarget::String => match value {
+            Value::String(_) => value.clone(),
+            Value::Null => Value::String(std::string::String::new()),
+            other => Value::String(other.to_string()),
+        },
+        CoerceTarget::Array => match value {
+            Value::Array(_) => value.clone(),
+            Value::Null => Value::Array(Vec::new()),
+            other => Value::Array(vec![other.clone()]),
+        },
+    }
+}
+
+fn aggregate_metric(items: &[Value], metric: &crate::models::pipeline::AggregateMetric) -> Value {
+    use crate::models::pipeline::AggregateMetric::*;
+    let pick = |item: &Value, field: &str| -> Value { resolve_path(item, field) };
+    let pick_num = |item: &Value, field: &str| -> Option<f64> {
+        let v = resolve_path(item, field);
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    };
+    match metric {
+        Count => serde_json::json!(items.len()),
+        Sum { field } => {
+            let total: f64 = items.iter().filter_map(|item| pick_num(item, field)).sum();
+            serde_json::json!(total)
+        }
+        Avg { field } => {
+            let values: Vec<f64> = items
+                .iter()
+                .filter_map(|item| pick_num(item, field))
+                .collect();
+            if values.is_empty() {
+                Value::Null
+            } else {
+                let sum: f64 = values.iter().sum();
+                serde_json::json!(sum / values.len() as f64)
+            }
+        }
+        Min { field } => items
+            .iter()
+            .filter_map(|item| pick_num(item, field))
+            .reduce(f64::min)
+            .map(|v| serde_json::json!(v))
+            .unwrap_or(Value::Null),
+        Max { field } => items
+            .iter()
+            .filter_map(|item| pick_num(item, field))
+            .reduce(f64::max)
+            .map(|v| serde_json::json!(v))
+            .unwrap_or(Value::Null),
+        First { field } => items
+            .first()
+            .map(|item| pick(item, field))
+            .unwrap_or(Value::Null),
+        Last { field } => items
+            .last()
+            .map(|item| pick(item, field))
+            .unwrap_or(Value::Null),
+    }
 }
 
 impl<'a> Default for WorkflowEngine<'a> {

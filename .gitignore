@@ -21,6 +21,7 @@ data/
 
 # Logs
 *.log
+.autopilot/
 
 # IDE
 .idea/

@@ -1,8 +1,28 @@
 use super::{Id, Timestamp};
 use crate::models::dashboard::BuildProposal;
+use crate::models::validation::ValidationIssue;
 use serde::{Deserialize, Serialize};
 
 pub const CHAT_EVENT_CHANNEL: &str = "chat:event";
+
+/// Lightweight session header for the sidebar list. Skips the full
+/// messages array so we don't ship megabytes of conversation history
+/// through the Tauri IPC every time the panel opens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSessionSummary {
+    pub id: Id,
+    pub mode: ChatMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashboard_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub widget_id: Option<Id>,
+    pub title: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub message_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -198,6 +218,11 @@ pub enum ChatEventKind {
     MessageCompleted,
     MessageFailed,
     MessageCancelled,
+    AgentPhase,
+    /// W16: proposal validation outcome. Always paired with
+    /// `AgentEvent::ProposalValidationResult` so the UI can render the
+    /// typed issue list.
+    ProposalValidation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +275,57 @@ pub enum AgentEvent {
     RecoverableFailure {
         message: String,
     },
+    AgentPhase {
+        phase: AgentPhase,
+        status: AgentPhaseStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// W16: structured validator result. `Started` carries an empty
+    /// issues list; `Completed` carries the (now empty) issues list and
+    /// signals the proposal is good; `Failed` carries the remaining
+    /// issues after the retry budget was spent.
+    ProposalValidationResult {
+        status: AgentPhaseStatus,
+        issues: Vec<ValidationIssue>,
+        #[serde(default)]
+        retried: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentPhase {
+    McpReconnect,
+    McpListTools {
+        server_id: String,
+    },
+    ProviderRequest,
+    ProviderFirstByte,
+    ToolResume {
+        iteration: u8,
+    },
+    /// W16: the agent called the same `(tool_name, arguments)` repeatedly
+    /// inside one assistant run. Always emitted with `Failed`. The
+    /// repeated tool call is short-circuited with a synthetic
+    /// `loop_detected` tool result.
+    LoopDetected {
+        tool_name: String,
+    },
+    /// W16: proposal validator gate. `Started` fires before the validator
+    /// runs. `Completed` fires when the proposal passes. `Failed` fires
+    /// when issues remain after the retry budget. The structured issues
+    /// themselves travel on the matching `AgentEvent::ProposalValidationResult`
+    /// envelope, not here.
+    ProposalValidation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhaseStatus {
+    Started,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

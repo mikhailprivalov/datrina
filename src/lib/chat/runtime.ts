@@ -1,5 +1,8 @@
 import type {
   AgentEvent,
+  AgentPhase,
+  AgentPhaseEntry,
+  AgentPhaseStatus,
   BuildProposal,
   ChatEventEnvelope,
   ChatMessage,
@@ -8,6 +11,7 @@ import type {
   ToolCallTrace,
   ToolResult,
   ToolResultTrace,
+  ValidationIssue,
 } from '../api';
 
 export type ChatRuntimeStatus = 'idle' | 'streaming' | 'complete' | 'failed' | 'cancelled';
@@ -162,6 +166,28 @@ export function applyChatEvent(
         status: 'cancelled',
         parts: upsertTerminalPart(message.parts, { type: 'cancellation', reason: agentEvent.reason }),
       }), false);
+    case 'agent_phase':
+      return updateRuntimeMessage(base, event.message_id, message => ({
+        ...message,
+        parts: upsertAgentPhasePart(
+          message.parts,
+          agentEvent.phase,
+          agentEvent.status,
+          agentEvent.detail,
+          event.emitted_at,
+        ),
+      }), true);
+    case 'proposal_validation_result':
+      return updateRuntimeMessage(base, event.message_id, message => ({
+        ...message,
+        parts: upsertProposalValidationPart(
+          message.parts,
+          agentEvent.status,
+          agentEvent.issues,
+          agentEvent.retried,
+          event.emitted_at,
+        ),
+      }), agentEvent.status === 'started');
     case 'text_start':
     case 'text_end':
     case 'reasoning_start':
@@ -282,6 +308,9 @@ function legacyAgentEvent(event: ChatEventEnvelope): AgentEvent | null {
       return { type: 'run_error', message: event.error ?? 'Chat stream failed', recoverable: true };
     case 'message_cancelled':
       return { type: 'abort_cancel', reason: event.error ?? 'cancelled by user' };
+    case 'agent_phase':
+    case 'proposal_validation':
+      return null;
   }
 }
 
@@ -361,18 +390,21 @@ function appendTextPart(parts: ChatMessagePart[], text: string): ChatMessagePart
 
 function appendReasoningPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
   if (!text) return parts;
-  const index = parts.findIndex(part => part.type === 'visible_reasoning');
-  if (index === -1) return [...parts, { type: 'visible_reasoning', text }];
-  return parts.map((part, itemIndex) => itemIndex === index && part.type === 'visible_reasoning'
-    ? { ...part, text: `${part.text}${text}` }
-    : part);
+  const next = [...parts];
+  const last = next[next.length - 1];
+  if (last?.type === 'visible_reasoning') {
+    next[next.length - 1] = { ...last, text: `${last.text}${text}` };
+    return next;
+  }
+  next.push({ type: 'visible_reasoning', text });
+  return next;
 }
 
 function replaceReasoningPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
-  if (!text.trim()) return parts.filter(part => part.type !== 'visible_reasoning');
-  const index = parts.findIndex(part => part.type === 'visible_reasoning');
-  if (index === -1) return [...parts, { type: 'visible_reasoning', text }];
-  return parts.map((part, itemIndex) => itemIndex === index ? { type: 'visible_reasoning', text } : part);
+  if (!text.trim()) return parts;
+  const hasReasoning = parts.some(part => part.type === 'visible_reasoning');
+  if (hasReasoning) return parts;
+  return [...parts, { type: 'visible_reasoning', text }];
 }
 
 function upsertToolCallPart(parts: ChatMessagePart[], nextPart: Extract<ChatMessagePart, { type: 'tool_call' }>): ChatMessagePart[] {
@@ -406,6 +438,87 @@ function upsertTerminalPart(parts: ChatMessagePart[], nextPart: ChatMessagePart)
   const index = parts.findIndex(part => part.type === nextPart.type);
   if (index === -1) return [...parts, nextPart];
   return parts.map((part, itemIndex) => itemIndex === index ? nextPart : part);
+}
+
+function agentPhaseKey(phase: AgentPhase): string {
+  switch (phase.kind) {
+    case 'mcp_reconnect':
+      return 'mcp_reconnect';
+    case 'mcp_list_tools':
+      return `mcp_list_tools:${phase.server_id}`;
+    case 'provider_request':
+      return 'provider_request';
+    case 'provider_first_byte':
+      return 'provider_first_byte';
+    case 'tool_resume':
+      return `tool_resume:${phase.iteration}`;
+    case 'loop_detected':
+      return `loop_detected:${phase.tool_name}`;
+    case 'proposal_validation':
+      return 'proposal_validation';
+  }
+}
+
+function upsertProposalValidationPart(
+  parts: ChatMessagePart[],
+  status: AgentPhaseStatus,
+  issues: ValidationIssue[],
+  retried: boolean,
+  emittedAt: number,
+): ChatMessagePart[] {
+  const nextPart: ChatMessagePart = {
+    type: 'proposal_validation',
+    status,
+    issues,
+    retried,
+    updated_at: emittedAt,
+  };
+  const index = parts.findIndex(part => part.type === 'proposal_validation');
+  if (index === -1) return [...parts, nextPart];
+  return parts.map((part, itemIndex) => itemIndex === index ? nextPart : part);
+}
+
+function upsertAgentPhasePart(
+  parts: ChatMessagePart[],
+  phase: AgentPhase,
+  status: AgentPhaseStatus,
+  detail: string | undefined,
+  emittedAt: number,
+): ChatMessagePart[] {
+  const key = agentPhaseKey(phase);
+  const existingIndex = parts.findIndex(part => part.type === 'agent_phase');
+  const existingPart = existingIndex === -1 ? null : parts[existingIndex];
+  const existingPhases = existingPart && existingPart.type === 'agent_phase' ? existingPart.phases : [];
+  const entryIndex = existingPhases.findIndex(entry => entry.key === key);
+  let nextPhases: AgentPhaseEntry[];
+  if (entryIndex === -1) {
+    nextPhases = [
+      ...existingPhases,
+      {
+        key,
+        phase,
+        status,
+        detail,
+        started_at: emittedAt,
+        finished_at: status === 'started' ? undefined : emittedAt,
+      },
+    ];
+  } else {
+    nextPhases = existingPhases.map((entry, index) => index === entryIndex
+      ? {
+          ...entry,
+          phase,
+          status,
+          detail: detail ?? entry.detail,
+          finished_at: status === 'started' ? entry.finished_at : emittedAt,
+        }
+      : entry);
+  }
+  const nextPart: ChatMessagePart = { type: 'agent_phase', phases: nextPhases };
+  if (existingIndex === -1) {
+    return [nextPart, ...parts];
+  }
+  return parts.map((part, index) => index === existingIndex ? nextPart : part);
 }
 
 function maskForDisplay(value: unknown, depth = 0): unknown {

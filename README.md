@@ -198,12 +198,4 @@ datrina/
 
 ## License
 
-Functional Source License 1.1 (FSL-1.1).
-
-- Source code is publicly available.
-- Free for local use, commercial and non-commercial.
-- Converts to Apache 2.0 after 2 years.
-- Cannot be offered as a competing SaaS product.
-- Cannot be rebranded for commercial distribution.
-
-See `LICENSE.md` when present in this checkout for the full license text.
+MIT License. See [`LICENSE.md`](./LICENSE.md) for the full text.

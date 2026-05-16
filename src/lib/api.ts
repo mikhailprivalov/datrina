@@ -23,7 +23,7 @@ export interface Dashboard {
   updated_at: number;
 }
 
-export type WidgetType = 'chart' | 'text' | 'table' | 'image' | 'gauge';
+export type WidgetType = 'chart' | 'text' | 'table' | 'image' | 'gauge' | 'stat' | 'logs' | 'bar_gauge' | 'status_grid' | 'heatmap';
 
 export interface WidgetBase {
   id: string;
@@ -61,14 +61,54 @@ export interface GaugeWidget extends WidgetBase {
   config: GaugeConfig;
 }
 
-export type Widget = ChartWidget | TextWidget | TableWidget | ImageWidget | GaugeWidget;
+export interface StatWidget extends WidgetBase {
+  type: 'stat';
+  config: StatConfig;
+}
+
+export interface LogsWidget extends WidgetBase {
+  type: 'logs';
+  config: LogsConfig;
+}
+
+export interface BarGaugeWidget extends WidgetBase {
+  type: 'bar_gauge';
+  config: BarGaugeConfig;
+}
+
+export interface StatusGridWidget extends WidgetBase {
+  type: 'status_grid';
+  config: StatusGridConfig;
+}
+
+export interface HeatmapWidget extends WidgetBase {
+  type: 'heatmap';
+  config: HeatmapConfig;
+}
+
+export type Widget =
+  | ChartWidget
+  | TextWidget
+  | TableWidget
+  | ImageWidget
+  | GaugeWidget
+  | StatWidget
+  | LogsWidget
+  | BarGaugeWidget
+  | StatusGridWidget
+  | HeatmapWidget;
 
 export type WidgetRuntimeData =
   | ChartWidgetRuntimeData
   | TextWidgetRuntimeData
   | TableWidgetRuntimeData
   | ImageWidgetRuntimeData
-  | GaugeWidgetRuntimeData;
+  | GaugeWidgetRuntimeData
+  | StatWidgetRuntimeData
+  | LogsWidgetRuntimeData
+  | BarGaugeWidgetRuntimeData
+  | StatusGridWidgetRuntimeData
+  | HeatmapWidgetRuntimeData;
 
 export interface ChartWidgetRuntimeData {
   kind: 'chart';
@@ -82,7 +122,7 @@ export interface TextWidgetRuntimeData {
 
 export interface TableWidgetRuntimeData {
   kind: 'table';
-  rows: Record<string, string | number | boolean | null>[];
+  rows: Record<string, unknown>[];
 }
 
 export interface ImageWidgetRuntimeData {
@@ -94,6 +134,60 @@ export interface ImageWidgetRuntimeData {
 export interface GaugeWidgetRuntimeData {
   kind: 'gauge';
   value: number;
+}
+
+export interface StatWidgetRuntimeData {
+  kind: 'stat';
+  value: number | string;
+  delta?: number | string | null;
+  label?: string | null;
+  sparkline?: Array<{ t?: string | number; v: number } | number> | null;
+}
+
+export interface LogEntry {
+  ts?: string | number;
+  level?: string;
+  message?: string;
+  source?: string;
+  [extra: string]: unknown;
+}
+
+export interface LogsWidgetRuntimeData {
+  kind: 'logs';
+  entries: LogEntry[];
+}
+
+export interface BarGaugeRow {
+  name: string;
+  value: number;
+  max?: number;
+}
+
+export interface BarGaugeWidgetRuntimeData {
+  kind: 'bar_gauge';
+  rows: BarGaugeRow[];
+}
+
+export interface StatusGridItem {
+  name: string;
+  status: string;
+  detail?: string | number | null;
+}
+
+export interface StatusGridWidgetRuntimeData {
+  kind: 'status_grid';
+  items: StatusGridItem[];
+}
+
+export interface HeatmapCell {
+  x: number | string;
+  y: number | string;
+  value: number;
+}
+
+export interface HeatmapWidgetRuntimeData {
+  kind: 'heatmap';
+  cells: HeatmapCell[];
 }
 
 export interface WidgetRefreshResult {
@@ -135,17 +229,32 @@ export interface ChartConfig {
 }
 
 export interface TextConfig {
-  format: 'markdown' | 'plain' | 'html';
+  format?: 'markdown' | 'plain' | 'html';
   font_size?: number;
   color?: string;
   align?: 'left' | 'center' | 'right';
 }
 
+export type TableColumnFormat =
+  | 'text'
+  | 'number'
+  | 'date'
+  | 'currency'
+  | 'percent'
+  | 'status'
+  | 'progress'
+  | 'badge'
+  | 'link'
+  | 'sparkline';
+
 export interface TableColumn {
   key: string;
   header: string;
   width?: number;
-  format?: 'text' | 'number' | 'date' | 'currency' | 'percent';
+  format?: TableColumnFormat;
+  thresholds?: GaugeThreshold[];
+  status_colors?: Record<string, string>;
+  link_template?: string;
 }
 
 export interface TableConfig {
@@ -172,6 +281,52 @@ export interface GaugeConfig {
   unit?: string;
   thresholds?: GaugeThreshold[];
   show_value?: boolean;
+}
+
+export interface StatConfig {
+  unit?: string;
+  prefix?: string;
+  suffix?: string;
+  decimals?: number;
+  color_mode?: 'none' | 'value' | 'background';
+  thresholds?: GaugeThreshold[];
+  show_sparkline?: boolean;
+  graph_mode?: 'none' | 'sparkline';
+  align?: 'left' | 'center' | 'right';
+}
+
+export interface LogsConfig {
+  max_entries?: number;
+  show_timestamp?: boolean;
+  show_level?: boolean;
+  wrap?: boolean;
+  reverse?: boolean;
+}
+
+export interface BarGaugeConfig {
+  orientation?: 'horizontal' | 'vertical';
+  display_mode?: 'gradient' | 'basic' | 'retro';
+  show_value?: boolean;
+  min?: number;
+  max?: number;
+  unit?: string;
+  thresholds?: GaugeThreshold[];
+}
+
+export interface StatusGridConfig {
+  columns?: number;
+  layout?: 'grid' | 'row' | 'compact';
+  show_label?: boolean;
+  status_colors?: Record<string, string>;
+}
+
+export interface HeatmapConfig {
+  color_scheme?: 'viridis' | 'magma' | 'cool' | 'warm' | 'green_red';
+  x_label?: string;
+  y_label?: string;
+  unit?: string;
+  show_legend?: boolean;
+  log_scale?: boolean;
 }
 
 export interface DatasourceConfig {
@@ -277,7 +432,24 @@ export type ChatMessagePart =
     }
   | { type: 'build_proposal'; proposal: BuildProposal }
   | { type: 'error'; message: string; recoverable: boolean }
-  | { type: 'cancellation'; reason: string };
+  | { type: 'cancellation'; reason: string }
+  | { type: 'agent_phase'; phases: AgentPhaseEntry[] }
+  | {
+      type: 'proposal_validation';
+      status: AgentPhaseStatus;
+      issues: ValidationIssue[];
+      retried: boolean;
+      updated_at: number;
+    };
+
+export interface AgentPhaseEntry {
+  key: string;
+  phase: AgentPhase;
+  status: AgentPhaseStatus;
+  detail?: string;
+  started_at: number;
+  finished_at?: number;
+}
 
 export interface ToolCall {
   id: string;
@@ -312,7 +484,63 @@ export type ChatEventKind =
   | 'build_proposal_parsed'
   | 'message_completed'
   | 'message_failed'
-  | 'message_cancelled';
+  | 'message_cancelled'
+  | 'agent_phase'
+  | 'proposal_validation';
+
+export type AgentPhaseStatus = 'started' | 'completed' | 'failed';
+
+export type AgentPhase =
+  | { kind: 'mcp_reconnect' }
+  | { kind: 'mcp_list_tools'; server_id: string }
+  | { kind: 'provider_request' }
+  | { kind: 'provider_first_byte' }
+  | { kind: 'tool_resume'; iteration: number }
+  | { kind: 'loop_detected'; tool_name: string }
+  | { kind: 'proposal_validation' };
+
+export type ValidationIssue =
+  | {
+      kind: 'missing_datasource_plan';
+      widget_index: number;
+      widget_title: string;
+    }
+  | {
+      kind: 'unknown_replace_widget_id';
+      widget_index: number;
+      widget_title: string;
+      replace_widget_id: string;
+    }
+  | {
+      kind: 'unknown_source_key';
+      widget_index: number;
+      widget_title: string;
+      source_key: string;
+    }
+  | {
+      kind: 'hardcoded_literal_value';
+      widget_index: number;
+      widget_title: string;
+      path: string;
+    }
+  | {
+      kind: 'text_widget_contains_raw_json';
+      widget_index: number;
+      widget_title: string;
+    }
+  | {
+      kind: 'missing_dry_run_evidence';
+      widget_index: number;
+      widget_title: string;
+      widget_kind: string;
+    }
+  | {
+      kind: 'pipeline_schema_invalid';
+      widget_index: number;
+      widget_title: string;
+      error: string;
+    }
+  | { kind: 'duplicate_shared_key'; key: string };
 
 export type AgentEvent =
   | { type: 'run_started' }
@@ -347,7 +575,19 @@ export type AgentEvent =
     }
   | { type: 'build_proposal'; proposal: BuildProposal }
   | { type: 'abort_cancel'; reason: string }
-  | { type: 'recoverable_failure'; message: string };
+  | { type: 'recoverable_failure'; message: string }
+  | {
+      type: 'agent_phase';
+      phase: AgentPhase;
+      status: AgentPhaseStatus;
+      detail?: string;
+    }
+  | {
+      type: 'proposal_validation_result';
+      status: AgentPhaseStatus;
+      issues: ValidationIssue[];
+      retried: boolean;
+    };
 
 export interface ChatEventEnvelope {
   kind: ChatEventKind;
@@ -385,6 +625,17 @@ export interface ToolResultTrace {
   error?: string;
 }
 
+export interface WidgetDryRunResult {
+  status: 'ok' | 'error';
+  widget_runtime?: WidgetRuntimeData | null;
+  raw_output?: unknown;
+  error?: string;
+  duration_ms: number;
+  pipeline_steps: number;
+  has_llm_step: boolean;
+  workflow_node_ids: string[];
+}
+
 export interface BuildProposal {
   id: string;
   title: string;
@@ -392,6 +643,20 @@ export interface BuildProposal {
   dashboard_name?: string;
   dashboard_description?: string;
   widgets: BuildWidgetProposal[];
+  remove_widget_ids?: string[];
+  shared_datasources?: SharedDatasource[];
+}
+
+export interface SharedDatasource {
+  key: string;
+  kind: 'builtin_tool' | 'mcp_tool' | 'provider_prompt';
+  tool_name?: string;
+  server_id?: string;
+  arguments?: Record<string, unknown>;
+  prompt?: string;
+  pipeline?: PipelineStep[];
+  refresh_cron?: string;
+  label?: string;
 }
 
 export interface BuildWidgetProposal {
@@ -404,17 +669,58 @@ export interface BuildWidgetProposal {
   y?: number;
   w?: number;
   h?: number;
+  replace_widget_id?: string;
 }
 
 export interface BuildDatasourcePlan {
-  kind: 'builtin_tool' | 'mcp_tool' | 'provider_prompt';
+  kind: 'builtin_tool' | 'mcp_tool' | 'provider_prompt' | 'shared';
   tool_name?: string;
   server_id?: string;
   arguments?: Record<string, unknown>;
   prompt?: string;
   output_path?: string;
   refresh_cron?: string;
+  pipeline?: PipelineStep[];
+  source_key?: string;
 }
+
+export type FilterOp =
+  | 'eq' | 'ne'
+  | 'gt' | 'gte' | 'lt' | 'lte'
+  | 'contains' | 'starts_with' | 'ends_with'
+  | 'in' | 'not_in'
+  | 'exists' | 'not_exists'
+  | 'truthy' | 'falsy';
+
+export type SortOrder = 'asc' | 'desc';
+
+export type AggregateMetric =
+  | { kind: 'count' }
+  | { kind: 'sum'; field: string }
+  | { kind: 'avg'; field: string }
+  | { kind: 'min'; field: string }
+  | { kind: 'max'; field: string }
+  | { kind: 'first'; field: string }
+  | { kind: 'last'; field: string };
+
+export type CoerceTarget = 'number' | 'integer' | 'string' | 'array';
+
+export type PipelineStep =
+  | { kind: 'pick'; path: string }
+  | { kind: 'filter'; field: string; op?: FilterOp; value?: unknown }
+  | { kind: 'sort'; by: string; order?: SortOrder }
+  | { kind: 'limit'; count: number }
+  | { kind: 'map'; fields?: string[]; rename?: Record<string, string> }
+  | { kind: 'aggregate'; group_by?: string; metric: AggregateMetric; output_key?: string }
+  | { kind: 'set'; field: string; value: unknown }
+  | { kind: 'head' }
+  | { kind: 'tail' }
+  | { kind: 'length' }
+  | { kind: 'flatten' }
+  | { kind: 'unique'; by?: string }
+  | { kind: 'format'; template: string; output_key?: string }
+  | { kind: 'coerce'; to: CoerceTarget }
+  | { kind: 'llm_postprocess'; prompt: string; expect?: 'text' | 'json' };
 
 export interface LLMProvider {
   id: string;
@@ -506,8 +812,10 @@ async function callVoid(command: string, args?: Record<string, unknown>): Promis
 export const dashboardApi = {
   list: () => call<Dashboard[]>('list_dashboards'),
   get: (id: string) => call<Dashboard>('get_dashboard', { id }),
-  create: (name: string, description?: string, template: 'blank' | 'local_mvp' = 'blank') =>
-    call<Dashboard>('create_dashboard', { req: { name, description, template } }),
+  create: (name: string, description?: string, template: 'blank' | 'local_mvp' = 'blank') => {
+    const safeTemplate: 'blank' | 'local_mvp' = template === 'local_mvp' ? 'local_mvp' : 'blank';
+    return call<Dashboard>('create_dashboard', { req: { name, description, template: safeTemplate } });
+  },
   update: (id: string, data: Partial<Dashboard>) =>
     call<Dashboard>('update_dashboard', { id, req: data }),
   addWidget: (
@@ -526,6 +834,8 @@ export const dashboardApi = {
     dashboard_id?: string;
     confirmed: boolean;
   }) => call<Dashboard>('apply_build_proposal', { req }),
+  dryRunWidget: (proposal: BuildWidgetProposal, sharedDatasources?: SharedDatasource[]) =>
+    call<WidgetDryRunResult>('dry_run_widget', { proposal, sharedDatasources }),
   delete: (id: string) => call<boolean>('delete_dashboard', { id }),
   refreshWidget: (dashboardId: string, widgetId: string) =>
     call<WidgetRefreshResult>('refresh_widget', { dashboardId, widgetId }),
@@ -533,8 +843,21 @@ export const dashboardApi = {
 
 // ─── Chat API ────────────────────────────────────────────────────────────────
 
+export interface ChatSessionSummary {
+  id: string;
+  mode: 'build' | 'context';
+  dashboard_id?: string;
+  widget_id?: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  message_count: number;
+  preview?: string;
+}
+
 export const chatApi = {
   listSessions: () => call<ChatSession[]>('list_sessions'),
+  listSessionSummaries: () => call<ChatSessionSummary[]>('list_session_summaries'),
   getSession: (id: string) => call<ChatSession>('get_session', { id }),
   createSession: (mode: 'build' | 'context', dashboardId?: string) =>
     call<ChatSession>('create_session', { req: { mode, dashboard_id: dashboardId } }),
@@ -544,6 +867,8 @@ export const chatApi = {
     call<ChatMessage>('send_message_stream', { sessionId, req: { content } }),
   cancelResponse: (sessionId: string) =>
     call<boolean>('cancel_chat_response', { sessionId }),
+  truncateMessages: (sessionId: string, beforeMessageId: string) =>
+    call<ChatSession>('truncate_chat_messages', { sessionId, beforeMessageId }),
   deleteSession: (id: string) => call<boolean>('delete_session', { id }),
 };
 
@@ -604,4 +929,69 @@ export const configApi = {
 export const systemApi = {
   getAppInfo: () => call<Record<string, string>>('get_app_info'),
   openUrl: (url: string) => callVoid('open_url', { url }),
+};
+
+// ─── Memory API (W17) ────────────────────────────────────────────────────────
+
+export type MemoryKind = 'fact' | 'preference' | 'tool_shape' | 'lesson';
+
+export type MemoryScope =
+  | { kind: 'global' }
+  | { kind: 'dashboard'; id: string }
+  | { kind: 'mcp_server'; id: string }
+  | { kind: 'session'; id: string };
+
+export interface MemoryRecord {
+  id: string;
+  scope: MemoryScope;
+  kind: MemoryKind;
+  content: string;
+  metadata?: unknown;
+  created_at: number;
+  accessed_count: number;
+  last_accessed_at?: number | null;
+  expires_at?: number | null;
+  compressed_into?: string | null;
+}
+
+export interface MemoryHit {
+  record: MemoryRecord;
+  score: number;
+}
+
+export interface ToolShape {
+  id: string;
+  server_id: string;
+  tool_name: string;
+  args_fingerprint: string;
+  shape_summary: string;
+  shape_full: string;
+  sample_path?: string | null;
+  observed_at: number;
+  observation_count: number;
+}
+
+export interface RememberMemoryRequest {
+  scope: MemoryScope;
+  kind: MemoryKind;
+  content: string;
+  metadata?: unknown;
+}
+
+export interface RecallMemoryRequest {
+  query: string;
+  dashboard_id?: string;
+  mcp_server_ids?: string[];
+  session_id?: string;
+  top_n?: number;
+}
+
+export const memoryApi = {
+  list: () => call<MemoryRecord[]>('list_memories'),
+  remove: (id: string) => call<boolean>('delete_memory', { id }),
+  remember: (req: RememberMemoryRequest) => call<MemoryRecord>('remember_memory', { req }),
+  recall: (req: RecallMemoryRequest) => call<MemoryHit[]>('recall_memories', { req }),
+  listToolShapes: (serverId: string) =>
+    call<ToolShape[]>('list_tool_shapes', { serverId }),
+  listKinds: () => call<MemoryKind[]>('list_memory_kinds'),
 };

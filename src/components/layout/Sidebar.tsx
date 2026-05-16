@@ -1,6 +1,28 @@
 import { useState } from 'react';
 import type { Dashboard } from '../../lib/api';
 
+const DASHBOARD_ICONS = [
+  'M4 5a1 1 0 011-1h4a1 1 0 011 1v10a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h4a1 1 0 011 1v6a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 17a1 1 0 011-1h4a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1v-2zM14 17a1 1 0 011-1h4a1 1 0 011 1v2a1 1 0 01-1 1h-4a1 1 0 01-1-1v-2z',
+  'M3 3h7v7H3V3zm11 0h7v7h-7V3zM3 14h7v7H3v-7zm11 0h7v7h-7v-7z',
+  'M3 12l9-9 9 9M5 10v10h14V10',
+  'M12 2l3 6 6 .9-4.5 4.4 1 6.2L12 16.5 6.5 19.5l1-6.2L3 8.9 9 8z',
+  'M3 13h2v8H3v-8zm4-5h2v13H7V8zm4-3h2v16h-2V5zm4 7h2v9h-2v-9zm4-4h2v13h-2V8z',
+  'M3 12c0-4.97 4.03-9 9-9s9 4.03 9 9-4.03 9-9 9-9-4.03-9-9zm9-5v5l3 2',
+  'M4 6h16M4 12h10M4 18h16',
+  'M12 2L2 22h20L12 2zm0 4l7 14H5l7-14zm-1 5v3h2v-3h-2zm0 4v2h2v-2h-2z',
+  'M21 7H3a1 1 0 00-1 1v8a1 1 0 001 1h18a1 1 0 001-1V8a1 1 0 00-1-1zm-9 3a3 3 0 100 6 3 3 0 000-6z',
+  'M12 3l9 4-9 4-9-4 9-4zm-9 9l9 4 9-4M3 16l9 4 9-4',
+];
+
+function pickIconPath(id: string): string {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash * 31 + id.charCodeAt(i)) | 0;
+  }
+  const index = Math.abs(hash) % DASHBOARD_ICONS.length;
+  return DASHBOARD_ICONS[index];
+}
+
 interface Props {
   dashboards: Dashboard[];
   activeId: string | null;
@@ -8,11 +30,15 @@ interface Props {
   onCreate: () => void;
   onDelete: (id: string) => void;
   onOpenSettings: () => void;
+  onOpenMcpSettings?: () => void;
+  onOpenMemorySettings?: () => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
+  theme: 'light' | 'dark';
+  onToggleTheme: () => void;
 }
 
-export function Sidebar({ dashboards, activeId, onSelect, onCreate, onDelete, onOpenSettings, isCollapsed, onToggleCollapse }: Props) {
+export function Sidebar({ dashboards, activeId, onSelect, onCreate, onDelete, onOpenSettings, onOpenMcpSettings, onOpenMemorySettings, isCollapsed, onToggleCollapse, theme, onToggleTheme }: Props) {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; id: string } | null>(null);
 
   const handleContextMenu = (e: React.MouseEvent, id: string) => {
@@ -35,7 +61,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onDelete, on
           </div>
         )}
         <button onClick={onToggleCollapse} className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0">
-          <svg className={`w-4 h-4 text-muted-foreground transition-transform ${isCollapsed ? '' : 'rotate-180'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg className={`w-4 h-4 text-muted-foreground transition-transform ${isCollapsed ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 17l-5-5m0 0l5-5m-5 5h12" />
           </svg>
         </button>
@@ -61,7 +87,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onDelete, on
             title={d.name}
           >
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 5a1 1 0 011-1h4a1 1 0 011 1v10a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h4a1 1 0 011 1v6a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 17a1 1 0 011-1h4a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1v-2zM14 17a1 1 0 011-1h4a1 1 0 011 1v2a1 1 0 01-1 1h-4a1 1 0 01-1-1v-2z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d={pickIconPath(d.id)} />
             </svg>
             {!isCollapsed && <span className="truncate text-left">{d.name}</span>}
           </button>
@@ -94,13 +120,49 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onDelete, on
       )}
 
       {/* Footer */}
-      <div className="border-t border-border p-2">
+      <div className="border-t border-border p-2 space-y-1">
+        <button
+          onClick={onToggleTheme}
+          title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}
+        >
+          {theme === 'dark' ? (
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+            </svg>
+          ) : (
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+            </svg>
+          )}
+          {!isCollapsed && <span>{theme === 'dark' ? 'Light theme' : 'Dark theme'}</span>}
+        </button>
+        {onOpenMcpSettings && (
+          <button onClick={onOpenMcpSettings} className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}>
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+            {!isCollapsed && <span>MCP servers</span>}
+          </button>
+        )}
+        {onOpenMemorySettings && (
+          <button
+            onClick={onOpenMemorySettings}
+            title="Agent memory"
+            className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}
+          >
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+            </svg>
+            {!isCollapsed && <span>Agent memory</span>}
+          </button>
+        )}
         <button onClick={onOpenSettings} className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}>
           <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
           </svg>
-          {!isCollapsed && <span>Settings</span>}
+          {!isCollapsed && <span>Providers</span>}
         </button>
       </div>
     </aside>
