@@ -6,16 +6,19 @@ use tauri::{App, Manager};
 use tracing::info;
 
 use crate::models::{
+    alert::{AlertEvent, AlertSeverity, WidgetAlert},
     chat::ChatSession,
-    dashboard::Dashboard,
+    dashboard::{Dashboard, DashboardVersion, DashboardVersionSummary, VersionSource},
     mcp::MCPServer,
     memory::{MemoryKind, MemoryRecord, Scope, ToolShape},
+    playground::{PlaygroundPreset, PlaygroundToolKind},
     provider::LLMProvider,
     workflow::Workflow,
 };
 
 pub struct Storage {
     pool: Pool<Sqlite>,
+    app_data_dir: std::path::PathBuf,
 }
 
 /// FTS5 MATCH requires a syntactically valid query. User-typed text often
@@ -47,7 +50,9 @@ impl Storage {
             .connect("sqlite::memory:")
             .await?;
 
-        let storage = Self { pool };
+        let app_data_dir = std::env::temp_dir().join("datrina-tests");
+        let _ = std::fs::create_dir_all(&app_data_dir);
+        let storage = Self { pool, app_data_dir };
         storage.migrate().await?;
         Ok(storage)
     }
@@ -70,7 +75,16 @@ impl Storage {
             .connect_with(connect_options)
             .await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            app_data_dir: app_dir,
+        })
+    }
+
+    /// W22: filesystem location of `pricing_overrides.json`. Lives alongside
+    /// `app.db` in the OS app-data dir so the same backup covers both.
+    pub fn pricing_overrides_path(&self) -> std::path::PathBuf {
+        self.app_data_dir.join("pricing_overrides.json")
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -109,6 +123,31 @@ impl Storage {
         )
         .execute(&self.pool)
         .await?;
+
+        // W18: plan artifact + per-step status persisted per session so
+        // Build continuations resume with accurate plan state. Both
+        // columns are JSON-encoded; nullable when no plan exists yet.
+        // Errors here are tolerated because they're "duplicate column"
+        // on already-migrated databases.
+        let _ = sqlx::query("ALTER TABLE chat_sessions ADD COLUMN current_plan TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE chat_sessions ADD COLUMN plan_status TEXT")
+            .execute(&self.pool)
+            .await;
+
+        // W22: per-session token + cost totals + optional budget cap. All
+        // updated transactionally by `update_chat_session`. Existing rows
+        // start at zero / NULL on first read.
+        for stmt in [
+            "ALTER TABLE chat_sessions ADD COLUMN total_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_sessions ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_sessions ADD COLUMN total_reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_sessions ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0.0",
+            "ALTER TABLE chat_sessions ADD COLUMN max_cost_usd REAL",
+        ] {
+            let _ = sqlx::query(stmt).execute(&self.pool).await;
+        }
 
         // Workflows table
         sqlx::query(
@@ -301,6 +340,172 @@ impl Storage {
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS mcp_tool_observed_shape_key \
              ON mcp_tool_observed_shape (server_id, tool_name, args_fingerprint)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W19: per-dashboard version history. Every mutation
+        // (apply/manual edit/restore/pre-delete) writes one row here so the
+        // user can list, diff, and restore prior states from the UI. Ring
+        // buffer cap (`MAX_VERSIONS_PER_DASHBOARD`) is enforced inside
+        // `record_dashboard_version`.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS dashboard_versions (
+                    id TEXT PRIMARY KEY,
+                    dashboard_id TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+                    snapshot_json TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    source_session_id TEXT,
+                    summary TEXT NOT NULL,
+                    widget_count INTEGER NOT NULL,
+                    parent_version_id TEXT
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS dashboard_versions_dashboard_idx \
+             ON dashboard_versions (dashboard_id, applied_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W20: Data Playground saved presets. `server_id` is nullable
+        // because HTTP / builtin tools don't bind to an MCP server.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS playground_presets (
+                    id TEXT PRIMARY KEY,
+                    tool_kind TEXT NOT NULL,
+                    server_id TEXT,
+                    tool_name TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    arguments TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS playground_presets_source_idx \
+             ON playground_presets (tool_kind, server_id, tool_name)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W21: per-widget alert definitions. Stored separately from the
+        // widget JSON so the 10 widget variants stay untouched. One row
+        // per widget; `alerts_json` is the array of `WidgetAlert`s.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS widget_alerts (
+                    widget_id TEXT PRIMARY KEY,
+                    dashboard_id TEXT NOT NULL,
+                    alerts_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at INTEGER NOT NULL
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS widget_alerts_dashboard_idx \
+             ON widget_alerts (dashboard_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W21: firing-event log. The Sidebar badge, AlertsView feed, and
+        // autonomous-trigger budget all read from here.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS alert_events (
+                    id TEXT PRIMARY KEY,
+                    widget_id TEXT NOT NULL,
+                    dashboard_id TEXT NOT NULL,
+                    alert_id TEXT NOT NULL,
+                    fired_at INTEGER NOT NULL,
+                    severity TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    acknowledged_at INTEGER,
+                    triggered_session_id TEXT
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS alert_events_widget_idx \
+             ON alert_events (widget_id, fired_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS alert_events_unack_idx \
+             ON alert_events (acknowledged_at) WHERE acknowledged_at IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS alert_events_alert_idx \
+             ON alert_events (alert_id, fired_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W23: per-widget pipeline traces. Ring-buffer up to 5 entries per
+        // widget. Capture is opt-in via widget datasource flag; persisted
+        // traces feed the Debug view history and the W18 reflection turn.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS widget_traces (
+                    widget_id TEXT NOT NULL,
+                    captured_at INTEGER NOT NULL,
+                    trace_json TEXT NOT NULL,
+                    PRIMARY KEY (widget_id, captured_at)
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS widget_traces_widget_idx \
+             ON widget_traces (widget_id, captured_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W25: per-dashboard parameter declarations live alongside layout
+        // as a JSON column. Per-user selections are tracked separately so a
+        // dropdown change doesn't rewrite the entire dashboard row.
+        let _ =
+            sqlx::query("ALTER TABLE dashboards ADD COLUMN parameters TEXT NOT NULL DEFAULT '[]'")
+                .execute(&self.pool)
+                .await;
+
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS dashboard_parameter_values (
+                    dashboard_id TEXT NOT NULL,
+                    param_name TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (dashboard_id, param_name)
+                )
+            "#,
         )
         .execute(&self.pool)
         .await?;
@@ -580,8 +785,8 @@ impl Storage {
 
     pub async fn create_dashboard(&self, dashboard: &Dashboard) -> Result<()> {
         sqlx::query(r#"
-            INSERT INTO dashboards (id, name, description, layout, workflows, is_default, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dashboards (id, name, description, layout, workflows, is_default, created_at, updated_at, parameters)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#)
         .bind(&dashboard.id)
         .bind(&dashboard.name)
@@ -591,6 +796,7 @@ impl Storage {
         .bind(if dashboard.is_default { 1i64 } else { 0i64 })
         .bind(dashboard.created_at)
         .bind(dashboard.updated_at)
+        .bind(serde_json::to_string(&dashboard.parameters)?)
         .execute(&self.pool).await?;
 
         Ok(())
@@ -600,7 +806,7 @@ impl Storage {
         sqlx::query(
             r#"
             UPDATE dashboards SET name = ?, description = ?, layout = ?, workflows = ?,
-            is_default = ?, updated_at = ? WHERE id = ?
+            is_default = ?, updated_at = ?, parameters = ? WHERE id = ?
         "#,
         )
         .bind(&dashboard.name)
@@ -609,6 +815,7 @@ impl Storage {
         .bind(serde_json::to_string(&dashboard.workflows)?)
         .bind(if dashboard.is_default { 1i64 } else { 0i64 })
         .bind(dashboard.updated_at)
+        .bind(serde_json::to_string(&dashboard.parameters)?)
         .bind(&dashboard.id)
         .execute(&self.pool)
         .await?;
@@ -624,9 +831,84 @@ impl Storage {
         Ok(())
     }
 
+    // ─── W25: parameter selections ──────────────────────────────────────────
+
+    /// Load every persisted (param_name -> value) selection for a dashboard.
+    pub async fn get_dashboard_parameter_values(
+        &self,
+        dashboard_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, crate::models::dashboard::ParameterValue>> {
+        let rows = sqlx::query(
+            "SELECT param_name, value_json FROM dashboard_parameter_values WHERE dashboard_id = ?",
+        )
+        .bind(dashboard_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let name: String = row.try_get("param_name")?;
+            let value_json: String = row.try_get("value_json")?;
+            if let Ok(value) =
+                serde_json::from_str::<crate::models::dashboard::ParameterValue>(&value_json)
+            {
+                out.insert(name, value);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn set_dashboard_parameter_value(
+        &self,
+        dashboard_id: &str,
+        param_name: &str,
+        value: &crate::models::dashboard::ParameterValue,
+        now: i64,
+    ) -> Result<()> {
+        let value_json = serde_json::to_string(value)?;
+        sqlx::query(
+            r#"
+                INSERT INTO dashboard_parameter_values (dashboard_id, param_name, value_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(dashboard_id, param_name) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(dashboard_id)
+        .bind(param_name)
+        .bind(value_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_dashboard_parameter_value(
+        &self,
+        dashboard_id: &str,
+        param_name: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM dashboard_parameter_values WHERE dashboard_id = ? AND param_name = ?",
+        )
+        .bind(dashboard_id)
+        .bind(param_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     fn row_to_dashboard(row: &sqlx::sqlite::SqliteRow) -> Result<Dashboard> {
         let layout_json: String = row.try_get("layout")?;
         let workflows_json: String = row.try_get("workflows")?;
+        // W25: `parameters` column is added in a separate ALTER, so older
+        // rows may not have it; treat missing / null / invalid as empty.
+        let parameters_json: Option<String> = row.try_get("parameters").ok();
+        let parameters = parameters_json
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
 
         Ok(Dashboard {
             id: row.try_get("id")?,
@@ -637,6 +919,157 @@ impl Storage {
             is_default: row.try_get::<i64, _>("is_default")? == 1,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            parameters,
+        })
+    }
+
+    // ─── W19: Dashboard versions ────────────────────────────────────────────
+
+    /// Newest entries kept; older ones pruned in the same transaction as
+    /// the insert. 30 keeps roughly a month of normal use without
+    /// ballooning the SQLite db for users who hammer Apply.
+    const MAX_VERSIONS_PER_DASHBOARD: i64 = 30;
+
+    /// Insert a snapshot row for `dashboard`. Wraps the insert + prune in
+    /// a single transaction so we never observe a half-pruned window.
+    pub async fn insert_dashboard_version(
+        &self,
+        version_id: &str,
+        dashboard: &Dashboard,
+        source: VersionSource,
+        summary: &str,
+        source_session_id: Option<&str>,
+        parent_version_id: Option<&str>,
+        applied_at: i64,
+    ) -> Result<DashboardVersionSummary> {
+        let snapshot_json = serde_json::to_string(dashboard)?;
+        let widget_count = dashboard.layout.len() as i64;
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+                INSERT INTO dashboard_versions (
+                    id, dashboard_id, snapshot_json, applied_at, source,
+                    source_session_id, summary, widget_count, parent_version_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(version_id)
+        .bind(&dashboard.id)
+        .bind(&snapshot_json)
+        .bind(applied_at)
+        .bind(source.as_str())
+        .bind(source_session_id)
+        .bind(summary)
+        .bind(widget_count)
+        .bind(parent_version_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Prune any rows beyond the most recent MAX_VERSIONS_PER_DASHBOARD.
+        sqlx::query(
+            r#"
+                DELETE FROM dashboard_versions
+                WHERE dashboard_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM dashboard_versions
+                    WHERE dashboard_id = ?
+                    ORDER BY applied_at DESC, id DESC
+                    LIMIT ?
+                  )
+            "#,
+        )
+        .bind(&dashboard.id)
+        .bind(&dashboard.id)
+        .bind(Self::MAX_VERSIONS_PER_DASHBOARD)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(DashboardVersionSummary {
+            id: version_id.to_string(),
+            dashboard_id: dashboard.id.clone(),
+            applied_at,
+            source,
+            summary: summary.to_string(),
+            widget_count: widget_count as i32,
+            source_session_id: source_session_id.map(str::to_string),
+            parent_version_id: parent_version_id.map(str::to_string),
+        })
+    }
+
+    pub async fn list_dashboard_versions(
+        &self,
+        dashboard_id: &str,
+    ) -> Result<Vec<DashboardVersionSummary>> {
+        let rows = sqlx::query(
+            "SELECT id, dashboard_id, applied_at, source, source_session_id, \
+             summary, widget_count, parent_version_id \
+             FROM dashboard_versions WHERE dashboard_id = ? \
+             ORDER BY applied_at DESC, id DESC",
+        )
+        .bind(dashboard_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(Self::row_to_version_summary(&row)?);
+        }
+        Ok(out)
+    }
+
+    pub async fn get_dashboard_version(
+        &self,
+        version_id: &str,
+    ) -> Result<Option<DashboardVersion>> {
+        let row = sqlx::query(
+            "SELECT id, dashboard_id, snapshot_json, applied_at, source, \
+             source_session_id, summary, widget_count, parent_version_id \
+             FROM dashboard_versions WHERE id = ?",
+        )
+        .bind(version_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(Self::row_to_version_full(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn row_to_version_summary(row: &sqlx::sqlite::SqliteRow) -> Result<DashboardVersionSummary> {
+        let source_str: String = row.try_get("source")?;
+        let source = VersionSource::from_str(&source_str)
+            .ok_or_else(|| anyhow::anyhow!("unknown version source '{}'", source_str))?;
+        Ok(DashboardVersionSummary {
+            id: row.try_get("id")?,
+            dashboard_id: row.try_get("dashboard_id")?,
+            applied_at: row.try_get("applied_at")?,
+            source,
+            summary: row.try_get("summary")?,
+            widget_count: row.try_get::<i64, _>("widget_count")? as i32,
+            source_session_id: row.try_get("source_session_id")?,
+            parent_version_id: row.try_get("parent_version_id")?,
+        })
+    }
+
+    fn row_to_version_full(row: &sqlx::sqlite::SqliteRow) -> Result<DashboardVersion> {
+        let source_str: String = row.try_get("source")?;
+        let source = VersionSource::from_str(&source_str)
+            .ok_or_else(|| anyhow::anyhow!("unknown version source '{}'", source_str))?;
+        let snapshot_json: String = row.try_get("snapshot_json")?;
+        let snapshot: Dashboard = serde_json::from_str(&snapshot_json)?;
+        Ok(DashboardVersion {
+            id: row.try_get("id")?,
+            dashboard_id: row.try_get("dashboard_id")?,
+            applied_at: row.try_get("applied_at")?,
+            source,
+            summary: row.try_get("summary")?,
+            widget_count: row.try_get::<i64, _>("widget_count")? as i32,
+            source_session_id: row.try_get("source_session_id")?,
+            parent_version_id: row.try_get("parent_version_id")?,
+            snapshot,
         })
     }
 
@@ -718,10 +1151,18 @@ impl Storage {
     }
 
     pub async fn create_chat_session(&self, session: &ChatSession) -> Result<()> {
-        sqlx::query(r#"
-            INSERT INTO chat_sessions (id, mode, dashboard_id, widget_id, title, messages, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        "#)
+        sqlx::query(
+            r#"
+            INSERT INTO chat_sessions (
+                id, mode, dashboard_id, widget_id, title, messages,
+                current_plan, plan_status,
+                total_input_tokens, total_output_tokens, total_reasoning_tokens,
+                total_cost_usd, max_cost_usd,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+        )
         .bind(&session.id)
         .bind(match session.mode {
             crate::models::chat::ChatMode::Build => "build",
@@ -731,18 +1172,39 @@ impl Storage {
         .bind(&session.widget_id)
         .bind(&session.title)
         .bind(serde_json::to_string(&session.messages)?)
+        .bind(match session.current_plan.as_ref() {
+            Some(plan) => Some(serde_json::to_string(plan)?),
+            None => None,
+        })
+        .bind(match session.plan_status.as_ref() {
+            Some(status) => Some(serde_json::to_string(status)?),
+            None => None,
+        })
+        .bind(session.total_input_tokens as i64)
+        .bind(session.total_output_tokens as i64)
+        .bind(session.total_reasoning_tokens as i64)
+        .bind(session.total_cost_usd)
+        .bind(session.max_cost_usd)
         .bind(session.created_at)
         .bind(session.updated_at)
-        .execute(&self.pool).await?;
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
 
     pub async fn update_chat_session(&self, session: &ChatSession) -> Result<()> {
-        sqlx::query(r#"
-            UPDATE chat_sessions SET mode = ?, dashboard_id = ?, widget_id = ?, title = ?, messages = ?, updated_at = ?
+        sqlx::query(
+            r#"
+            UPDATE chat_sessions SET
+                mode = ?, dashboard_id = ?, widget_id = ?, title = ?, messages = ?,
+                current_plan = ?, plan_status = ?,
+                total_input_tokens = ?, total_output_tokens = ?, total_reasoning_tokens = ?,
+                total_cost_usd = ?, max_cost_usd = ?,
+                updated_at = ?
             WHERE id = ?
-        "#)
+        "#,
+        )
         .bind(match session.mode {
             crate::models::chat::ChatMode::Build => "build",
             crate::models::chat::ChatMode::Context => "context",
@@ -751,11 +1213,74 @@ impl Storage {
         .bind(&session.widget_id)
         .bind(&session.title)
         .bind(serde_json::to_string(&session.messages)?)
+        .bind(match session.current_plan.as_ref() {
+            Some(plan) => Some(serde_json::to_string(plan)?),
+            None => None,
+        })
+        .bind(match session.plan_status.as_ref() {
+            Some(status) => Some(serde_json::to_string(status)?),
+            None => None,
+        })
+        .bind(session.total_input_tokens as i64)
+        .bind(session.total_output_tokens as i64)
+        .bind(session.total_reasoning_tokens as i64)
+        .bind(session.total_cost_usd)
+        .bind(session.max_cost_usd)
         .bind(session.updated_at)
         .bind(&session.id)
-        .execute(&self.pool).await?;
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
+    }
+
+    /// W22: lightweight update path used by the streaming chat command
+    /// when only the running totals need to be flushed (e.g. after a
+    /// resume turn). Avoids re-serialising the whole `messages` blob.
+    pub async fn update_chat_session_totals(
+        &self,
+        session_id: &str,
+        total_input_tokens: u64,
+        total_output_tokens: u64,
+        total_reasoning_tokens: u64,
+        total_cost_usd: f64,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE chat_sessions SET
+                total_input_tokens = ?,
+                total_output_tokens = ?,
+                total_reasoning_tokens = ?,
+                total_cost_usd = ?,
+                updated_at = ?
+            WHERE id = ?
+        "#,
+        )
+        .bind(total_input_tokens as i64)
+        .bind(total_output_tokens as i64)
+        .bind(total_reasoning_tokens as i64)
+        .bind(total_cost_usd)
+        .bind(updated_at)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// W22: set / clear the per-session budget cap. Returns the updated
+    /// session row.
+    pub async fn set_session_max_cost(
+        &self,
+        session_id: &str,
+        max_cost_usd: Option<f64>,
+    ) -> Result<Option<ChatSession>> {
+        sqlx::query("UPDATE chat_sessions SET max_cost_usd = ? WHERE id = ?")
+            .bind(max_cost_usd)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        self.get_chat_session(session_id).await
     }
 
     pub async fn delete_chat_session(&self, id: &str) -> Result<()> {
@@ -766,8 +1291,111 @@ impl Storage {
         Ok(())
     }
 
+    // ─── W22: cost queries ──────────────────────────────────────────────────
+
+    /// Sum of `total_cost_usd` across every session whose `updated_at`
+    /// falls in `[since_ms, until_ms)`. The footer uses this to compute
+    /// "today $X.XX" cheaply.
+    pub async fn sum_cost_between(&self, since_ms: i64, until_ms: i64) -> Result<f64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(total_cost_usd), 0.0) AS total \
+             FROM chat_sessions WHERE updated_at >= ? AND updated_at < ?",
+        )
+        .bind(since_ms)
+        .bind(until_ms)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<f64, _>("total").unwrap_or(0.0))
+    }
+
+    /// `(bucket_start_ms, cost_usd)` rows grouped by UTC day, sorted
+    /// ascending by bucket. `since_ms` is inclusive; `until_ms` is
+    /// exclusive. Used by Settings → Costs to draw the 30-day bar chart.
+    pub async fn daily_cost_buckets(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<(i64, f64)>> {
+        let rows = sqlx::query(
+            "SELECT CAST(updated_at / 86400000 AS INTEGER) * 86400000 AS bucket,
+                    SUM(total_cost_usd) AS total
+             FROM chat_sessions
+             WHERE updated_at >= ? AND updated_at < ?
+             GROUP BY bucket
+             ORDER BY bucket ASC",
+        )
+        .bind(since_ms)
+        .bind(until_ms)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let bucket = row.try_get::<i64, _>("bucket").unwrap_or(0);
+                let total = row.try_get::<f64, _>("total").unwrap_or(0.0);
+                (bucket, total)
+            })
+            .collect())
+    }
+
+    /// Top-N sessions by `total_cost_usd`. Returns the lightweight
+    /// summary rows the cost view needs (id, title, total, updated_at).
+    pub async fn top_sessions_by_cost(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::models::chat::CostSessionEntry>> {
+        let rows = sqlx::query(
+            "SELECT id, title, mode, total_cost_usd, total_input_tokens, total_output_tokens, \
+             total_reasoning_tokens, updated_at \
+             FROM chat_sessions \
+             WHERE total_cost_usd > 0 \
+             ORDER BY total_cost_usd DESC \
+             LIMIT ?",
+        )
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::models::chat::CostSessionEntry {
+                session_id: row.try_get::<String, _>("id").unwrap_or_default(),
+                title: row.try_get::<String, _>("title").unwrap_or_default(),
+                mode: row
+                    .try_get::<String, _>("mode")
+                    .map(|m| {
+                        if m == "build" {
+                            crate::models::chat::ChatMode::Build
+                        } else {
+                            crate::models::chat::ChatMode::Context
+                        }
+                    })
+                    .unwrap_or(crate::models::chat::ChatMode::Context),
+                cost_usd: row.try_get::<f64, _>("total_cost_usd").unwrap_or(0.0),
+                input_tokens: row
+                    .try_get::<i64, _>("total_input_tokens")
+                    .unwrap_or(0)
+                    .max(0) as u64,
+                output_tokens: row
+                    .try_get::<i64, _>("total_output_tokens")
+                    .unwrap_or(0)
+                    .max(0) as u64,
+                reasoning_tokens: row
+                    .try_get::<i64, _>("total_reasoning_tokens")
+                    .unwrap_or(0)
+                    .max(0) as u64,
+                updated_at: row.try_get::<i64, _>("updated_at").unwrap_or(0),
+            })
+            .collect())
+    }
+
     fn row_to_chat_session(row: &sqlx::sqlite::SqliteRow) -> Result<ChatSession> {
         let messages_json: String = row.try_get("messages")?;
+        let current_plan_json: Option<String> = row
+            .try_get::<Option<String>, _>("current_plan")
+            .unwrap_or(None);
+        let plan_status_json: Option<String> = row
+            .try_get::<Option<String>, _>("plan_status")
+            .unwrap_or(None);
 
         Ok(ChatSession {
             id: row.try_get("id")?,
@@ -779,6 +1407,34 @@ impl Storage {
             widget_id: row.try_get("widget_id")?,
             title: row.try_get("title")?,
             messages: serde_json::from_str(&messages_json)?,
+            current_plan: current_plan_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
+            plan_status: plan_status_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
+            total_input_tokens: row
+                .try_get::<Option<i64>, _>("total_input_tokens")
+                .unwrap_or(None)
+                .unwrap_or(0)
+                .max(0) as u64,
+            total_output_tokens: row
+                .try_get::<Option<i64>, _>("total_output_tokens")
+                .unwrap_or(None)
+                .unwrap_or(0)
+                .max(0) as u64,
+            total_reasoning_tokens: row
+                .try_get::<Option<i64>, _>("total_reasoning_tokens")
+                .unwrap_or(None)
+                .unwrap_or(0)
+                .max(0) as u64,
+            total_cost_usd: row
+                .try_get::<Option<f64>, _>("total_cost_usd")
+                .unwrap_or(None)
+                .unwrap_or(0.0),
+            max_cost_usd: row
+                .try_get::<Option<f64>, _>("max_cost_usd")
+                .unwrap_or(None),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -904,6 +1560,46 @@ impl Storage {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// W19: restore path needs to put a workflow back to a known shape.
+    /// We do not have an UPDATE on the full row elsewhere, so this is a
+    /// DELETE + INSERT inside one transaction to keep the row atomically
+    /// in sync with the restored snapshot.
+    pub async fn upsert_workflow(&self, workflow: &Workflow) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM workflows WHERE id = ?")
+            .bind(&workflow.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+                INSERT INTO workflows (
+                    id, name, description, nodes, edges, trigger, is_enabled, last_run,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&workflow.id)
+        .bind(&workflow.name)
+        .bind(&workflow.description)
+        .bind(serde_json::to_string(&workflow.nodes)?)
+        .bind(serde_json::to_string(&workflow.edges)?)
+        .bind(serde_json::to_string(&workflow.trigger)?)
+        .bind(if workflow.is_enabled { 1i64 } else { 0i64 })
+        .bind(
+            workflow
+                .last_run
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
+        .bind(workflow.created_at)
+        .bind(workflow.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1071,6 +1767,357 @@ impl Storage {
             url: row.try_get("url")?,
         })
     }
+
+    // ─── Playground Presets (W20) ───────────────────────────────────────────
+
+    pub async fn upsert_playground_preset(&self, preset: &PlaygroundPreset) -> Result<()> {
+        let arguments_json = serde_json::to_string(&preset.arguments)?;
+        let kind = match preset.tool_kind {
+            PlaygroundToolKind::Mcp => "mcp",
+            PlaygroundToolKind::Http => "http",
+        };
+        sqlx::query(
+            r#"
+                INSERT INTO playground_presets (
+                    id, tool_kind, server_id, tool_name, display_name,
+                    arguments, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    tool_kind = excluded.tool_kind,
+                    server_id = excluded.server_id,
+                    tool_name = excluded.tool_name,
+                    display_name = excluded.display_name,
+                    arguments = excluded.arguments,
+                    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&preset.id)
+        .bind(kind)
+        .bind(preset.server_id.as_deref())
+        .bind(&preset.tool_name)
+        .bind(&preset.display_name)
+        .bind(&arguments_json)
+        .bind(preset.created_at)
+        .bind(preset.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_playground_presets(&self) -> Result<Vec<PlaygroundPreset>> {
+        let rows = sqlx::query(
+            "SELECT id, tool_kind, server_id, tool_name, display_name, \
+             arguments, created_at, updated_at \
+             FROM playground_presets ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::row_to_playground_preset).collect()
+    }
+
+    pub async fn delete_playground_preset(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM playground_presets WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    fn row_to_playground_preset(row: &sqlx::sqlite::SqliteRow) -> Result<PlaygroundPreset> {
+        let tool_kind: String = row.try_get("tool_kind")?;
+        let kind = match tool_kind.as_str() {
+            "http" => PlaygroundToolKind::Http,
+            _ => PlaygroundToolKind::Mcp,
+        };
+        let arguments_json: String = row.try_get("arguments")?;
+        let arguments: serde_json::Value =
+            serde_json::from_str(&arguments_json).unwrap_or(serde_json::Value::Null);
+        Ok(PlaygroundPreset {
+            id: row.try_get("id")?,
+            tool_kind: kind,
+            server_id: row.try_get("server_id")?,
+            tool_name: row.try_get("tool_name")?,
+            display_name: row.try_get("display_name")?,
+            arguments,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    // ─── W21: Widget alerts ─────────────────────────────────────────────────
+
+    pub async fn get_widget_alerts(&self, widget_id: &str) -> Result<Vec<WidgetAlert>> {
+        let row = sqlx::query("SELECT alerts_json FROM widget_alerts WHERE widget_id = ?")
+            .bind(widget_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(r) => {
+                let json: String = r.try_get("alerts_json")?;
+                Ok(serde_json::from_str(&json).unwrap_or_default())
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub async fn set_widget_alerts(
+        &self,
+        widget_id: &str,
+        dashboard_id: &str,
+        alerts: &[WidgetAlert],
+    ) -> Result<()> {
+        let alerts_json = serde_json::to_string(alerts)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"
+                INSERT INTO widget_alerts (widget_id, dashboard_id, alerts_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(widget_id) DO UPDATE SET
+                    dashboard_id = excluded.dashboard_id,
+                    alerts_json = excluded.alerts_json,
+                    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(widget_id)
+        .bind(dashboard_id)
+        .bind(&alerts_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_widget_alerts_for_dashboard(
+        &self,
+        dashboard_id: &str,
+    ) -> Result<Vec<(String, Vec<WidgetAlert>)>> {
+        let rows =
+            sqlx::query("SELECT widget_id, alerts_json FROM widget_alerts WHERE dashboard_id = ?")
+                .bind(dashboard_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let widget_id: String = row.try_get("widget_id")?;
+            let json: String = row.try_get("alerts_json")?;
+            let alerts: Vec<WidgetAlert> = serde_json::from_str(&json).unwrap_or_default();
+            out.push((widget_id, alerts));
+        }
+        Ok(out)
+    }
+
+    // ─── W21: Alert events ──────────────────────────────────────────────────
+
+    pub async fn insert_alert_event(&self, event: &AlertEvent) -> Result<()> {
+        sqlx::query(
+            r#"
+                INSERT INTO alert_events (
+                    id, widget_id, dashboard_id, alert_id, fired_at,
+                    severity, message, context_json, acknowledged_at,
+                    triggered_session_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&event.id)
+        .bind(&event.widget_id)
+        .bind(&event.dashboard_id)
+        .bind(&event.alert_id)
+        .bind(event.fired_at)
+        .bind(event.severity.as_str())
+        .bind(&event.message)
+        .bind(serde_json::to_string(&event.context)?)
+        .bind(event.acknowledged_at)
+        .bind(event.triggered_session_id.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_alert_events(
+        &self,
+        only_unacknowledged: bool,
+        limit: usize,
+    ) -> Result<Vec<AlertEvent>> {
+        let sql = if only_unacknowledged {
+            "SELECT id, widget_id, dashboard_id, alert_id, fired_at, severity, \
+             message, context_json, acknowledged_at, triggered_session_id \
+             FROM alert_events WHERE acknowledged_at IS NULL \
+             ORDER BY fired_at DESC LIMIT ?"
+        } else {
+            "SELECT id, widget_id, dashboard_id, alert_id, fired_at, severity, \
+             message, context_json, acknowledged_at, triggered_session_id \
+             FROM alert_events ORDER BY fired_at DESC LIMIT ?"
+        };
+        let rows = sqlx::query(sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(Self::row_to_alert_event).collect()
+    }
+
+    pub async fn last_fired_at_for_widget(
+        &self,
+        widget_id: &str,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let rows = sqlx::query(
+            "SELECT alert_id, MAX(fired_at) AS last_fired \
+             FROM alert_events WHERE widget_id = ? GROUP BY alert_id",
+        )
+        .bind(widget_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let alert_id: String = row.try_get("alert_id")?;
+            let last_fired: i64 = row.try_get("last_fired")?;
+            out.insert(alert_id, last_fired);
+        }
+        Ok(out)
+    }
+
+    pub async fn count_agent_actions_in_window(
+        &self,
+        alert_id: &str,
+        since_ms: i64,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM alert_events \
+             WHERE alert_id = ? AND triggered_session_id IS NOT NULL AND fired_at >= ?",
+        )
+        .bind(alert_id)
+        .bind(since_ms)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>("n")?)
+    }
+
+    pub async fn acknowledge_alert_event(&self, event_id: &str) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "UPDATE alert_events SET acknowledged_at = ? \
+             WHERE id = ? AND acknowledged_at IS NULL",
+        )
+        .bind(now)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn count_unacknowledged_alerts(&self) -> Result<i64> {
+        let row =
+            sqlx::query("SELECT COUNT(*) AS n FROM alert_events WHERE acknowledged_at IS NULL")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.try_get::<i64, _>("n")?)
+    }
+
+    // ─── W23: Pipeline traces ───────────────────────────────────────────────
+
+    pub async fn insert_widget_trace(
+        &self,
+        widget_id: &str,
+        captured_at: i64,
+        trace_json: &str,
+    ) -> Result<()> {
+        const RING_BUFFER_LIMIT: i64 = 5;
+        sqlx::query(
+            "INSERT OR REPLACE INTO widget_traces (widget_id, captured_at, trace_json) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(widget_id)
+        .bind(captured_at)
+        .bind(trace_json)
+        .execute(&self.pool)
+        .await?;
+
+        // Trim oldest entries beyond the ring-buffer cap.
+        sqlx::query(
+            "DELETE FROM widget_traces WHERE widget_id = ? AND captured_at NOT IN \
+             (SELECT captured_at FROM widget_traces WHERE widget_id = ? \
+              ORDER BY captured_at DESC LIMIT ?)",
+        )
+        .bind(widget_id)
+        .bind(widget_id)
+        .bind(RING_BUFFER_LIMIT)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_widget_traces(&self, widget_id: &str) -> Result<Vec<(i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT captured_at, trace_json FROM widget_traces \
+             WHERE widget_id = ? ORDER BY captured_at DESC",
+        )
+        .bind(widget_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let captured_at: i64 = row.try_get("captured_at")?;
+            let trace_json: String = row.try_get("trace_json")?;
+            out.push((captured_at, trace_json));
+        }
+        Ok(out)
+    }
+
+    pub async fn get_widget_trace(
+        &self,
+        widget_id: &str,
+        captured_at: i64,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT trace_json FROM widget_traces \
+             WHERE widget_id = ? AND captured_at = ?",
+        )
+        .bind(widget_id)
+        .bind(captured_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(r.try_get::<String, _>("trace_json")?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn latest_widget_trace(&self, widget_id: &str) -> Result<Option<(i64, String)>> {
+        let row = sqlx::query(
+            "SELECT captured_at, trace_json FROM widget_traces \
+             WHERE widget_id = ? ORDER BY captured_at DESC LIMIT 1",
+        )
+        .bind(widget_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some((
+                r.try_get::<i64, _>("captured_at")?,
+                r.try_get::<String, _>("trace_json")?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    fn row_to_alert_event(row: &sqlx::sqlite::SqliteRow) -> Result<AlertEvent> {
+        let severity_str: String = row.try_get("severity")?;
+        let severity = AlertSeverity::from_str(&severity_str)
+            .ok_or_else(|| anyhow::anyhow!("unknown alert severity '{}'", severity_str))?;
+        let context_json: String = row.try_get("context_json")?;
+        let context: serde_json::Value =
+            serde_json::from_str(&context_json).unwrap_or(serde_json::Value::Null);
+        Ok(AlertEvent {
+            id: row.try_get("id")?,
+            widget_id: row.try_get("widget_id")?,
+            dashboard_id: row.try_get("dashboard_id")?,
+            alert_id: row.try_get("alert_id")?,
+            fired_at: row.try_get("fired_at")?,
+            severity,
+            message: row.try_get("message")?,
+            context,
+            acknowledged_at: row.try_get("acknowledged_at")?,
+            triggered_session_id: row.try_get("triggered_session_id")?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1155,6 +2202,7 @@ mod tests {
             is_default: false,
             created_at: now,
             updated_at: now,
+            parameters: Vec::new(),
         };
         storage.create_dashboard(&dashboard).await?;
         assert_eq!(storage.get_dashboard("dash-1").await?.unwrap().name, "Ops");
@@ -1238,6 +2286,58 @@ mod tests {
                 .id,
             "run-1"
         );
+
+        Ok(())
+    }
+
+    /// W19: snapshot insert + listing + read-back, plus ring buffer prune
+    /// at the 30-entry cap so spamming Apply does not balloon the table.
+    #[tokio::test]
+    async fn dashboard_version_round_trip_and_ring_buffer_prune() -> Result<()> {
+        use crate::models::dashboard::VersionSource;
+
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let dashboard = Dashboard {
+            id: "dash-v".into(),
+            name: "Versions".into(),
+            description: None,
+            layout: vec![],
+            workflows: vec![],
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+            parameters: Vec::new(),
+        };
+        storage.create_dashboard(&dashboard).await?;
+
+        // Insert 35 versions; only the newest 30 should survive.
+        for i in 0..35 {
+            storage
+                .insert_dashboard_version(
+                    &format!("ver-{i:03}"),
+                    &dashboard,
+                    VersionSource::AgentApply,
+                    &format!("apply #{i}"),
+                    Some("sess-1"),
+                    None,
+                    now + i as i64,
+                )
+                .await?;
+        }
+
+        let listing = storage.list_dashboard_versions("dash-v").await?;
+        assert_eq!(listing.len(), 30);
+        assert_eq!(listing[0].id, "ver-034");
+        assert_eq!(listing[29].id, "ver-005");
+
+        let full = storage
+            .get_dashboard_version("ver-020")
+            .await?
+            .expect("version stored");
+        assert_eq!(full.snapshot.name, "Versions");
+        assert_eq!(full.source, VersionSource::AgentApply);
+        assert_eq!(full.source_session_id.as_deref(), Some("sess-1"));
 
         Ok(())
     }

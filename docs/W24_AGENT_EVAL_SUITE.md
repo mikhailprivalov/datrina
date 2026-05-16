@@ -1,8 +1,63 @@
 # W24 Agent Eval Suite
 
-Status: planned
+Status: shipped v1 (replay-mode assertions). Live-mode + full
+agent-loop replay deferred to v2 — see "v2 deferrals" below.
 
-Date: 2026-05-16
+Date: 2026-05-16 (v1 landed 2026-05-17)
+
+## v1 — what shipped
+
+* `src-tauri/tests/agent_eval.rs` — single integration-test binary that
+  loads every `tests/fixtures/agent_evals/*.yaml` scenario and runs its
+  assertions against the production assertion surfaces in-process.
+  Runs in under a second, no network, no provider key required.
+* Six seed scenarios covering: a happy-path single stat over MCP, a
+  table over HTTP, a multi-widget shared-source dashboard, a hardcoded-
+  literal regression, a text-widget-as-JSON regression, and a captured
+  looping tool-call sequence.
+* Ten assertion kinds: `validator_passes`, `validator_fails_with`,
+  `no_hardcoded_literals`, `proposal_widget` (kind/count/datasource
+  presence/pipeline step kinds), `tool_called`, `plan_step_kind`,
+  `plan_step_count`, `loop_detected`, `cost_lt_usd`.
+* `expensive_evals` feature flag wired in Cargo.toml. The live test
+  body is a documented `#[ignore]` placeholder pointing at the v2
+  prerequisites — kept honest rather than stubbed silently.
+* Two fault-injection self-tests in `agent_eval.rs` that feed synthetic
+  bad proposals into the assertion library and confirm the assertions
+  actually trip; protects against the assertions silently rotting into
+  no-ops after a future validator refactor.
+* `bun run eval` shortcut; README "Running agent evals" section.
+
+The runner mirrors `chat.rs::count_recent_repeats` /
+`canonical_json_string` in the test file rather than re-exporting them
+from the production binary. Intentional: if a future change to the
+runtime heuristic diverges from the mirror, the affected scenario
+fails with a clear diff, which is exactly the regression signal the
+suite exists to provide.
+
+## v2 deferrals
+
+Driving the full `send_message_stream_inner` agent loop from a
+captured-chunk `MockProvider` requires extracting an `AIProvider` trait
+out of `AIEngine` and threading `&dyn AIProvider` through chat.rs (4.6k
+lines). That refactor is the prerequisite for:
+
+* Recorded SSE replay (the `record_eval` example).
+* Live-mode evals against real OpenRouter behind `--features
+  expensive_evals`.
+* HTML drift report (`target/eval_report.html`).
+* Asserting iteration counts and the full tool-loop sequence.
+
+The v1 assertion surface already catches the regressions the suite was
+created for today (prompt drift breaking the validator, anti-hardcode
+rule decay, pipeline schema rot, cost spikes, loop-detection drift).
+v2 lands when the chat-loop extraction is independently motivated.
+
+## Original plan
+
+The sections below are the v0 plan as written 2026-05-16. Kept as
+reference for the v2 work; some terminology (recording capture, MockProvider) is
+v2 scope.
 
 ## Context
 

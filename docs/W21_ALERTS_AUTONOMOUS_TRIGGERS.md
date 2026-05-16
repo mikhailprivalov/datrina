@@ -1,6 +1,6 @@
 # W21 Alerts And Autonomous Triggers
 
-Status: planned
+Status: shipped
 
 Date: 2026-05-16
 

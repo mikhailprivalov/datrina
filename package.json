@@ -13,7 +13,8 @@
     "tauri:build": "tauri build",
     "check:contract": "node scripts/check-contract.mjs",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "eval": "cargo test --test agent_eval --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
     "@ai-sdk/openai": "^1.0.0",

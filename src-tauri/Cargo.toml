@@ -24,6 +24,7 @@ tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-store = "2"
 tauri-plugin-os = "2"
 tauri-plugin-process = "2"
+tauri-plugin-notification = "2"
 
 # Async runtime
 tokio = { version = "1.42", features = ["full", "process", "io-util", "sync", "time", "macros"] }
@@ -73,3 +74,11 @@ portable-pty = "0.9"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# W24 — toggles live-provider eval scenarios that hit a real LLM (cost +
+# network). Off by default; replay-mode evals run without this feature.
+expensive_evals = []
+
+[dev-dependencies]
+# W24 — agent eval suite uses YAML scenario fixtures.
+serde_yaml = "0.9"
+pretty_assertions = "1"

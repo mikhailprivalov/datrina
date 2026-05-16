@@ -1,8 +1,10 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { chatApi, dashboardApi } from '../../lib/api';
+import { chatApi, costApi, dashboardApi } from '../../lib/api';
+import type { SessionCostSnapshot } from '../../lib/api';
+import { SessionBudgetModal } from '../chat/SessionBudgetModal';
 import {
   appendErrorRuntimeMessage,
   appendUserRuntimeMessage,
@@ -22,6 +24,9 @@ import type {
   ChatSession,
   ChatSessionSummary,
   LLMProvider,
+  PlanArtifact,
+  PlanStepKind,
+  PlanStepStatus,
   ValidationIssue,
   WidgetDryRunResult,
 } from '../../lib/api';
@@ -32,12 +37,16 @@ interface Props {
   dashboardName?: string;
   activeProvider?: LLMProvider;
   canApplyToDashboard: boolean;
+  /** Pre-filled input value, e.g. seeded from Playground "Use as widget" or
+   * a Template Gallery selection. Consumed exactly once per change. */
+  initialPrompt?: string;
+  onInitialPromptConsumed?: () => void;
   onClose: () => void;
   onModeChange: (mode: 'build' | 'context') => void;
-  onApplyBuildProposal: (proposal: BuildProposal) => Promise<void>;
+  onApplyBuildProposal: (proposal: BuildProposal, sessionId?: string) => Promise<void>;
 }
 
-export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, canApplyToDashboard, onClose, onModeChange, onApplyBuildProposal }: Props) {
+export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, canApplyToDashboard, initialPrompt, onInitialPromptConsumed, onClose, onModeChange, onApplyBuildProposal }: Props) {
   const [runtime, setRuntime] = useState(createChatRuntimeState([]));
   const [input, setInput] = useState('');
   const [session, setSession] = useState<ChatSession | null>(null);
@@ -46,6 +55,9 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingDraft, setEditingDraft] = useState('');
+  // W22: live cost snapshot for the footer (running session totals + today).
+  const [costSnapshot, setCostSnapshot] = useState<SessionCostSnapshot | null>(null);
+  const [isBudgetModalOpen, setIsBudgetModalOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -177,6 +189,7 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
       setRuntime(prev => applyChatEvent(prev, chatEvent, modeRef.current));
       if (chatEvent.kind === 'message_completed' || chatEvent.kind === 'message_failed' || chatEvent.kind === 'message_cancelled') {
         refreshSessionsList();
+        refreshCostSnapshot();
       }
     });
 
@@ -187,12 +200,44 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
     };
   }, []);
 
+  // W22: pull a fresh cost snapshot whenever the active session id
+  // changes, and on a slow interval so "today" stays current across
+  // long-idle panels.
+  const refreshCostSnapshot = useCallback(async () => {
+    const sid = sessionIdRef.current;
+    if (!sid) {
+      setCostSnapshot(null);
+      return;
+    }
+    try {
+      const snapshot = await costApi.getSessionSnapshot(sid);
+      if (sessionIdRef.current === sid) {
+        setCostSnapshot(snapshot);
+      }
+    } catch (err) {
+      console.error('Failed to load cost snapshot:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshCostSnapshot();
+    const handle = window.setInterval(refreshCostSnapshot, 60_000);
+    return () => window.clearInterval(handle);
+  }, [refreshCostSnapshot, session?.id]);
+
   useEffect(() => {
     const textarea = inputRef.current;
     if (!textarea) return;
     textarea.style.height = 'auto';
     textarea.style.height = `${Math.min(textarea.scrollHeight, 128)}px`;
   }, [input]);
+
+  useEffect(() => {
+    if (!initialPrompt) return;
+    setInput(initialPrompt);
+    onInitialPromptConsumed?.();
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, [initialPrompt, onInitialPromptConsumed]);
 
   const handleInputChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(normalizeChatInput(event.target.value));
@@ -396,6 +441,19 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
             </svg>
           </button>
+          {session && (
+            <button
+              onClick={() => setIsBudgetModalOpen(true)}
+              title={costSnapshot?.max_cost_usd != null
+                ? `Session budget: $${costSnapshot.max_cost_usd.toFixed(2)}`
+                : 'Set session cost budget'}
+              className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </button>
+          )}
           <button onClick={onClose} className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -489,6 +547,7 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
                   <MessageParts
                     message={msg}
                     isLoading={runtime.isLoading}
+                    sessionId={session?.id}
                     onApplyBuildProposal={onApplyBuildProposal}
                   />
                 )}
@@ -548,6 +607,24 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
         )}
       </div>
 
+      {costSnapshot && (
+        <div className="px-3 pt-2 pb-1 border-t border-border/60 text-[10px] text-muted-foreground/80 flex items-center justify-between gap-2">
+          <span className="truncate" title={formatCostFooterTitle(costSnapshot)}>
+            {formatCostFooter(costSnapshot)}
+          </span>
+          {costSnapshot.max_cost_usd != null && costSnapshot.max_cost_usd > 0 && (
+            <span
+              className={
+                costSnapshot.cost_usd >= costSnapshot.max_cost_usd
+                  ? 'text-destructive'
+                  : 'text-muted-foreground/70'
+              }
+            >
+              cap ${costSnapshot.max_cost_usd.toFixed(2)}
+            </span>
+          )}
+        </div>
+      )}
       <div className="p-3 border-t border-border">
         <div className="flex items-end gap-2">
           <textarea
@@ -582,8 +659,50 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
         <p className="text-[10px] text-muted-foreground/60 mt-1.5 text-center">Shift+Enter for new line</p>
       </div>
     </aside>
+    {isBudgetModalOpen && session && (
+      <SessionBudgetModal
+        sessionId={session.id}
+        currentMaxCostUsd={costSnapshot?.max_cost_usd ?? null}
+        currentSpentUsd={costSnapshot?.cost_usd ?? session.total_cost_usd ?? 0}
+        onClose={() => setIsBudgetModalOpen(false)}
+        onSaved={(updated: ChatSession) => {
+          setIsBudgetModalOpen(false);
+          setSession(updated);
+          refreshCostSnapshot();
+        }}
+      />
+    )}
     </div>
   );
+}
+
+function formatCostFooter(snapshot: SessionCostSnapshot): string {
+  const tokens = `${formatTokens(snapshot.input_tokens)} in / ${formatTokens(snapshot.output_tokens)} out`
+    + (snapshot.reasoning_tokens > 0 ? ` / ${formatTokens(snapshot.reasoning_tokens)} think` : '');
+  const cost = ` · $${snapshot.cost_usd.toFixed(4)}`;
+  const today = ` · today $${snapshot.today_cost_usd.toFixed(2)}`;
+  const model = snapshot.model ? `${snapshot.model} · ` : '';
+  return `${model}${tokens}${cost}${today}`;
+}
+
+function formatCostFooterTitle(snapshot: SessionCostSnapshot): string {
+  return [
+    snapshot.model ? `Model: ${snapshot.model}` : null,
+    `Prompt: ${snapshot.input_tokens} tokens`,
+    `Completion: ${snapshot.output_tokens} tokens`,
+    snapshot.reasoning_tokens > 0 ? `Reasoning: ${snapshot.reasoning_tokens} tokens` : null,
+    `Session cost: $${snapshot.cost_usd.toFixed(4)}`,
+    `Today total: $${snapshot.today_cost_usd.toFixed(4)}`,
+    snapshot.max_cost_usd != null ? `Cap: $${snapshot.max_cost_usd.toFixed(2)}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function formatTokens(count: number): string {
+  if (count < 1000) return `${count}`;
+  if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+  return `${Math.round(count / 1000)}k`;
 }
 
 function SessionsSidebar({
@@ -807,19 +926,27 @@ function CopyMessageButton({ message }: { message: ChatRuntimeMessage }) {
 function MessageParts({
   message,
   isLoading,
+  sessionId,
   onApplyBuildProposal,
 }: {
   message: ChatRuntimeMessage;
   isLoading: boolean;
-  onApplyBuildProposal: (proposal: BuildProposal) => Promise<void>;
+  sessionId?: string;
+  onApplyBuildProposal: (proposal: BuildProposal, sessionId?: string) => Promise<void>;
 }) {
   const timelinePart = message.parts.find((part): part is Extract<ChatMessagePart, { type: 'agent_phase' }> =>
     part.type === 'agent_phase');
   const validationPart = message.parts.find((part): part is Extract<ChatMessagePart, { type: 'proposal_validation' }> =>
     part.type === 'proposal_validation');
+  const planPart = message.parts.find((part): part is Extract<ChatMessagePart, { type: 'plan' }> =>
+    part.type === 'plan');
+  const reflectionPart = message.parts.find((part): part is Extract<ChatMessagePart, { type: 'reflection_meta' }> =>
+    part.type === 'reflection_meta');
   const renderableParts = message.parts.filter(part =>
     part.type !== 'agent_phase'
       && part.type !== 'proposal_validation'
+      && part.type !== 'plan'
+      && part.type !== 'reflection_meta'
       && part.type !== 'provider_opaque_reasoning_state'
   );
   const isStreaming = message.role === 'assistant' && (isLoading || message.status === 'streaming');
@@ -832,6 +959,14 @@ function MessageParts({
   );
   return (
     <>
+      {planPart && (
+        <PlanArtifactTile
+          plan={planPart.plan}
+          status={planPart.status}
+          isLive={isStreaming}
+        />
+      )}
+      {reflectionPart && <ReflectionBadge widgetIds={reflectionPart.widget_ids} />}
       {timelinePart && (
         <AgentTimeline
           phases={timelinePart.phases}
@@ -863,6 +998,7 @@ function MessageParts({
           <MessagePart
             key={`${part.type}-${index}`}
             part={part}
+            sessionId={sessionId}
             onApplyBuildProposal={onApplyBuildProposal}
           />
         );
@@ -912,7 +1048,128 @@ function phaseLabel(phase: AgentPhase): string {
       return `Tool loop short-circuited (${phase.tool_name})`;
     case 'proposal_validation':
       return 'Validating proposal';
+    case 'plan_enforcement':
+      return 'Plan enforcement';
   }
+}
+
+function PlanArtifactTile({
+  plan,
+  status,
+  isLive,
+}: {
+  plan: PlanArtifact;
+  status: Record<string, PlanStepStatus>;
+  isLive: boolean;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const total = plan.steps.length;
+  const done = plan.steps.filter(step => status[step.id] === 'done').length;
+  const running = plan.steps.find(step => status[step.id] === 'running');
+  const failed = plan.steps.some(step => status[step.id] === 'failed');
+  const summaryLabel = failed
+    ? 'Plan failed'
+    : running
+      ? `Running ${running.id}`
+      : isLive
+        ? 'Plan ready'
+        : 'Plan complete';
+  return (
+    <div className={`mt-1 mb-2 rounded-md border ${failed ? 'border-destructive/40 bg-destructive/5' : 'border-amber-500/30 bg-amber-500/5'} p-2 text-[11px]`}>
+      <button
+        type="button"
+        onClick={() => setExpanded(v => !v)}
+        className="flex w-full items-center justify-between gap-2 text-left"
+      >
+        <span className="flex items-center gap-1.5 font-medium text-foreground">
+          <svg className={`h-3 w-3 transition-transform ${expanded ? 'rotate-90' : ''}`} viewBox="0 0 20 20" fill="currentColor">
+            <path fillRule="evenodd" d="M7.293 5.293a1 1 0 011.414 0l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414-1.414L10.586 10 7.293 6.707a1 1 0 010-1.414z" clipRule="evenodd" />
+          </svg>
+          Plan ({done}/{total})
+        </span>
+        <span className="text-muted-foreground">{summaryLabel}</span>
+      </button>
+      {expanded && (
+        <>
+          {plan.summary && (
+            <p className="mt-1 text-muted-foreground">{plan.summary}</p>
+          )}
+          <ol className="mt-1 space-y-0.5">
+            {plan.steps.map(step => {
+              const s = status[step.id] ?? 'pending';
+              return (
+                <li key={step.id} className="flex items-start gap-2 leading-snug">
+                  <span className="mt-0.5 flex-shrink-0">
+                    <PlanStepIcon status={s} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className={`truncate ${s === 'failed' ? 'text-destructive' : 'text-foreground'}`}>
+                        <span className="font-medium">{step.id}</span>
+                        <span className="ml-1 text-muted-foreground">·</span>
+                        <span className="ml-1">{step.title}</span>
+                      </span>
+                      <span className="flex-shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
+                        {planKindLabel(step.kind)}
+                      </span>
+                    </div>
+                    {step.rationale && (
+                      <p className="text-[10px] text-muted-foreground">{step.rationale}</p>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PlanStepIcon({ status }: { status: PlanStepStatus }) {
+  if (status === 'running') {
+    return <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-amber-500/30 border-t-amber-500" />;
+  }
+  if (status === 'done') {
+    return (
+      <svg className="h-3 w-3 text-emerald-500" viewBox="0 0 20 20" fill="currentColor">
+        <path fillRule="evenodd" d="M16.704 5.296a1 1 0 010 1.408l-8 8a1 1 0 01-1.408 0l-4-4a1 1 0 011.408-1.408L8 12.592l7.296-7.296a1 1 0 011.408 0z" clipRule="evenodd" />
+      </svg>
+    );
+  }
+  if (status === 'failed') {
+    return (
+      <svg className="h-3 w-3 text-destructive" viewBox="0 0 20 20" fill="currentColor">
+        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+      </svg>
+    );
+  }
+  return <span className="inline-block h-3 w-3 rounded-full border border-muted-foreground/40" />;
+}
+
+function planKindLabel(kind: PlanStepKind): string {
+  switch (kind) {
+    case 'explore': return 'explore';
+    case 'fetch': return 'fetch';
+    case 'design': return 'design';
+    case 'test': return 'test';
+    case 'propose': return 'propose';
+    case 'other': return 'other';
+  }
+}
+
+function ReflectionBadge({ widgetIds }: { widgetIds: string[] }) {
+  return (
+    <div className="mt-1 mb-2 flex items-center gap-2 rounded-md border border-blue-500/30 bg-blue-500/5 px-2 py-1 text-[11px] text-blue-700 dark:text-blue-300">
+      <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-5a1 1 0 112 0 1 1 0 01-2 0zM9 6a1 1 0 112 0v4a1 1 0 11-2 0V6z" clipRule="evenodd" />
+      </svg>
+      <span>
+        Reflection suggestion — agent reviewed {widgetIds.length} widget{widgetIds.length === 1 ? '' : 's'} after first refresh.
+      </span>
+    </div>
+  );
 }
 
 function ProposalValidationTile({
@@ -1103,16 +1360,20 @@ function formatElapsed(ms: number): string {
 
 function MessagePart({
   part,
+  sessionId,
   onApplyBuildProposal,
 }: {
   part: ChatMessagePart;
-  onApplyBuildProposal: (proposal: BuildProposal) => Promise<void>;
+  sessionId?: string;
+  onApplyBuildProposal: (proposal: BuildProposal, sessionId?: string) => Promise<void>;
 }) {
   switch (part.type) {
     case 'text':
     case 'provider_opaque_reasoning_state':
     case 'agent_phase':
     case 'proposal_validation':
+    case 'plan':
+    case 'reflection_meta':
       return null;
     case 'visible_reasoning':
       return <ReasoningTrace reasoning={part.text} />;
@@ -1124,7 +1385,7 @@ function MessagePart({
       return (
         <ProposalPreview
           proposal={part.proposal}
-          onApply={() => onApplyBuildProposal(part.proposal)}
+          onApply={() => onApplyBuildProposal(part.proposal, sessionId)}
         />
       );
     case 'error':

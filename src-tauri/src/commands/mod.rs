@@ -1,8 +1,12 @@
+pub mod alert;
 pub mod chat;
 pub mod config;
+pub mod cost;
 pub mod dashboard;
+pub mod debug;
 pub mod mcp;
 pub mod memory;
+pub mod playground;
 pub mod provider;
 pub mod system;
 pub mod tool;

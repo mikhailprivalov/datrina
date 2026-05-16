@@ -15,6 +15,11 @@ pub struct Dashboard {
     pub is_default: bool,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// W25: Grafana-style template variables. Empty by default; references
+    /// like `$name` / `${name}` inside widget configs are substituted by
+    /// the parameter engine before workflow execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<DashboardParameter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +94,12 @@ pub struct ApplyBuildProposalRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dashboard_id: Option<Id>,
     pub confirmed: bool,
+    /// W18: chat session that produced this proposal. When set, the apply
+    /// path registers a post-apply reflection job for each newly created
+    /// or replaced widget so the agent can critique its own output after
+    /// the first successful refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +123,11 @@ pub struct BuildProposal {
     /// related widgets consistent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_datasources: Vec<SharedDatasource>,
+    /// W25: dashboard-level template variables proposed alongside the
+    /// widgets. Existing parameters with matching `id` are replaced; new
+    /// ones are appended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<DashboardParameter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,4 +237,211 @@ pub enum BuildDatasourcePlanKind {
     /// tail.
     Shared,
     ProviderPrompt,
+}
+
+// ─── W19: Dashboard versions / undo ─────────────────────────────────────────
+
+/// What caused a snapshot to be written. Drives the source badge in the
+/// UI and lets the reflection heuristic correlate restores with their
+/// parent versions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionSource {
+    AgentApply,
+    ManualEdit,
+    Restore,
+    PreDelete,
+}
+
+impl VersionSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VersionSource::AgentApply => "agent_apply",
+            VersionSource::ManualEdit => "manual_edit",
+            VersionSource::Restore => "restore",
+            VersionSource::PreDelete => "pre_delete",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "agent_apply" => Some(VersionSource::AgentApply),
+            "manual_edit" => Some(VersionSource::ManualEdit),
+            "restore" => Some(VersionSource::Restore),
+            "pre_delete" => Some(VersionSource::PreDelete),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardVersionSummary {
+    pub id: Id,
+    pub dashboard_id: Id,
+    pub applied_at: Timestamp,
+    pub source: VersionSource,
+    pub summary: String,
+    pub widget_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_version_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardVersion {
+    pub id: Id,
+    pub dashboard_id: Id,
+    pub applied_at: Timestamp,
+    pub source: VersionSource,
+    pub summary: String,
+    pub widget_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_version_id: Option<Id>,
+    /// Full Dashboard serialized as JSON at snapshot time. Kept as a string
+    /// in storage; deserialized on demand so callers that only need
+    /// summaries do not pay the parse cost.
+    pub snapshot: Dashboard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonPathChange {
+    pub path: String,
+    pub before: Value,
+    pub after: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetDiff {
+    pub widget_id: Id,
+    pub widget_title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind_changed: Option<(String, String)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_changed: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_changes: Vec<JsonPathChange>,
+    pub datasource_plan_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardDiff {
+    pub from_version_id: Id,
+    pub to_version_id: Id,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_widgets: Vec<WidgetSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_widgets: Vec<WidgetSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modified_widgets: Vec<WidgetDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_changed: Option<(String, String)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description_changed: Option<(Option<String>, Option<String>)>,
+    pub layout_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetSummary {
+    pub id: Id,
+    pub title: String,
+    pub kind: String,
+}
+
+// ─── W25: Dashboard parameters (Grafana-style variables) ────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardParameter {
+    pub id: String,
+    pub name: String,
+    pub label: String,
+    #[serde(flatten)]
+    pub kind: DashboardParameterKind,
+    #[serde(default)]
+    pub multi: bool,
+    #[serde(default)]
+    pub include_all: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<ParameterValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DashboardParameterKind {
+    StaticList {
+        #[serde(default)]
+        options: Vec<ParameterOption>,
+    },
+    TextInput {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+    },
+    TimeRange {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_preset: Option<String>,
+    },
+    Interval {
+        #[serde(default)]
+        presets: Vec<String>,
+    },
+    McpQuery {
+        server_id: String,
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pipeline: Vec<crate::models::pipeline::PipelineStep>,
+    },
+    HttpQuery {
+        method: String,
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        headers: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pipeline: Vec<crate::models::pipeline::PipelineStep>,
+    },
+    Constant {
+        value: ParameterValue,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ParameterValue {
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Range(TimeRangeValue),
+    Array(Vec<ParameterValue>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeRangeValue {
+    pub from: i64,
+    pub to: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterOption {
+    pub label: String,
+    pub value: ParameterValue,
+}
+
+/// Persisted per-dashboard parameter selection. Stored separately from the
+/// dashboard JSON so changing a value doesn't require rewriting the whole
+/// layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardParameterSelection {
+    pub dashboard_id: Id,
+    pub param_name: String,
+    pub value: ParameterValue,
+    pub updated_at: Timestamp,
 }

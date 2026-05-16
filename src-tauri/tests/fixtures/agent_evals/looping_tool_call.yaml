@@ -1,0 +1,33 @@
+id: looping_tool_call
+description: |
+  Captures a known pathological sequence where the agent repeated the same
+  (tool_name, canonical-arguments) tuple more than the loop-detector
+  threshold. The no_loop_detected assertion must trip (the test passes when
+  it correctly detects the loop), confirming that loop detection still
+  matches the runtime heuristic in chat.rs.
+
+trace:
+  proposal:
+    id: prop-loop
+    title: Stuck agent
+    widgets: []
+  tool_calls:
+    - { call_id: c1, name: list_dashboards, arguments: { dashboard_id: same }, result: { ok: true } }
+    - { call_id: c2, name: list_dashboards, arguments: { dashboard_id: same }, result: { ok: true } }
+    - { call_id: c3, name: list_dashboards, arguments: { dashboard_id: same }, result: { ok: true } }
+    - { call_id: c4, name: list_dashboards, arguments: { dashboard_id: same }, result: { ok: true } }
+  plan:
+    summary: empty
+    steps: []
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 500
+    completion: 80
+
+assertions:
+  - kind: loop_detected
+    name: list_dashboards
+    min_repeats: 3
+  - kind: cost_lt_usd
+    value: 0.05

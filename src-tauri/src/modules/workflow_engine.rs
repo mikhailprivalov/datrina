@@ -512,7 +512,7 @@ fn pick_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// Resolve a dotted path with `[index]` and `[*]` segments. Always returns
 /// an owned `Value`; `[*]` flattens an array into a Vec of matched values.
-fn resolve_path(value: &Value, path: &str) -> Value {
+pub(crate) fn resolve_path(value: &Value, path: &str) -> Value {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return value.clone();
@@ -619,6 +619,182 @@ async fn run_pipeline(
         current = apply_pipeline_step(current, step, ai_engine, provider).await?;
     }
     Ok(current)
+}
+
+/// W23: trace-instrumented pipeline runner. Returns the final value and a
+/// per-step trace capturing pruned input/output samples, durations, and
+/// (if applicable) the step error. The normal `run_pipeline` path keeps
+/// its zero-overhead signature.
+pub(crate) async fn run_pipeline_with_trace(
+    input: Value,
+    steps: &[crate::models::pipeline::PipelineStep],
+    ai_engine: Option<&crate::modules::ai::AIEngine>,
+    provider: Option<&crate::models::provider::LLMProvider>,
+) -> (Value, Vec<crate::models::pipeline::PipelineStepTrace>) {
+    let mut current = input;
+    let mut traces = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        let input_sample = prune_for_trace(&current);
+        let started = std::time::Instant::now();
+        let kind = pipeline_step_kind(step);
+        let config_json = serde_json::to_value(step).unwrap_or(Value::Null);
+        match apply_pipeline_step(current.clone(), step, ai_engine, provider).await {
+            Ok(next) => {
+                let duration_ms = started.elapsed().as_millis() as u32;
+                let output_sample = prune_for_trace(&next);
+                traces.push(crate::models::pipeline::PipelineStepTrace {
+                    index: index as u32,
+                    kind,
+                    config_json,
+                    input_sample,
+                    output_sample,
+                    duration_ms,
+                    error: None,
+                });
+                current = next;
+            }
+            Err(error) => {
+                let duration_ms = started.elapsed().as_millis() as u32;
+                traces.push(crate::models::pipeline::PipelineStepTrace {
+                    index: index as u32,
+                    kind,
+                    config_json,
+                    input_sample,
+                    output_sample: prune_for_trace(&Value::Null),
+                    duration_ms,
+                    error: Some(error.to_string()),
+                });
+                return (Value::Null, traces);
+            }
+        }
+    }
+    (current, traces)
+}
+
+fn pipeline_step_kind(step: &crate::models::pipeline::PipelineStep) -> String {
+    use crate::models::pipeline::PipelineStep::*;
+    match step {
+        Pick { .. } => "pick",
+        Filter { .. } => "filter",
+        Sort { .. } => "sort",
+        Limit { .. } => "limit",
+        Map { .. } => "map",
+        Aggregate { .. } => "aggregate",
+        Set { .. } => "set",
+        Head => "head",
+        Tail => "tail",
+        Length => "length",
+        Flatten => "flatten",
+        Unique { .. } => "unique",
+        Format { .. } => "format",
+        Coerce { .. } => "coerce",
+        LlmPostprocess { .. } => "llm_postprocess",
+    }
+    .to_string()
+}
+
+/// Build a [`SampleValue`] from an arbitrary JSON value with strict size
+/// caps so traces are safe to store and serialize: strings >256 chars
+/// truncated, arrays >5 items kept as head, depth >5 collapsed.
+pub(crate) fn prune_for_trace(value: &Value) -> crate::models::pipeline::SampleValue {
+    use crate::models::pipeline::{SampleKind, SampleValue, SizeHint};
+    const MAX_STR: usize = 256;
+    const MAX_DEPTH: usize = 5;
+    let preview = prune_value(value, MAX_DEPTH);
+    match value {
+        Value::Null => SampleValue {
+            kind: SampleKind::Null,
+            size_hint: SizeHint::default(),
+            preview,
+        },
+        Value::Array(items) => SampleValue {
+            kind: SampleKind::ArrayHead,
+            size_hint: SizeHint {
+                items: Some(items.len()),
+                bytes: None,
+            },
+            preview,
+        },
+        Value::Object(map) => SampleValue {
+            kind: SampleKind::Object,
+            size_hint: SizeHint {
+                items: Some(map.len()),
+                bytes: None,
+            },
+            preview,
+        },
+        Value::String(s) => {
+            if s.chars().count() > MAX_STR {
+                SampleValue {
+                    kind: SampleKind::TruncatedString,
+                    size_hint: SizeHint {
+                        items: None,
+                        bytes: Some(s.len()),
+                    },
+                    preview,
+                }
+            } else {
+                SampleValue {
+                    kind: SampleKind::Value,
+                    size_hint: SizeHint {
+                        items: None,
+                        bytes: Some(s.len()),
+                    },
+                    preview,
+                }
+            }
+        }
+        _ => SampleValue {
+            kind: SampleKind::Value,
+            size_hint: SizeHint::default(),
+            preview,
+        },
+    }
+}
+
+fn prune_value(value: &Value, depth_remaining: usize) -> Value {
+    const MAX_STR: usize = 256;
+    const MAX_ARR: usize = 5;
+    if depth_remaining == 0 {
+        return Value::String(match value {
+            Value::Array(items) => format!("[…{} items]", items.len()),
+            Value::Object(map) => format!("{{…{} keys}}", map.len()),
+            other => other.to_string(),
+        });
+    }
+    match value {
+        Value::String(s) => {
+            if s.chars().count() > MAX_STR {
+                let truncated: String = s.chars().take(MAX_STR).collect();
+                Value::String(format!(
+                    "{}… [{} chars total]",
+                    truncated,
+                    s.chars().count()
+                ))
+            } else {
+                Value::String(s.clone())
+            }
+        }
+        Value::Array(items) => {
+            let mut head: Vec<Value> = items
+                .iter()
+                .take(MAX_ARR)
+                .map(|item| prune_value(item, depth_remaining - 1))
+                .collect();
+            if items.len() > MAX_ARR {
+                head.push(Value::String(format!("… {} more", items.len() - MAX_ARR)));
+            }
+            Value::Array(head)
+        }
+        Value::Object(map) => {
+            let mut pruned = serde_json::Map::new();
+            for (k, v) in map.iter() {
+                pruned.insert(k.clone(), prune_value(v, depth_remaining - 1));
+            }
+            Value::Object(pruned)
+        }
+        other => other.clone(),
+    }
 }
 
 async fn apply_pipeline_step(
@@ -1188,6 +1364,57 @@ mod tests {
             .iter()
             .any(|event| matches!(event.kind, WorkflowEventKind::RunFinished)));
 
+        Ok(())
+    }
+
+    #[test]
+    fn prune_for_trace_truncates_strings_and_arrays() {
+        use crate::models::pipeline::SampleKind;
+        // Long string → truncated_string kind, preview ends with `…`.
+        let long = "x".repeat(500);
+        let sample = prune_for_trace(&Value::String(long.clone()));
+        assert!(matches!(sample.kind, SampleKind::TruncatedString));
+        let preview = sample.preview.as_str().unwrap();
+        assert!(preview.contains("[500 chars total]"));
+        assert!(preview.starts_with("x"));
+
+        // Long array → array_head, only first 5 items kept + tail marker.
+        let arr: Vec<Value> = (0..20).map(|i| Value::from(i)).collect();
+        let sample = prune_for_trace(&Value::Array(arr));
+        assert!(matches!(sample.kind, SampleKind::ArrayHead));
+        assert_eq!(sample.size_hint.items, Some(20));
+        let preview_items = sample.preview.as_array().unwrap();
+        assert_eq!(preview_items.len(), 6); // 5 items + "... N more" marker
+        assert_eq!(preview_items[0], Value::from(0));
+        assert!(preview_items[5].as_str().unwrap().contains("15 more"));
+
+        // Null → null kind.
+        let sample = prune_for_trace(&Value::Null);
+        assert!(matches!(sample.kind, SampleKind::Null));
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_with_trace_records_steps_and_durations() -> Result<()> {
+        use crate::models::pipeline::PipelineStep;
+        let steps = vec![
+            PipelineStep::Pick {
+                path: "items".into(),
+            },
+            PipelineStep::Limit { count: 2 },
+            PipelineStep::Length,
+        ];
+        let initial = json!({ "items": [{"id":1},{"id":2},{"id":3},{"id":4}] });
+        let (final_value, traces) = run_pipeline_with_trace(initial, &steps, None, None).await;
+        assert_eq!(final_value, json!(2));
+        assert_eq!(traces.len(), 3);
+        assert_eq!(traces[0].kind, "pick");
+        assert_eq!(traces[1].kind, "limit");
+        assert_eq!(traces[2].kind, "length");
+        // Limit step output is an array head with 2 items.
+        assert_eq!(traces[1].output_sample.size_hint.items, Some(2));
+        for step in &traces {
+            assert!(step.error.is_none());
+        }
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 # W18 Plan / Execute / Reflect Orchestration
 
-Status: planned
+Status: implemented
 
 Date: 2026-05-16
 
@@ -190,3 +190,44 @@ assistant message, with one-click Apply.
 - W16 — validation gate runs **before** the proposal is shown; reflection
   runs **after** Apply. They are complementary.
 - W21 — alerts on stuck workflow are the safety net under reflection.
+
+## Completion notes
+
+- `submit_plan(summary, steps)` is registered as a Build-mode tool. The
+  per-call loop intercepts it, parses `PlanArtifact` from the arguments,
+  writes `current_plan` / `plan_status` on the session, and emits
+  `ChatEventKind::PlanUpdated` carrying the full plan + status map.
+- Plan enforcement: when a Build session has no plan yet and the agent's
+  first batch contains no `submit_plan`, every other call in the batch
+  is short-circuited with a synthetic `plan_required` tool result.
+  `AgentPhase::PlanEnforcement` traces this in the timeline.
+- Step tracking: each non-`submit_plan` tool call may carry a
+  `_plan_step: "<step_id>"` argument. The chat loop pops it before
+  executing the underlying tool, flips the matching step to `running`
+  (closing the previous `running` step), and emits a fresh
+  `PlanUpdated`. Run completion finalises any still-`running` step to
+  `done` (or `failed` on error).
+- Persistence: `chat_sessions.current_plan` and
+  `chat_sessions.plan_status` are JSON columns added via idempotent
+  `ALTER TABLE` migrations. `ChatMessagePart::Plan` carries the
+  end-of-turn snapshot on the owning assistant message so reload shows
+  the same checklist without replaying events.
+- Reflection trigger: `apply_build_proposal_inner` accepts an optional
+  `session_id` and registers `ReflectionPending` entries in
+  `AppState.pending_reflections` for every new / replaced widget.
+- Reflection turn: `refresh_widget_inner` consumes the pending entry on
+  the first successful refresh (within 5 minutes) and spawns
+  `enqueue_reflection_turn`, which posts a synthetic user-role
+  `[reflection]` message into the originating session and runs the
+  standard streaming agent flow. The resulting assistant message
+  carries a `ChatMessagePart::ReflectionMeta`, and the UI badges it as
+  a reflection suggestion. Stale entries (>5 min) are dropped silently
+  — surfaced by W21 alerts instead.
+- Frontend: `PlanArtifactTile` renders the plan checklist above the
+  message body with per-step icons (pending / running / done /
+  failed); `ReflectionBadge` flags reflection-driven assistant
+  messages; `applyBuildProposal` now plumbs `session_id` so apply
+  registers the reflection job.
+- Validation: `bun run check:contract`, `bun run typecheck`,
+  `bun run build`, `cargo fmt --all --check`, and
+  `cargo check --workspace --all-targets` all pass.

@@ -1,0 +1,39 @@
+id: text_widget_no_json_dump
+description: |
+  Text widget whose body parses as JSON. The user has been explicit that
+  text widgets must be markdown summaries, never raw JSON dumps; the
+  validator must flag the TextWidgetContainsRawJson issue.
+
+trace:
+  proposal:
+    id: prop-text-json-dump
+    title: Active release notes
+    widgets:
+      - widget_type: text
+        title: Active release notes
+        data: ""
+        datasource_plan:
+          kind: provider_prompt
+          prompt: Summarise the active release.
+        config:
+          content: |
+            {"release": "v1.2.3", "status": "ga", "ships_on": "2026-05-30"}
+  tool_calls: []
+  plan:
+    summary: One step propose.
+    steps:
+      - { id: s1, title: Propose, kind: propose }
+  usage:
+    provider_kind: openrouter
+    model: claude-haiku-4-5
+    prompt: 1500
+    completion: 200
+
+assertions:
+  - kind: validator_fails_with
+    issue: text_widget_contains_raw_json
+  - kind: proposal_widget
+    count: 1
+    widget_type: text
+  - kind: plan_step_count
+    min: 1

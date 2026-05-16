@@ -1,0 +1,65 @@
+id: release_status_single_stat
+description: |
+  Happy-path single stat widget driven by an MCP tool. Demonstrates the
+  end-to-end structure the agent should emit: a datasource_plan pointing at
+  the configured MCP server, a pluck+filter pipeline, and an accompanying
+  dry_run_widget tool call so the validator's MissingDryRunEvidence gate
+  is satisfied.
+
+trace:
+  proposal:
+    id: prop-release-stat
+    title: Active release stat
+    widgets:
+      - widget_type: stat
+        title: Active release
+        data: ""
+        datasource_plan:
+          kind: mcp_tool
+          server_id: example-mcp
+          tool_name: list_releases
+          arguments: { project: example-project }
+          pipeline:
+            - { kind: pick, path: releases }
+            - { kind: filter, field: state, op: eq, value: active }
+            - { kind: head }
+            - { kind: pick, path: version }
+        config:
+          unit: ""
+  tool_calls:
+    - call_id: call-dry-run-1
+      name: dry_run_widget
+      arguments:
+        proposal:
+          title: Active release
+      result:
+        status: ok
+        value: v1.2.3
+  plan:
+    summary: Fetch MCP list_releases, filter active, expose as stat.
+    steps:
+      - { id: s1, title: Fetch releases, kind: fetch }
+      - { id: s2, title: Design widget, kind: design }
+      - { id: s3, title: Dry-run, kind: test }
+      - { id: s4, title: Propose, kind: propose }
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 3200
+    completion: 600
+
+assertions:
+  - kind: validator_passes
+  - kind: proposal_widget
+    count: 1
+    widget_type: stat
+    has_datasource_plan: true
+    has_pipeline_step_kind: [pick, filter]
+  - kind: tool_called
+    name: dry_run_widget
+    min_count: 1
+  - kind: no_hardcoded_literals
+  - kind: plan_step_kind
+    kinds: [fetch, propose]
+  - kind: cost_lt_usd
+    value: 0.20

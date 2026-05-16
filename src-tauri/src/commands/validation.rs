@@ -20,6 +20,7 @@ use crate::models::dashboard::{
 };
 use crate::models::pipeline::PipelineStep;
 use crate::models::validation::ValidationIssue;
+use crate::modules::parameter_engine::{detect_cycle, ResolvedParameters};
 
 /// Issue-kinds that require a successful `dry_run_widget` tool call in
 /// the same chat session before the final proposal. Tables only require
@@ -86,6 +87,29 @@ pub fn validate_build_proposal(
     // identifier we have before apply).
     let dry_run_titles = collect_dry_run_titles(transcript);
 
+    // W25: union of parameter names declared on the proposal + already on
+    // the dashboard. Widgets can reference either set.
+    let mut declared_params: HashSet<String> =
+        proposal.parameters.iter().map(|p| p.name.clone()).collect();
+    if let Some(d) = dashboard {
+        for p in &d.parameters {
+            declared_params.insert(p.name.clone());
+        }
+    }
+
+    // W25: cycle check across the union of dashboard + proposal parameters.
+    let mut merged_params: Vec<_> = dashboard.map(|d| d.parameters.clone()).unwrap_or_default();
+    for p in &proposal.parameters {
+        if let Some(existing) = merged_params.iter_mut().find(|q| q.id == p.id) {
+            *existing = p.clone();
+        } else {
+            merged_params.push(p.clone());
+        }
+    }
+    if let Some(cycle) = detect_cycle(&merged_params) {
+        issues.push(ValidationIssue::ParameterCycle { cycle });
+    }
+
     for (index, widget) in proposal.widgets.iter().enumerate() {
         let widget_index = index as u32;
         let widget_title = widget.title.clone();
@@ -95,6 +119,14 @@ pub fn validate_build_proposal(
             &widget_title,
             widget,
             &declared_shared_keys,
+            &mut issues,
+        );
+
+        validate_widget_parameter_refs(
+            widget_index,
+            &widget_title,
+            widget,
+            &declared_params,
             &mut issues,
         );
 
@@ -190,6 +222,43 @@ fn validate_widget_pipeline(
             widget_title: widget_title.to_string(),
             error: error.to_string(),
         });
+    }
+}
+
+/// W25: every `$param` token referenced in a widget's datasource_plan
+/// arguments or pipeline config must resolve to a declared parameter.
+fn validate_widget_parameter_refs(
+    widget_index: u32,
+    widget_title: &str,
+    widget: &BuildWidgetProposal,
+    declared_params: &HashSet<String>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(plan) = widget.datasource_plan.as_ref() else {
+        return;
+    };
+    let mut referenced = std::collections::BTreeSet::new();
+    if let Some(args) = &plan.arguments {
+        referenced.extend(ResolvedParameters::referenced_names(args));
+    }
+    if !plan.pipeline.is_empty() {
+        if let Ok(pipeline_json) = serde_json::to_value(&plan.pipeline) {
+            referenced.extend(ResolvedParameters::referenced_names(&pipeline_json));
+        }
+    }
+    if let Some(prompt) = &plan.prompt {
+        referenced.extend(ResolvedParameters::referenced_names(&Value::String(
+            prompt.clone(),
+        )));
+    }
+    for name in referenced {
+        if !declared_params.contains(&name) {
+            issues.push(ValidationIssue::UnknownParameterReference {
+                widget_index,
+                widget_title: widget_title.to_string(),
+                param_name: name,
+            });
+        }
     }
 }
 
@@ -349,4 +418,136 @@ pub fn format_issues_for_agent(issues: &[ValidationIssue]) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::dashboard::{
+        BuildDatasourcePlan, BuildDatasourcePlanKind, BuildProposal, BuildWidgetProposal,
+        BuildWidgetType, DashboardParameter, DashboardParameterKind, ParameterValue,
+    };
+    use serde_json::json;
+
+    fn proposal_with_widget(
+        plan: BuildDatasourcePlan,
+        params: Vec<DashboardParameter>,
+    ) -> BuildProposal {
+        BuildProposal {
+            id: "p1".into(),
+            title: "T".into(),
+            summary: None,
+            dashboard_name: None,
+            dashboard_description: None,
+            widgets: vec![BuildWidgetProposal {
+                widget_type: BuildWidgetType::Stat,
+                title: "Active count".into(),
+                data: json!({"value": 0}),
+                datasource_plan: Some(plan),
+                config: None,
+                x: None,
+                y: None,
+                w: None,
+                h: None,
+                replace_widget_id: None,
+            }],
+            remove_widget_ids: Vec::new(),
+            shared_datasources: Vec::new(),
+            parameters: params,
+        }
+    }
+
+    fn param(name: &str, kind: DashboardParameterKind) -> DashboardParameter {
+        DashboardParameter {
+            id: name.into(),
+            name: name.into(),
+            label: name.into(),
+            kind,
+            multi: false,
+            include_all: false,
+            default: None,
+            depends_on: Vec::new(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn unknown_parameter_reference_flagged() {
+        let plan = BuildDatasourcePlan {
+            kind: BuildDatasourcePlanKind::McpTool,
+            tool_name: Some("get_releases".into()),
+            server_id: Some("yandex".into()),
+            arguments: Some(json!({"project": "$project"})),
+            prompt: None,
+            output_path: None,
+            refresh_cron: None,
+            pipeline: Vec::new(),
+            source_key: None,
+        };
+        let proposal = proposal_with_widget(plan, Vec::new());
+        let issues = validate_build_proposal(&proposal, None, &[]);
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, ValidationIssue::UnknownParameterReference { param_name, .. } if param_name == "project")));
+    }
+
+    #[test]
+    fn declared_parameter_resolves_without_issue() {
+        let plan = BuildDatasourcePlan {
+            kind: BuildDatasourcePlanKind::McpTool,
+            tool_name: Some("get_releases".into()),
+            server_id: Some("yandex".into()),
+            arguments: Some(json!({"project": "$project"})),
+            prompt: None,
+            output_path: None,
+            refresh_cron: None,
+            pipeline: Vec::new(),
+            source_key: None,
+        };
+        let project = param(
+            "project",
+            DashboardParameterKind::StaticList {
+                options: Vec::new(),
+            },
+        );
+        let proposal = proposal_with_widget(plan, vec![project]);
+        let issues = validate_build_proposal(&proposal, None, &[]);
+        assert!(!issues
+            .iter()
+            .any(|i| matches!(i, ValidationIssue::UnknownParameterReference { .. })));
+    }
+
+    #[test]
+    fn parameter_cycle_flagged() {
+        let mut a = param(
+            "env",
+            DashboardParameterKind::Constant {
+                value: ParameterValue::String("prod".into()),
+            },
+        );
+        a.depends_on = vec!["service".into()];
+        let mut b = param(
+            "service",
+            DashboardParameterKind::Constant {
+                value: ParameterValue::String("api".into()),
+            },
+        );
+        b.depends_on = vec!["env".into()];
+        let plan = BuildDatasourcePlan {
+            kind: BuildDatasourcePlanKind::McpTool,
+            tool_name: Some("t".into()),
+            server_id: Some("s".into()),
+            arguments: None,
+            prompt: None,
+            output_path: None,
+            refresh_cron: None,
+            pipeline: Vec::new(),
+            source_key: None,
+        };
+        let proposal = proposal_with_widget(plan, vec![a, b]);
+        let issues = validate_build_proposal(&proposal, None, &[]);
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, ValidationIssue::ParameterCycle { .. })));
+    }
 }

@@ -1,8 +1,40 @@
 # W20 Data Playground And Onboarding Templates
 
-Status: planned
+Status: shipped
 
 Date: 2026-05-16
+
+## What landed
+
+- Standalone `#/playground` route with a three-pane layout (Sources |
+  Arguments | Result). Reachable from the Sidebar "Explore (Playground)"
+  item.
+- MCP sources come from existing `list_tools` (the `input_schema` field
+  was already being passed through; no backend change needed there).
+- Custom HTTP source backed by a new `execute_http_request` Tauri command
+  that wraps `tool_engine.http_request` (reuses the same policy gate the
+  chat agent uses).
+- Schema-driven argument form for MCP tools (string/number/boolean/enum
+  + JSON textarea fallback for nested objects and arrays).
+- Result pane tabs: JSON, Table (auto-detects array-of-objects roots up
+  to depth 3 with a path picker), Chart (line/bar over the first numeric
+  column), Schema sketch.
+- "Use as widget" composes a Build Chat prompt with source, args, a 4 KB
+  sample, and an optional user note, then opens the chat pre-filled.
+- Saved presets persisted in a new `playground_presets` SQLite table via
+  `list/save/delete_playground_preset` commands.
+- Template Gallery with 8 templates replaces the empty state. Same
+  gallery available as a modal from the Sidebar ("From template…").
+  Each card flags missing required MCP servers and links into MCP
+  settings.
+
+## Out of scope (carried forward)
+
+- Visual chart designer in Playground (basic chart preview only; full
+  configuration still happens in the widget editor).
+- User-created templates / sharing — registry is static code in v1.
+- Cross-tool composition in Playground; chains continue to go through
+  Build Chat.
 
 ## Context
 

@@ -58,6 +58,15 @@ pub enum ValidationIssue {
     },
     /// `shared_datasources` key collision: two entries share the same key.
     DuplicateSharedKey { key: String },
+    /// W25: widget references `$param_name` but no matching parameter is
+    /// declared on the proposal or the existing dashboard.
+    UnknownParameterReference {
+        widget_index: u32,
+        widget_title: String,
+        param_name: String,
+    },
+    /// W25: parameter `depends_on` graph contains a cycle.
+    ParameterCycle { cycle: Vec<String> },
 }
 
 impl ValidationIssue {
@@ -115,6 +124,17 @@ impl ValidationIssue {
             ValidationIssue::DuplicateSharedKey { key } => {
                 format!("shared_datasources contains duplicate key '{key}'.")
             }
+            ValidationIssue::UnknownParameterReference {
+                widget_index,
+                widget_title,
+                param_name,
+            } => format!(
+                "widget #{widget_index} '{widget_title}' references parameter '${param_name}', but no such parameter is declared in proposal.parameters or on the dashboard."
+            ),
+            ValidationIssue::ParameterCycle { cycle } => format!(
+                "dashboard parameters form a depends_on cycle: {}.",
+                cycle.join(" → ")
+            ),
         }
     }
 }

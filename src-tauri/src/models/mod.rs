@@ -1,8 +1,11 @@
+pub mod alert;
 pub mod chat;
 pub mod dashboard;
 pub mod mcp;
 pub mod memory;
 pub mod pipeline;
+pub mod playground;
+pub mod pricing;
 pub mod provider;
 pub mod validation;
 pub mod widget;

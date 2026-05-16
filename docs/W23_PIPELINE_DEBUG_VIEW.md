@@ -1,8 +1,8 @@
 # W23 Pipeline Debug View
 
-Status: planned
+Status: shipped
 
-Date: 2026-05-16
+Date: 2026-05-17
 
 ## Context
 

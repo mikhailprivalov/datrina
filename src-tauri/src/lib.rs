@@ -30,6 +30,23 @@ pub struct AppState {
     pub ai_engine: Arc<AIEngine>,
     pub memory_engine: Arc<MemoryEngine>,
     pub chat_abort_flags: Arc<dashmap::DashMap<String, Arc<AtomicBool>>>,
+    /// W18: widget_id -> pending reflection registration. Populated by
+    /// `apply_build_proposal_inner` for every new/replaced widget that
+    /// originated from a chat session; consumed by `refresh_widget` once
+    /// the widget renders real data for the first time.
+    pub pending_reflections: Arc<dashmap::DashMap<String, ReflectionPending>>,
+}
+
+/// W18: one entry per widget waiting for its first successful refresh.
+#[derive(Clone, Debug)]
+pub struct ReflectionPending {
+    pub session_id: String,
+    pub dashboard_id: String,
+    pub widget_id: String,
+    pub widget_title: String,
+    pub widget_kind: &'static str,
+    pub replaced: bool,
+    pub applied_at: i64,
 }
 
 impl AppState {
@@ -89,6 +106,7 @@ impl AppState {
             ai_engine,
             memory_engine,
             chat_abort_flags: Arc::new(dashmap::DashMap::new()),
+            pending_reflections: Arc::new(dashmap::DashMap::new()),
         })
     }
 }
@@ -129,6 +147,16 @@ macro_rules! generate_handler {
             $crate::commands::dashboard::dry_run_widget,
             $crate::commands::dashboard::delete_dashboard,
             $crate::commands::dashboard::refresh_widget,
+            // W19: dashboard versions / undo
+            $crate::commands::dashboard::list_dashboard_versions,
+            $crate::commands::dashboard::get_dashboard_version,
+            $crate::commands::dashboard::diff_dashboard_versions,
+            $crate::commands::dashboard::restore_dashboard_version,
+            // W25: dashboard parameters
+            $crate::commands::dashboard::list_dashboard_parameters,
+            $crate::commands::dashboard::get_dashboard_parameter_values,
+            $crate::commands::dashboard::set_dashboard_parameter_value,
+            $crate::commands::dashboard::resolve_dashboard_parameters,
             // Chat commands
             $crate::commands::chat::list_sessions,
             $crate::commands::chat::list_session_summaries,
@@ -164,6 +192,7 @@ macro_rules! generate_handler {
             // Tool commands
             $crate::commands::tool::get_whitelist,
             $crate::commands::tool::execute_curl,
+            $crate::commands::tool::execute_http_request,
             // Memory commands (W17)
             $crate::commands::memory::list_memories,
             $crate::commands::memory::delete_memory,
@@ -171,6 +200,28 @@ macro_rules! generate_handler {
             $crate::commands::memory::recall_memories,
             $crate::commands::memory::list_tool_shapes,
             $crate::commands::memory::list_memory_kinds,
+            // Playground commands (W20)
+            $crate::commands::playground::list_playground_presets,
+            $crate::commands::playground::save_playground_preset,
+            $crate::commands::playground::delete_playground_preset,
+            // Alert commands (W21)
+            $crate::commands::alert::list_alert_events,
+            $crate::commands::alert::acknowledge_alert,
+            $crate::commands::alert::get_widget_alerts,
+            $crate::commands::alert::set_widget_alerts,
+            $crate::commands::alert::count_unacknowledged_alerts,
+            $crate::commands::alert::test_alert_condition,
+            // Debug commands (W23)
+            $crate::commands::debug::trace_widget_pipeline,
+            $crate::commands::debug::list_widget_traces,
+            $crate::commands::debug::get_widget_trace,
+            $crate::commands::debug::set_widget_capture_traces,
+            // Cost commands (W22)
+            $crate::commands::cost::get_session_cost_snapshot,
+            $crate::commands::cost::get_cost_summary,
+            $crate::commands::cost::set_session_budget,
+            $crate::commands::cost::get_pricing_overrides,
+            $crate::commands::cost::set_pricing_overrides,
             // Config commands
             $crate::commands::config::get_config,
             $crate::commands::config::set_config,
@@ -225,6 +276,7 @@ async fn run_startup_e2e_smoke(state: AppState, report_path: PathBuf) -> anyhow:
         is_default: false,
         created_at: now,
         updated_at: now,
+        parameters: Vec::new(),
     };
 
     for workflow in &dashboard.workflows {

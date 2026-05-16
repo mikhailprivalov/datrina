@@ -128,6 +128,24 @@ cargo fmt --all --check
 cargo check --workspace --all-targets
 ```
 
+### Running agent evals (W24)
+
+The agent eval suite asserts that the production assertion surfaces
+(W16 proposal validator, W22 cost math, runtime loop-detection heuristic,
+plan/structural checks) still behave correctly on a set of committed
+captured-shape scenarios. It runs in under a second and never hits the
+network.
+
+```bash
+bun run eval                                                  # convenience
+cargo test --test agent_eval --manifest-path src-tauri/Cargo.toml
+```
+
+Scenarios live in `src-tauri/tests/fixtures/agent_evals/*.yaml`. Add a
+new YAML, list its assertions, and the test binary picks it up
+automatically. Live-mode evals (`--features expensive_evals`) are
+documented as a v2 deferral in `docs/W24_AGENT_EVAL_SUITE.md`.
+
 Expected baseline notes:
 
 - `bun run build` may report a non-failing Vite chunk-size warning.

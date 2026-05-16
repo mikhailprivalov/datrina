@@ -1,0 +1,87 @@
+id: system_monitor_grouped
+description: |
+  Multiple widgets sharing one upstream datasource via shared_datasources.
+  Validates the W19 shared-key plumbing: a SharedDatasource named
+  `system_metrics` is declared once and consumed by three widgets via
+  `datasource_plan.source_key`.
+
+trace:
+  proposal:
+    id: prop-system-monitor
+    title: System monitor
+    summary: CPU / memory / disk from one shared source.
+    shared_datasources:
+      - key: system_metrics
+        kind: mcp_tool
+        server_id: system-mcp
+        tool_name: snapshot
+        arguments: {}
+        pipeline:
+          - { kind: pick, path: metrics }
+        label: Host snapshot
+    widgets:
+      - widget_type: stat
+        title: CPU usage
+        data: 0
+        datasource_plan:
+          kind: shared
+          source_key: system_metrics
+          pipeline:
+            - { kind: pick, path: cpu_percent }
+        config: {}
+      - widget_type: stat
+        title: Memory usage
+        data: 0
+        datasource_plan:
+          kind: shared
+          source_key: system_metrics
+          pipeline:
+            - { kind: pick, path: memory_percent }
+        config: {}
+      - widget_type: stat
+        title: Disk usage
+        data: 0
+        datasource_plan:
+          kind: shared
+          source_key: system_metrics
+          pipeline:
+            - { kind: pick, path: disk_percent }
+        config: {}
+  tool_calls:
+    - call_id: c-cpu
+      name: dry_run_widget
+      arguments: { proposal: { title: CPU usage } }
+      result: { status: ok, value: 17 }
+    - call_id: c-mem
+      name: dry_run_widget
+      arguments: { proposal: { title: Memory usage } }
+      result: { status: ok, value: 48 }
+    - call_id: c-disk
+      name: dry_run_widget
+      arguments: { proposal: { title: Disk usage } }
+      result: { status: ok, value: 62 }
+  plan:
+    summary: Shared snapshot fans out to three stats.
+    steps:
+      - { id: s1, title: Snapshot host, kind: fetch }
+      - { id: s2, title: Wire widgets, kind: design }
+      - { id: s3, title: Dry-run each, kind: test }
+      - { id: s4, title: Propose, kind: propose }
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 4500
+    completion: 1100
+
+assertions:
+  - kind: validator_passes
+  - kind: proposal_widget
+    count: 3
+    widget_type: stat
+    has_datasource_plan: true
+  - kind: tool_called
+    name: dry_run_widget
+    min_count: 3
+  - kind: no_hardcoded_literals
+  - kind: cost_lt_usd
+    value: 0.30

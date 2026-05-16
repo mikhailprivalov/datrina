@@ -1,13 +1,16 @@
 use anyhow::{anyhow, Result as AnyResult};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_notification::NotificationExt;
 use tracing::info;
 
+use crate::models::alert::{AlertEvent, ALERT_EVENT_CHANNEL};
 use crate::models::dashboard::{
     AddWidgetRequest, ApplyBuildChangeRequest, ApplyBuildProposalRequest, BuildChangeAction,
     BuildDatasourcePlan, BuildDatasourcePlanKind, BuildWidgetProposal, BuildWidgetType,
-    CreateDashboardRequest, CreateDashboardTemplate, Dashboard, DashboardWidgetType,
-    UpdateDashboardRequest,
+    CreateDashboardRequest, CreateDashboardTemplate, Dashboard, DashboardDiff, DashboardVersion,
+    DashboardVersionSummary, DashboardWidgetType, JsonPathChange, UpdateDashboardRequest,
+    VersionSource, WidgetDiff, WidgetSummary,
 };
 use crate::models::widget::{
     ChartConfig, ChartKind, ColumnFormat, DatasourceConfig, GaugeConfig, GaugeThreshold,
@@ -18,9 +21,11 @@ use crate::models::workflow::{
     WORKFLOW_EVENT_CHANNEL,
 };
 use crate::models::ApiResult;
+use crate::modules::alert_engine;
+use crate::modules::parameter_engine::{self, ResolvedParameters, SubstituteOptions};
 use crate::modules::scheduler::ScheduledRuntime;
 use crate::modules::workflow_engine::WorkflowEngine;
-use crate::AppState;
+use crate::{AppState, ReflectionPending};
 
 #[tauri::command]
 pub async fn list_dashboards(
@@ -65,6 +70,7 @@ pub async fn create_dashboard(
         is_default: false,
         created_at: now,
         updated_at: now,
+        parameters: Vec::new(),
     };
 
     Ok(
@@ -84,12 +90,13 @@ pub async fn update_dashboard(
     id: String,
     req: UpdateDashboardRequest,
 ) -> Result<ApiResult<Dashboard>, String> {
-    let mut dashboard = match state.storage.get_dashboard(&id).await {
+    let original = match state.storage.get_dashboard(&id).await {
         Ok(Some(d)) => d,
         Ok(None) => return Ok(ApiResult::err("Dashboard not found".to_string())),
         Err(e) => return Ok(ApiResult::err(e.to_string())),
     };
 
+    let mut dashboard = original.clone();
     if let Some(name) = req.name {
         dashboard.name = name;
     }
@@ -104,10 +111,58 @@ pub async fn update_dashboard(
     }
     dashboard.updated_at = chrono::Utc::now().timestamp_millis();
 
+    // W19: snapshot the pre-edit state before persisting. We only snapshot
+    // when something actually changed (layout/name/description/workflows)
+    // so non-mutating round-trips do not pollute history. updated_at is
+    // ignored for that check.
+    let summary = update_summary(&original, &dashboard);
+    if let Some(summary) = summary {
+        if let Err(error) = record_dashboard_version(
+            &state,
+            &original,
+            VersionSource::ManualEdit,
+            &summary,
+            None,
+            None,
+        )
+        .await
+        {
+            return Ok(ApiResult::err(error.to_string()));
+        }
+    }
+
     Ok(match state.storage.update_dashboard(&dashboard).await {
         Ok(()) => ApiResult::ok(dashboard),
         Err(e) => ApiResult::err(e.to_string()),
     })
+}
+
+fn update_summary(before: &Dashboard, after: &Dashboard) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if before.name != after.name {
+        parts.push("name".to_string());
+    }
+    if before.description != after.description {
+        parts.push("description".to_string());
+    }
+    if before.layout.len() != after.layout.len() {
+        parts.push(format!(
+            "widgets ({} → {})",
+            before.layout.len(),
+            after.layout.len()
+        ));
+    } else if serde_json::to_value(&before.layout).ok() != serde_json::to_value(&after.layout).ok()
+    {
+        parts.push("layout".to_string());
+    }
+    if serde_json::to_value(&before.workflows).ok() != serde_json::to_value(&after.workflows).ok() {
+        parts.push("workflows".to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("Manual edit: {}", parts.join(", ")))
+    }
 }
 
 #[tauri::command]
@@ -208,6 +263,25 @@ pub async fn delete_dashboard(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<ApiResult<bool>, String> {
+    // W19: capture a final pre_delete snapshot so an accidental delete is
+    // recoverable via the version list. SQLite FKs are not enforced in
+    // this build, so the version row survives the cascade and can be
+    // queried back. Failure to snapshot is logged but does not block the
+    // delete since the user explicitly asked for it.
+    if let Ok(Some(dashboard)) = state.storage.get_dashboard(&id).await {
+        if let Err(error) = record_dashboard_version(
+            &state,
+            &dashboard,
+            VersionSource::PreDelete,
+            "Pre-delete snapshot",
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!("failed to record pre-delete snapshot for {}: {}", id, error);
+        }
+    }
     Ok(match state.storage.delete_dashboard(&id).await {
         Ok(()) => ApiResult::ok(true),
         Err(e) => ApiResult::err(e.to_string()),
@@ -246,6 +320,11 @@ pub async fn dry_run_widget(
     state: State<'_, AppState>,
     proposal: crate::models::dashboard::BuildWidgetProposal,
     shared_datasources: Option<Vec<crate::models::dashboard::SharedDatasource>>,
+    // W25: optional parameter declarations + values for the dry-run path.
+    parameters: Option<Vec<crate::models::dashboard::DashboardParameter>>,
+    parameter_values: Option<
+        std::collections::BTreeMap<String, crate::models::dashboard::ParameterValue>,
+    >,
 ) -> Result<ApiResult<WidgetDryRunResult>, String> {
     let resolved = match inline_shared_into_widget(proposal, shared_datasources.unwrap_or_default())
     {
@@ -263,19 +342,27 @@ pub async fn dry_run_widget(
             }));
         }
     };
-    Ok(match dry_run_widget_inner(&state, &resolved).await {
-        Ok(result) => ApiResult::ok(result),
-        Err(error) => ApiResult::ok(WidgetDryRunResult {
-            status: "error".to_string(),
-            widget_runtime: None,
-            raw_output: None,
-            error: Some(error.to_string()),
-            duration_ms: 0,
-            pipeline_steps: 0,
-            has_llm_step: false,
-            workflow_node_ids: Vec::new(),
-        }),
-    })
+    let resolved_params = match (parameters, parameter_values) {
+        (Some(params), Some(values)) => ResolvedParameters::resolve(&params, &values).ok(),
+        (Some(params), None) => ResolvedParameters::resolve(&params, &Default::default()).ok(),
+        (None, Some(values)) => Some(ResolvedParameters::from_map(values)),
+        (None, None) => None,
+    };
+    Ok(
+        match dry_run_widget_inner(&state, &resolved, resolved_params.as_ref()).await {
+            Ok(result) => ApiResult::ok(result),
+            Err(error) => ApiResult::ok(WidgetDryRunResult {
+                status: "error".to_string(),
+                widget_runtime: None,
+                raw_output: None,
+                error: Some(error.to_string()),
+                duration_ms: 0,
+                pipeline_steps: 0,
+                has_llm_step: false,
+                workflow_node_ids: Vec::new(),
+            }),
+        },
+    )
 }
 
 /// If the widget's datasource_plan is kind='shared', resolve it against the
@@ -328,6 +415,7 @@ pub(crate) fn inline_shared_into_widget(
 async fn dry_run_widget_inner(
     state: &State<'_, AppState>,
     proposal: &crate::models::dashboard::BuildWidgetProposal,
+    resolved_params: Option<&ResolvedParameters>,
 ) -> AnyResult<WidgetDryRunResult> {
     let now = chrono::Utc::now().timestamp_millis();
     let pipeline_steps = proposal
@@ -348,11 +436,15 @@ async fn dry_run_widget_inner(
         })
         .unwrap_or(false);
 
-    let (widget, workflow) = proposal_widget(proposal, 0, now)?;
+    let (widget, mut workflow) = proposal_widget(proposal, 0, now)?;
     let datasource = widget
         .datasource()
         .ok_or_else(|| anyhow!("Widget has no datasource workflow"))?;
     let workflow_node_ids: Vec<String> = workflow.nodes.iter().map(|n| n.id.clone()).collect();
+
+    if let Some(params) = resolved_params {
+        parameter_engine::substitute_workflow(&mut workflow, params, SubstituteOptions::default());
+    }
 
     reconnect_enabled_mcp_servers(state).await?;
     let started = std::time::Instant::now();
@@ -458,6 +550,10 @@ async fn apply_build_proposal_inner(
         ));
     }
 
+    // W18: collected at every replacement/append site so the post-apply
+    // reflection registry can index by widget_id. We need `replaced` to
+    // tell the reflection turn whether the widget is fresh or edited.
+    let mut reflection_targets: Vec<(String, String, &'static str, bool)> = Vec::new();
     let now = chrono::Utc::now().timestamp_millis();
 
     // Pre-process shared datasources: pre-assign workflow_ids and consumer
@@ -527,11 +623,27 @@ async fn apply_build_proposal_inner(
         shared_workflows.push(workflow);
     }
     let mut dashboard = match req.dashboard_id.as_deref() {
-        Some(id) => state
-            .storage
-            .get_dashboard(id)
-            .await?
-            .ok_or_else(|| anyhow!("Dashboard not found"))?,
+        Some(id) => {
+            let existing = state
+                .storage
+                .get_dashboard(id)
+                .await?
+                .ok_or_else(|| anyhow!("Dashboard not found"))?;
+            // W19: snapshot the pre-apply state so the user can Undo or
+            // restore. `session_id` is recorded so the History drawer can
+            // jump back to the chat that produced the snapshot.
+            let summary = proposal_summary(&req);
+            record_dashboard_version(
+                state,
+                &existing,
+                VersionSource::AgentApply,
+                &summary,
+                req.session_id.as_deref(),
+                None,
+            )
+            .await?;
+            existing
+        }
         None => Dashboard {
             id: uuid::Uuid::new_v4().to_string(),
             name: req
@@ -550,6 +662,7 @@ async fn apply_build_proposal_inner(
             is_default: false,
             created_at: now,
             updated_at: now,
+            parameters: Vec::new(),
         },
     };
 
@@ -620,6 +733,7 @@ async fn apply_build_proposal_inner(
                         workflow_id: shared_workflow_id,
                         output_key: format!("output_{}.data", widget_id),
                         post_process: None,
+                        capture_traces: false,
                     };
                     (
                         build_widget_shell(
@@ -646,7 +760,11 @@ async fn apply_build_proposal_inner(
                     schedule_workflow_if_cron(app, state, workflow.clone()).await?;
                     dashboard.workflows.push(workflow);
                 }
+                let replaced_id = widget.id().to_string();
+                let replaced_title = widget.title().to_string();
+                let replaced_kind = widget_kind_label(&widget);
                 dashboard.layout[index] = widget;
+                reflection_targets.push((replaced_id, replaced_title, replaced_kind, true));
                 continue;
             }
             // replace_widget_id pointed at a widget that no longer exists -
@@ -662,6 +780,7 @@ async fn apply_build_proposal_inner(
                 workflow_id: shared_workflow_id,
                 output_key: format!("output_{}.data", widget_id),
                 post_process: None,
+                capture_traces: false,
             };
             (
                 build_widget_shell(widget_proposal, auto_cursor_y, widget_id, Some(datasource))?,
@@ -700,8 +819,27 @@ async fn apply_build_proposal_inner(
             schedule_workflow_if_cron(app, state, workflow.clone()).await?;
             dashboard.workflows.push(workflow);
         }
+        let added_id = widget.id().to_string();
+        let added_title = widget.title().to_string();
+        let added_kind = widget_kind_label(&widget);
         dashboard.layout.push(widget);
+        reflection_targets.push((added_id, added_title, added_kind, false));
     }
+    // W25: merge proposed parameters into the dashboard. Existing entries
+    // with the same `id` are replaced; new ones are appended. An empty
+    // `proposal.parameters` list is a no-op (preserves existing).
+    for proposed in &req.proposal.parameters {
+        if let Some(existing) = dashboard
+            .parameters
+            .iter_mut()
+            .find(|p| p.id == proposed.id)
+        {
+            *existing = proposed.clone();
+        } else {
+            dashboard.parameters.push(proposed.clone());
+        }
+    }
+
     dashboard.updated_at = now;
 
     if req.dashboard_id.is_some() {
@@ -710,7 +848,44 @@ async fn apply_build_proposal_inner(
         state.storage.create_dashboard(&dashboard).await?;
     }
 
+    // W18: register a one-shot reflection job for each widget the agent
+    // just shipped, scoped to the chat session that produced the
+    // proposal. The first successful `refresh_widget` for any of these
+    // ids consumes the entry and triggers `enqueue_reflection_turn`.
+    if let Some(session_id) = req.session_id.as_deref() {
+        let dashboard_id = dashboard.id.clone();
+        for (widget_id, title, kind, replaced) in reflection_targets {
+            state.pending_reflections.insert(
+                widget_id.clone(),
+                ReflectionPending {
+                    session_id: session_id.to_string(),
+                    dashboard_id: dashboard_id.clone(),
+                    widget_id,
+                    widget_title: title,
+                    widget_kind: kind,
+                    replaced,
+                    applied_at: now,
+                },
+            );
+        }
+    }
+
     Ok(dashboard)
+}
+
+pub(crate) fn widget_kind_label(widget: &Widget) -> &'static str {
+    match widget {
+        Widget::Chart { .. } => "chart",
+        Widget::Text { .. } => "text",
+        Widget::Table { .. } => "table",
+        Widget::Image { .. } => "image",
+        Widget::Gauge { .. } => "gauge",
+        Widget::Stat { .. } => "stat",
+        Widget::Logs { .. } => "logs",
+        Widget::BarGauge { .. } => "bar_gauge",
+        Widget::StatusGrid { .. } => "status_grid",
+        Widget::Heatmap { .. } => "heatmap",
+    }
 }
 
 pub(crate) fn proposal_widget_public(
@@ -768,6 +943,7 @@ fn proposal_widget(
         workflow_id,
         output_key: "output.data".to_string(),
         post_process: None,
+        capture_traces: false,
     });
     let widget = build_widget_shell(proposal, default_y, widget_id, datasource)?;
     Ok((widget, workflow))
@@ -1451,7 +1627,7 @@ async fn refresh_widget_inner(
         ));
     }
 
-    let workflow = match state.storage.get_workflow(&datasource.workflow_id).await? {
+    let mut workflow = match state.storage.get_workflow(&datasource.workflow_id).await? {
         Some(workflow) => workflow,
         None => dashboard
             .workflows
@@ -1460,6 +1636,24 @@ async fn refresh_widget_inner(
             .cloned()
             .ok_or_else(|| anyhow!("Datasource workflow not found"))?,
     };
+
+    // W25: resolve dashboard parameters and substitute `$name` tokens in
+    // node configs before execution so refresh picks up the current
+    // dropdown values.
+    if !dashboard.parameters.is_empty() {
+        let selected = state
+            .storage
+            .get_dashboard_parameter_values(dashboard_id)
+            .await
+            .unwrap_or_default();
+        if let Ok(resolved) = ResolvedParameters::resolve(&dashboard.parameters, &selected) {
+            parameter_engine::substitute_workflow(
+                &mut workflow,
+                &resolved,
+                SubstituteOptions::default(),
+            );
+        }
+    }
 
     reconnect_enabled_mcp_servers(state).await?;
     let engine = WorkflowEngine::with_runtime(
@@ -1496,11 +1690,211 @@ async fn refresh_widget_inner(
         .ok_or_else(|| anyhow!("Workflow output '{}' not found", datasource.output_key))?;
     let data = widget_runtime_data(widget, output)?;
 
+    // W23: capture pipeline trace if the widget opted in. Best-effort —
+    // errors are logged but never fail the refresh.
+    if datasource.capture_traces {
+        crate::commands::debug::capture_trace_after_refresh(state, dashboard_id, widget_id).await;
+    }
+
+    // W21: evaluate alerts against the rendered runtime data. Errors
+    // here must not fail the refresh — they're surfaced via tracing only.
+    if let Err(error) =
+        evaluate_widget_alerts(&app, state, dashboard_id, widget_id, widget.title(), &data).await
+    {
+        tracing::warn!(
+            "alert evaluation failed for widget {}: {}",
+            widget_id,
+            error
+        );
+    }
+
+    // W18: if a reflection job is pending for this widget, fire one
+    // post-apply reflection turn. The 5-minute staleness window matches
+    // the workflow-stuck threshold flagged in the spec; older entries
+    // are dropped silently and will be picked up by W21 alerts instead.
+    if let Some((widget_id_key, pending)) = state.pending_reflections.remove(widget_id) {
+        const REFLECTION_STALENESS_MS: i64 = 5 * 60 * 1000;
+        if chrono::Utc::now().timestamp_millis() - pending.applied_at < REFLECTION_STALENESS_MS {
+            crate::commands::chat::enqueue_reflection_turn(
+                app.clone(),
+                state.inner().clone(),
+                pending,
+                data.clone(),
+            );
+        } else {
+            tracing::info!(
+                "skipping post-apply reflection for stale widget {}",
+                widget_id_key
+            );
+        }
+    }
+
     Ok(json!({
         "status": "ok",
         "workflow_run_id": run.id,
         "data": data,
     }))
+}
+
+/// W21: post-refresh alert pass. Walks every alert configured for
+/// `widget_id`, applies cooldown, persists firing events, emits a UI
+/// event + OS notification, and (for autonomous triggers) spawns a
+/// background chat session capped by `max_runs_per_day`.
+async fn evaluate_widget_alerts(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    dashboard_id: &str,
+    widget_id: &str,
+    widget_title: &str,
+    data: &Value,
+) -> AnyResult<()> {
+    let alerts = state.storage.get_widget_alerts(widget_id).await?;
+    if alerts.is_empty() {
+        return Ok(());
+    }
+    let last_fired = state.storage.last_fired_at_for_widget(widget_id).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let fired = alert_engine::evaluate(&alerts, data, &last_fired, now);
+    if fired.is_empty() {
+        return Ok(());
+    }
+
+    for hit in fired {
+        // 1) Optionally spawn the autonomous turn first so we can record
+        //    the session id alongside the event. Budget = number of
+        //    autonomous spawns for this alert in the last 24h.
+        let mut triggered_session_id: Option<String> = None;
+        if let Some(action) = hit.alert.agent_action.clone() {
+            let since = now - 24 * 60 * 60 * 1000;
+            let already_spawned = state
+                .storage
+                .count_agent_actions_in_window(&hit.alert.id, since)
+                .await
+                .unwrap_or(0);
+            if (already_spawned as u32) < action.max_runs_per_day {
+                let prompt = render_agent_prompt(
+                    &action.prompt_template,
+                    widget_title,
+                    &hit.message,
+                    &hit.context,
+                );
+                let title = format!("[alert] {}", hit.alert.name);
+                match crate::commands::chat::spawn_autonomous_alert_turn(
+                    app.clone(),
+                    state.inner().clone(),
+                    action.mode,
+                    Some(dashboard_id.to_string()),
+                    Some(widget_id.to_string()),
+                    title,
+                    prompt,
+                    Some(action.max_cost_usd),
+                )
+                .await
+                {
+                    Ok(session_id) => triggered_session_id = Some(session_id),
+                    Err(error) => tracing::warn!(
+                        "autonomous alert turn failed for alert {}: {}",
+                        hit.alert.id,
+                        error
+                    ),
+                }
+            } else {
+                tracing::info!(
+                    "autonomous alert turn skipped for {} — daily budget {} exhausted",
+                    hit.alert.id,
+                    action.max_runs_per_day
+                );
+            }
+        }
+
+        // 2) Persist the event.
+        let event = AlertEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            widget_id: widget_id.to_string(),
+            dashboard_id: dashboard_id.to_string(),
+            alert_id: hit.alert.id.clone(),
+            fired_at: now,
+            severity: hit.severity,
+            message: hit.message.clone(),
+            context: hit.context.clone(),
+            acknowledged_at: None,
+            triggered_session_id: triggered_session_id.clone(),
+        };
+        if let Err(error) = state.storage.insert_alert_event(&event).await {
+            tracing::warn!("failed to persist alert event {}: {}", event.id, error);
+            continue;
+        }
+
+        // 3) Emit UI event + fire OS notification. Failure here is
+        //    non-fatal; the event is already in the DB so the UI will
+        //    catch up on the next refresh.
+        if let Err(error) = app.emit(ALERT_EVENT_CHANNEL, &event) {
+            tracing::warn!("failed to emit alert event: {}", error);
+        }
+        let notify_title = format!("{} • {}", widget_title, hit.alert.name);
+        if let Err(error) = app
+            .notification()
+            .builder()
+            .title(notify_title)
+            .body(hit.message.clone())
+            .show()
+        {
+            tracing::warn!("OS notification failed for alert {}: {}", event.id, error);
+        }
+    }
+    Ok(())
+}
+
+fn render_agent_prompt(
+    template: &str,
+    widget_title: &str,
+    message: &str,
+    context: &Value,
+) -> String {
+    let value = context
+        .get("value")
+        .map(value_to_string)
+        .unwrap_or_default();
+    let path = context
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let threshold = context
+        .get("threshold")
+        .map(value_to_string)
+        .unwrap_or_default();
+    let mut out = template.to_string();
+    for (placeholder, replacement) in [
+        ("{widget}", widget_title),
+        ("{message}", message),
+        ("{value}", value.as_str()),
+        ("{path}", path.as_str()),
+        ("{threshold}", threshold.as_str()),
+    ] {
+        out = out.replace(placeholder, replacement);
+    }
+    if out.trim().is_empty() {
+        return format!(
+            "Alert fired on widget \"{}\". Message: {}. Suggest next steps.",
+            widget_title, message
+        );
+    }
+    out
+}
+
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) async fn active_provider_public(
+    state: &State<'_, AppState>,
+) -> AnyResult<Option<crate::models::provider::LLMProvider>> {
+    active_provider(state).await
 }
 
 async fn active_provider(
@@ -2142,6 +2536,7 @@ pub(crate) fn local_mvp_slice(now: i64) -> (Vec<Widget>, Vec<Workflow>) {
             workflow_id,
             output_key: "output.value".to_string(),
             post_process: None,
+            capture_traces: false,
         }),
     };
 
@@ -2176,6 +2571,7 @@ fn local_text_widget(title: String, content: String, y: i32, now: i64) -> (Widge
             workflow_id,
             output_key: "output.content".to_string(),
             post_process: None,
+            capture_traces: false,
         }),
     };
 
@@ -2227,6 +2623,7 @@ fn local_gauge_widget(title: String, value: f64, y: i32, now: i64) -> (Widget, W
             workflow_id,
             output_key: "output.value".to_string(),
             post_process: None,
+            capture_traces: false,
         }),
     };
 
@@ -2282,6 +2679,350 @@ fn single_output_workflow(
     }
 }
 
+// ─── W19: snapshot helper + version commands ─────────────────────────────────
+
+/// Persist a snapshot of `dashboard` before any state-changing mutation.
+/// Returns the new version row's summary (the inserted `id` is also
+/// referenced through that summary). Callers pass `parent_version_id` for
+/// restores so the heuristic in W18 reflection can correlate them.
+async fn record_dashboard_version(
+    state: &State<'_, AppState>,
+    dashboard: &Dashboard,
+    source: VersionSource,
+    summary: &str,
+    source_session_id: Option<&str>,
+    parent_version_id: Option<&str>,
+) -> AnyResult<DashboardVersionSummary> {
+    let version_id = uuid::Uuid::new_v4().to_string();
+    let applied_at = chrono::Utc::now().timestamp_millis();
+    let saved = state
+        .storage
+        .insert_dashboard_version(
+            &version_id,
+            dashboard,
+            source,
+            summary,
+            source_session_id,
+            parent_version_id,
+            applied_at,
+        )
+        .await?;
+    Ok(saved)
+}
+
+fn proposal_summary(req: &ApplyBuildProposalRequest) -> String {
+    if let Some(summary) = req
+        .proposal
+        .summary
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return summary.trim().to_string();
+    }
+    let title = req.proposal.title.trim();
+    if !title.is_empty() {
+        return format!("Agent apply: {title}");
+    }
+    let added = req.proposal.widgets.len();
+    let removed = req.proposal.remove_widget_ids.len();
+    format!("Agent apply (+{added}/-{removed})")
+}
+
+#[tauri::command]
+pub async fn list_dashboard_versions(
+    state: State<'_, AppState>,
+    dashboard_id: String,
+) -> Result<ApiResult<Vec<DashboardVersionSummary>>, String> {
+    Ok(
+        match state.storage.list_dashboard_versions(&dashboard_id).await {
+            Ok(versions) => ApiResult::ok(versions),
+            Err(e) => ApiResult::err(e.to_string()),
+        },
+    )
+}
+
+#[tauri::command]
+pub async fn get_dashboard_version(
+    state: State<'_, AppState>,
+    version_id: String,
+) -> Result<ApiResult<DashboardVersion>, String> {
+    Ok(
+        match state.storage.get_dashboard_version(&version_id).await {
+            Ok(Some(version)) => ApiResult::ok(version),
+            Ok(None) => ApiResult::err("Version not found".to_string()),
+            Err(e) => ApiResult::err(e.to_string()),
+        },
+    )
+}
+
+#[tauri::command]
+pub async fn diff_dashboard_versions(
+    state: State<'_, AppState>,
+    from_id: String,
+    to_id: String,
+) -> Result<ApiResult<DashboardDiff>, String> {
+    Ok(match diff_versions_inner(&state, &from_id, &to_id).await {
+        Ok(diff) => ApiResult::ok(diff),
+        Err(e) => ApiResult::err(e.to_string()),
+    })
+}
+
+async fn diff_versions_inner(
+    state: &State<'_, AppState>,
+    from_id: &str,
+    to_id: &str,
+) -> AnyResult<DashboardDiff> {
+    let from = state
+        .storage
+        .get_dashboard_version(from_id)
+        .await?
+        .ok_or_else(|| anyhow!("from version not found"))?;
+    let to = state
+        .storage
+        .get_dashboard_version(to_id)
+        .await?
+        .ok_or_else(|| anyhow!("to version not found"))?;
+    Ok(compute_dashboard_diff(
+        &from.snapshot,
+        &to.snapshot,
+        from_id,
+        to_id,
+    ))
+}
+
+#[tauri::command]
+pub async fn restore_dashboard_version(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    version_id: String,
+) -> Result<ApiResult<Dashboard>, String> {
+    Ok(
+        match restore_dashboard_version_inner(&app, &state, &version_id).await {
+            Ok(dashboard) => ApiResult::ok(dashboard),
+            Err(e) => ApiResult::err(e.to_string()),
+        },
+    )
+}
+
+async fn restore_dashboard_version_inner(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    version_id: &str,
+) -> AnyResult<Dashboard> {
+    let target = state
+        .storage
+        .get_dashboard_version(version_id)
+        .await?
+        .ok_or_else(|| anyhow!("Version not found"))?;
+    let current = state
+        .storage
+        .get_dashboard(&target.dashboard_id)
+        .await?
+        .ok_or_else(|| anyhow!("Dashboard no longer exists; cannot restore"))?;
+
+    record_dashboard_version(
+        state,
+        &current,
+        VersionSource::Restore,
+        &format!("Restored from {}", short_version_id(version_id)),
+        None,
+        Some(version_id),
+    )
+    .await?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut restored = target.snapshot.clone();
+    restored.updated_at = now;
+
+    apply_workflow_swap(app, state, &current, &restored).await?;
+    state.storage.update_dashboard(&restored).await?;
+
+    Ok(restored)
+}
+
+fn short_version_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Make storage + scheduler match `restored.workflows` exactly. Workflows
+/// only in the current dashboard are unscheduled + deleted; workflows in
+/// the restored snapshot are upserted and rescheduled if they have a cron.
+/// Errors on unschedule/delete are tolerated so a stale scheduler entry
+/// does not block a restore.
+async fn apply_workflow_swap(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    current: &Dashboard,
+    restored: &Dashboard,
+) -> AnyResult<()> {
+    let restored_ids: std::collections::HashSet<&str> =
+        restored.workflows.iter().map(|w| w.id.as_str()).collect();
+
+    for workflow in &current.workflows {
+        if !restored_ids.contains(workflow.id.as_str()) {
+            let _ = state.scheduler.lock().await.unschedule(&workflow.id).await;
+            if let Err(error) = state.storage.delete_workflow(&workflow.id).await {
+                tracing::warn!(
+                    "restore: failed to delete workflow {}: {}",
+                    workflow.id,
+                    error
+                );
+            }
+        }
+    }
+
+    for workflow in &restored.workflows {
+        state.storage.upsert_workflow(workflow).await?;
+        let _ = state.scheduler.lock().await.unschedule(&workflow.id).await;
+        schedule_workflow_if_cron(app, state, workflow.clone()).await?;
+    }
+    Ok(())
+}
+
+fn compute_dashboard_diff(
+    from: &Dashboard,
+    to: &Dashboard,
+    from_id: &str,
+    to_id: &str,
+) -> DashboardDiff {
+    use std::collections::HashMap;
+
+    let from_widgets: HashMap<&str, &Widget> = from.layout.iter().map(|w| (w.id(), w)).collect();
+    let to_widgets: HashMap<&str, &Widget> = to.layout.iter().map(|w| (w.id(), w)).collect();
+
+    let added_widgets = to
+        .layout
+        .iter()
+        .filter(|w| !from_widgets.contains_key(w.id()))
+        .map(widget_summary)
+        .collect::<Vec<_>>();
+    let removed_widgets = from
+        .layout
+        .iter()
+        .filter(|w| !to_widgets.contains_key(w.id()))
+        .map(widget_summary)
+        .collect::<Vec<_>>();
+
+    let mut modified_widgets = Vec::new();
+    for (id, from_w) in &from_widgets {
+        if let Some(to_w) = to_widgets.get(*id) {
+            if let Some(diff) = widget_diff(from_w, to_w) {
+                modified_widgets.push(diff);
+            }
+        }
+    }
+
+    let name_changed = if from.name != to.name {
+        Some((from.name.clone(), to.name.clone()))
+    } else {
+        None
+    };
+    let description_changed = if from.description != to.description {
+        Some((from.description.clone(), to.description.clone()))
+    } else {
+        None
+    };
+
+    let layout_changed = from.layout.len() != to.layout.len()
+        || from.layout.iter().any(|fw| {
+            to_widgets.get(fw.id()).is_none_or(|tw| {
+                let fp = existing_position(fw);
+                let tp = existing_position(tw);
+                fp.x != tp.x || fp.y != tp.y || fp.w != tp.w || fp.h != tp.h
+            })
+        });
+
+    DashboardDiff {
+        from_version_id: from_id.to_string(),
+        to_version_id: to_id.to_string(),
+        added_widgets,
+        removed_widgets,
+        modified_widgets,
+        name_changed,
+        description_changed,
+        layout_changed,
+    }
+}
+
+fn widget_summary(widget: &Widget) -> WidgetSummary {
+    WidgetSummary {
+        id: widget.id().to_string(),
+        title: widget.title().to_string(),
+        kind: widget_kind_label(widget).to_string(),
+    }
+}
+
+fn widget_diff(from: &Widget, to: &Widget) -> Option<WidgetDiff> {
+    let from_kind = widget_kind_label(from).to_string();
+    let to_kind = widget_kind_label(to).to_string();
+    let kind_changed = if from_kind != to_kind {
+        Some((from_kind.clone(), to_kind.clone()))
+    } else {
+        None
+    };
+    let title_changed = if from.title() != to.title() {
+        Some((from.title().to_string(), to.title().to_string()))
+    } else {
+        None
+    };
+
+    let from_value = serde_json::to_value(from).unwrap_or(Value::Null);
+    let to_value = serde_json::to_value(to).unwrap_or(Value::Null);
+    let mut config_changes = Vec::new();
+    if let (Some(from_obj), Some(to_obj)) = (from_value.get("config"), to_value.get("config")) {
+        diff_json("config", from_obj, to_obj, &mut config_changes);
+    }
+    let datasource_plan_changed = from_value.get("datasource") != to_value.get("datasource");
+
+    if kind_changed.is_none()
+        && title_changed.is_none()
+        && config_changes.is_empty()
+        && !datasource_plan_changed
+    {
+        return None;
+    }
+
+    Some(WidgetDiff {
+        widget_id: from.id().to_string(),
+        widget_title: to.title().to_string(),
+        kind_changed,
+        title_changed,
+        config_changes,
+        datasource_plan_changed,
+    })
+}
+
+/// Recursive JSON-Pointer-style diff. Records a leaf change whenever
+/// values differ; for objects, also reports keys present on only one side.
+fn diff_json(path: &str, from: &Value, to: &Value, out: &mut Vec<JsonPathChange>) {
+    if from == to {
+        return;
+    }
+    match (from, to) {
+        (Value::Object(from_map), Value::Object(to_map)) => {
+            let mut keys: std::collections::BTreeSet<&String> = from_map.keys().collect();
+            keys.extend(to_map.keys());
+            for key in keys {
+                let next_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let from_v = from_map.get(key).cloned().unwrap_or(Value::Null);
+                let to_v = to_map.get(key).cloned().unwrap_or(Value::Null);
+                diff_json(&next_path, &from_v, &to_v, out);
+            }
+        }
+        _ => {
+            out.push(JsonPathChange {
+                path: path.to_string(),
+                before: from.clone(),
+                after: to.clone(),
+            });
+        }
+    }
+}
+
 pub(crate) trait WidgetDatasource {
     fn datasource(&self) -> Option<&DatasourceConfig>;
 }
@@ -2301,4 +3042,187 @@ impl WidgetDatasource for Widget {
             | Widget::Heatmap { datasource, .. } => datasource.as_ref(),
         }
     }
+}
+
+// ─── W25: Dashboard parameter commands ──────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DashboardParameterState {
+    pub parameter: crate::models::dashboard::DashboardParameter,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<crate::models::dashboard::ParameterValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<crate::models::dashboard::ParameterOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_dashboard_parameters(
+    state: State<'_, AppState>,
+    dashboard_id: String,
+) -> Result<ApiResult<Vec<DashboardParameterState>>, String> {
+    let result = list_dashboard_parameters_inner(&state, &dashboard_id).await;
+    Ok(match result {
+        Ok(state) => ApiResult::ok(state),
+        Err(error) => ApiResult::err(error.to_string()),
+    })
+}
+
+async fn list_dashboard_parameters_inner(
+    state: &State<'_, AppState>,
+    dashboard_id: &str,
+) -> AnyResult<Vec<DashboardParameterState>> {
+    let dashboard = state
+        .storage
+        .get_dashboard(dashboard_id)
+        .await?
+        .ok_or_else(|| anyhow!("Dashboard not found"))?;
+    let selections = state
+        .storage
+        .get_dashboard_parameter_values(dashboard_id)
+        .await
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(dashboard.parameters.len());
+    for param in &dashboard.parameters {
+        let value = selections.get(&param.name).cloned();
+        let (options, options_error) = match &param.kind {
+            crate::models::dashboard::DashboardParameterKind::StaticList { options } => {
+                (options.clone(), None)
+            }
+            _ => (Vec::new(), None),
+        };
+        out.push(DashboardParameterState {
+            parameter: param.clone(),
+            value,
+            options,
+            options_error,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn get_dashboard_parameter_values(
+    state: State<'_, AppState>,
+    dashboard_id: String,
+) -> Result<
+    ApiResult<std::collections::BTreeMap<String, crate::models::dashboard::ParameterValue>>,
+    String,
+> {
+    Ok(
+        match state
+            .storage
+            .get_dashboard_parameter_values(&dashboard_id)
+            .await
+        {
+            Ok(values) => ApiResult::ok(values),
+            Err(error) => ApiResult::err(error.to_string()),
+        },
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SetDashboardParameterResult {
+    pub affected_widget_ids: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn set_dashboard_parameter_value(
+    state: State<'_, AppState>,
+    dashboard_id: String,
+    param_name: String,
+    value: crate::models::dashboard::ParameterValue,
+) -> Result<ApiResult<SetDashboardParameterResult>, String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let outcome = async {
+        state
+            .storage
+            .set_dashboard_parameter_value(&dashboard_id, &param_name, &value, now)
+            .await?;
+        // Compute affected widgets by walking every widget's datasource
+        // workflow for `$param_name` references.
+        let dashboard = state
+            .storage
+            .get_dashboard(&dashboard_id)
+            .await?
+            .ok_or_else(|| anyhow!("Dashboard not found"))?;
+        let mut affected = Vec::new();
+        for widget in &dashboard.layout {
+            let Some(ds) = widget.datasource() else {
+                continue;
+            };
+            let workflow = match state.storage.get_workflow(&ds.workflow_id).await? {
+                Some(wf) => wf,
+                None => match dashboard
+                    .workflows
+                    .iter()
+                    .find(|wf| wf.id == ds.workflow_id)
+                {
+                    Some(wf) => wf.clone(),
+                    None => continue,
+                },
+            };
+            let mut referenced = std::collections::BTreeSet::new();
+            for node in &workflow.nodes {
+                if let Some(cfg) = &node.config {
+                    let names = ResolvedParameters::referenced_names(cfg);
+                    referenced.extend(names);
+                }
+            }
+            if referenced.contains(&param_name) {
+                affected.push(widget.id().to_string());
+            }
+        }
+        Ok::<_, anyhow::Error>(SetDashboardParameterResult {
+            affected_widget_ids: affected,
+        })
+    }
+    .await;
+    Ok(match outcome {
+        Ok(payload) => ApiResult::ok(payload),
+        Err(error) => ApiResult::err(error.to_string()),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ResolveDashboardParametersResult {
+    pub values: std::collections::BTreeMap<String, crate::models::dashboard::ParameterValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle: Option<Vec<String>>,
+}
+
+#[tauri::command]
+pub async fn resolve_dashboard_parameters(
+    state: State<'_, AppState>,
+    dashboard_id: String,
+) -> Result<ApiResult<ResolveDashboardParametersResult>, String> {
+    let outcome = async {
+        let dashboard = state
+            .storage
+            .get_dashboard(&dashboard_id)
+            .await?
+            .ok_or_else(|| anyhow!("Dashboard not found"))?;
+        if let Some(cycle) = crate::modules::parameter_engine::detect_cycle(&dashboard.parameters) {
+            return Ok(ResolveDashboardParametersResult {
+                values: Default::default(),
+                cycle: Some(cycle),
+            });
+        }
+        let selections = state
+            .storage
+            .get_dashboard_parameter_values(&dashboard_id)
+            .await
+            .unwrap_or_default();
+        let resolved = ResolvedParameters::resolve(&dashboard.parameters, &selections)?;
+        Ok::<_, anyhow::Error>(ResolveDashboardParametersResult {
+            values: resolved.as_map().clone(),
+            cycle: None,
+        })
+    }
+    .await;
+    Ok(match outcome {
+        Ok(payload) => ApiResult::ok(payload),
+        Err(error) => ApiResult::err(error.to_string()),
+    })
 }

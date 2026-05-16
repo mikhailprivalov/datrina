@@ -1,6 +1,8 @@
 pub mod ai;
+pub mod alert_engine;
 pub mod mcp_manager;
 pub mod memory;
+pub mod parameter_engine;
 pub mod scheduler;
 pub mod storage;
 pub mod tool_engine;

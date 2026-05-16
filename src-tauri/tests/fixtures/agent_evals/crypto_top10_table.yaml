@@ -1,0 +1,59 @@
+id: crypto_top10_table
+description: |
+  Table widget driven purely by an http_request datasource (no MCP). Must
+  pass validation, have a pipeline that picks + limits + maps, and have a
+  matching dry_run_widget call.
+
+trace:
+  proposal:
+    id: prop-crypto-table
+    title: Top 10 crypto by market cap
+    widgets:
+      - widget_type: table
+        title: Top 10 crypto by market cap
+        data: []
+        datasource_plan:
+          kind: builtin_tool
+          tool_name: http_request
+          arguments:
+            method: GET
+            url: https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10
+          pipeline:
+            - kind: map
+              fields: [name, symbol, current_price, market_cap]
+            - { kind: limit, count: 10 }
+  tool_calls:
+    - call_id: call-dry-run-table
+      name: dry_run_widget
+      arguments:
+        proposal:
+          title: Top 10 crypto by market cap
+      result:
+        status: ok
+        rows:
+          - { name: Bitcoin, symbol: BTC, current_price: 67000, market_cap: 1300000000000 }
+          - { name: Ethereum, symbol: ETH, current_price: 3500, market_cap: 420000000000 }
+  plan:
+    summary: HTTP fetch + map + table.
+    steps:
+      - { id: s1, title: Fetch, kind: fetch }
+      - { id: s2, title: Test, kind: test }
+      - { id: s3, title: Propose, kind: propose }
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 2400
+    completion: 800
+
+assertions:
+  - kind: validator_passes
+  - kind: proposal_widget
+    count: 1
+    widget_type: table
+    has_datasource_plan: true
+    has_pipeline_step_kind: [map, limit]
+  - kind: tool_called
+    name: dry_run_widget
+    min_count: 1
+  - kind: cost_lt_usd
+    value: 0.20

@@ -2,6 +2,7 @@ use super::{Id, Timestamp};
 use crate::models::dashboard::BuildProposal;
 use crate::models::validation::ValidationIssue;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const CHAT_EVENT_CHANNEL: &str = "chat:event";
 
@@ -34,8 +35,71 @@ pub struct ChatSession {
     pub widget_id: Option<Id>,
     pub title: String,
     pub messages: Vec<ChatMessage>,
+    /// W18: structured plan emitted by `submit_plan` once per Build session.
+    /// Subsequent assistant turns continue advancing the same plan via
+    /// `_plan_step` arguments on later tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_plan: Option<PlanArtifact>,
+    /// W18: step_id -> current status. Persisted alongside the plan so
+    /// continuations resume with accurate state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_status: Option<BTreeMap<String, PlanStepStatus>>,
+    /// W22: running per-session token + cost totals. Updated transactionally
+    /// after every persisted assistant message that came back with a parsed
+    /// `usage` block. Footer + Costs view read directly from these.
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    #[serde(default)]
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub total_reasoning_tokens: u64,
+    #[serde(default)]
+    pub total_cost_usd: f64,
+    /// W22: optional per-session budget cap in USD. When `total_cost_usd`
+    /// would exceed this, the next provider request is denied with a
+    /// `budget_exceeded` error. `None` == no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanArtifact {
+    pub summary: String,
+    pub steps: Vec<PlanStep>,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub id: String,
+    pub title: String,
+    pub kind: PlanStepKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepKind {
+    Explore,
+    Fetch,
+    Design,
+    Test,
+    Propose,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +161,19 @@ pub enum ChatMessagePart {
     Cancellation {
         reason: String,
     },
+    /// W18: structured plan + live status. Persisted on the assistant
+    /// message that owns the plan; UI renders it as a checklist above the
+    /// message body.
+    Plan {
+        plan: PlanArtifact,
+        status: BTreeMap<String, PlanStepStatus>,
+    },
+    /// W18: surfaced on the assistant message produced from a
+    /// post-apply reflection turn so the UI can badge it as a suggestion
+    /// rather than a fresh user-driven proposal.
+    ReflectionMeta {
+        widget_ids: Vec<Id>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,12 +222,35 @@ pub struct MessageMetadata {
     pub build_proposal: Option<BuildProposal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// W22: resolved cost in USD for this single assistant turn. Computed
+    /// at persist time from `tokens` and the pricing table so a later
+    /// override edit doesn't silently rewrite history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
+/// W22: token usage as parsed from the provider's `usage` chunk. Reasoning
+/// tokens are tracked separately because o-series and a few OpenRouter
+/// aliases bill them at a different rate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt: u32,
     pub completion: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u32>,
+}
+
+/// W22: per-session entry returned by the top-sessions cost view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostSessionEntry {
+    pub session_id: Id,
+    pub title: String,
+    pub mode: ChatMode,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub updated_at: Timestamp,
 }
 
 // ─── Requests ────────────────────────────────────────────────────────────────
@@ -223,6 +323,10 @@ pub enum ChatEventKind {
     /// `AgentEvent::ProposalValidationResult` so the UI can render the
     /// typed issue list.
     ProposalValidation,
+    /// W18: emitted whenever the session-scoped plan or its step status
+    /// map changes (initial `submit_plan`, each `_plan_step` transition,
+    /// terminal cleanup).
+    PlanUpdated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +395,12 @@ pub enum AgentEvent {
         #[serde(default)]
         retried: bool,
     },
+    /// W18: full plan snapshot + current step status map. Emitted on
+    /// `submit_plan` and again whenever `_plan_step` flips a step's status.
+    PlanUpdated {
+        plan: PlanArtifact,
+        status: BTreeMap<String, PlanStepStatus>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +428,10 @@ pub enum AgentPhase {
     /// themselves travel on the matching `AgentEvent::ProposalValidationResult`
     /// envelope, not here.
     ProposalValidation,
+    /// W18: plan enforcement gate. `Started` fires when the agent's first
+    /// tool call wasn't `submit_plan`. `Completed` when the agent
+    /// submits a plan. `Failed` when the budget is spent without a plan.
+    PlanEnforcement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

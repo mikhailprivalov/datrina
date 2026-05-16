@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Sidebar } from './components/layout/Sidebar';
 import { DashboardGrid } from './components/layout/DashboardGrid';
@@ -8,8 +8,16 @@ import { StatusBar } from './components/layout/StatusBar';
 import { ProviderSettings } from './components/layout/ProviderSettings';
 import { McpSettings } from './components/layout/McpSettings';
 import { MemorySettings } from './components/layout/MemorySettings';
-import { configApi, dashboardApi, providerApi } from './lib/api';
-import type { BuildProposal, CreateProviderRequest, Dashboard, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WorkflowEventEnvelope, WorkflowRun } from './lib/api';
+import { CostsView } from './components/layout/CostsView';
+import { HistoryDrawer } from './components/dashboard/HistoryDrawer';
+import { Playground } from './components/playground/Playground';
+import { TemplateGallery } from './components/onboarding/TemplateGallery';
+import { AlertsView } from './components/alerts/AlertsView';
+import { AlertEditorModal } from './components/alerts/AlertEditorModal';
+import type { WidgetAlertStatus } from './components/layout/DashboardGrid';
+import type { DashboardTemplate } from './lib/templates';
+import { ALERT_EVENT_CHANNEL, alertApi, configApi, dashboardApi, providerApi } from './lib/api';
+import type { AlertEvent, AlertSeverity, BuildProposal, CreateProviderRequest, Dashboard, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WorkflowEventEnvelope, WorkflowRun } from './lib/api';
 
 function App() {
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
@@ -47,6 +55,20 @@ function App() {
   const [isProviderSettingsOpen, setIsProviderSettingsOpen] = useState(false);
   const [isMcpSettingsOpen, setIsMcpSettingsOpen] = useState(false);
   const [isMemorySettingsOpen, setIsMemorySettingsOpen] = useState(false);
+  const [isCostsViewOpen, setIsCostsViewOpen] = useState(false);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [undoToast, setUndoToast] = useState<{ versionId: string; label: string } | null>(null);
+  const [route, setRoute] = useState<'dashboards' | 'playground' | 'alerts'>(() => {
+    if (typeof window === 'undefined') return 'dashboards';
+    if (window.location.hash === '#/playground') return 'playground';
+    if (window.location.hash === '#/alerts') return 'alerts';
+    return 'dashboards';
+  });
+  const [alertEvents, setAlertEvents] = useState<AlertEvent[]>([]);
+  const [unacknowledgedAlertCount, setUnacknowledgedAlertCount] = useState(0);
+  const [alertEditorWidgetId, setAlertEditorWidgetId] = useState<string | null>(null);
+  const [isTemplateGalleryOpen, setIsTemplateGalleryOpen] = useState(false);
+  const [pendingBuildPrompt, setPendingBuildPrompt] = useState<string | null>(null);
 
   const loadDashboards = useCallback(async () => {
     try {
@@ -269,19 +291,40 @@ function App() {
     }
   };
 
-  const handleApplyBuildProposal = async (proposal: BuildProposal) => {
+  const handleApplyBuildProposal = async (proposal: BuildProposal, sessionId?: string) => {
+    const dashboardIdBeforeApply = activeDashboard?.id;
     setIsBusy(true);
     setError(null);
     setStatusMessage('Applying build proposal...');
     try {
       const updated = await dashboardApi.applyBuildProposal({
         proposal,
-        dashboard_id: activeDashboard?.id,
+        dashboard_id: dashboardIdBeforeApply,
         confirmed: true,
+        session_id: sessionId,
       });
       setDashboards(prev => upsertDashboard(prev, updated));
       setActiveId(updated.id);
       setStatusMessage('Build proposal applied');
+
+      // W19: surface a 10s Undo toast if the apply mutated an existing
+      // dashboard. New dashboards have no pre-apply state to undo to, so
+      // we skip the toast in that case.
+      if (dashboardIdBeforeApply) {
+        try {
+          const versions = await dashboardApi.listVersions(updated.id);
+          const undoTarget = versions.find(v => v.source === 'agent_apply');
+          if (undoTarget) {
+            setUndoToast({
+              versionId: undoTarget.id,
+              label: proposal.title?.trim() || 'Apply',
+            });
+          }
+        } catch (err) {
+          console.warn('Failed to list versions for Undo toast:', err);
+        }
+      }
+
       const newWidgets = updated.layout.slice(Math.max(0, updated.layout.length - proposal.widgets.length));
       for (const widget of newWidgets) {
         setRefreshingWidgetId(widget.id);
@@ -300,6 +343,154 @@ function App() {
       setRefreshingWidgetId(null);
     }
   };
+
+  const handleRestoreVersion = async (versionId: string) => {
+    setIsBusy(true);
+    setError(null);
+    setStatusMessage('Restoring version...');
+    try {
+      const restored = await dashboardApi.restoreVersion(versionId);
+      setDashboards(prev => upsertDashboard(prev, restored));
+      setActiveId(restored.id);
+      setUndoToast(null);
+      setStatusMessage('Version restored');
+      for (const widget of restored.layout) {
+        try {
+          const result = await dashboardApi.refreshWidget(restored.id, widget.id);
+          if (result.data) {
+            setWidgetData(prev => ({ ...prev, [widget.id]: result.data }));
+          }
+        } catch (err) {
+          console.warn(`Failed to refresh widget ${widget.id} after restore:`, err);
+        }
+      }
+    } catch (err) {
+      setError(errorMessage(err, 'Failed to restore version'));
+      setStatusMessage('Restore failed');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!undoToast) return;
+    const id = window.setTimeout(() => setUndoToast(null), 10_000);
+    return () => window.clearTimeout(id);
+  }, [undoToast]);
+
+  useEffect(() => {
+    const sync = () => {
+      const hash = window.location.hash;
+      if (hash === '#/playground') setRoute('playground');
+      else if (hash === '#/alerts') setRoute('alerts');
+      else setRoute('dashboards');
+    };
+    window.addEventListener('hashchange', sync);
+    return () => window.removeEventListener('hashchange', sync);
+  }, []);
+
+  const navigateToPlayground = useCallback(() => {
+    window.location.hash = '#/playground';
+    setRoute('playground');
+  }, []);
+
+  const navigateToDashboards = useCallback(() => {
+    window.location.hash = '';
+    setRoute('dashboards');
+  }, []);
+
+  const navigateToAlerts = useCallback(() => {
+    window.location.hash = '#/alerts';
+    setRoute('alerts');
+  }, []);
+
+  // W21: keep the Sidebar badge + per-widget dot in sync. The count
+  // comes from the backend, but the events array is also retained so we
+  // can derive per-widget status without a second round-trip.
+  const refreshAlertCount = useCallback(async () => {
+    try {
+      const count = await alertApi.countUnacknowledged();
+      setUnacknowledgedAlertCount(count);
+    } catch (err) {
+      console.warn('Failed to load alert count:', err);
+    }
+  }, []);
+
+  const refreshAlertEvents = useCallback(async () => {
+    try {
+      const data = await alertApi.listEvents(true, 200);
+      setAlertEvents(data);
+      setUnacknowledgedAlertCount(data.length);
+    } catch (err) {
+      console.warn('Failed to load alert events:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshAlertEvents();
+  }, [refreshAlertEvents]);
+
+  useEffect(() => {
+    const unsubscribe = listen<AlertEvent>(ALERT_EVENT_CHANNEL, evt => {
+      setAlertEvents(prev => [evt.payload, ...prev]);
+      setUnacknowledgedAlertCount(prev => prev + 1);
+    });
+    return () => {
+      unsubscribe.then(dispose => dispose()).catch(() => {});
+    };
+  }, []);
+
+  // Per-widget alert status derived from current unack events. Recomputed
+  // cheaply since `alertEvents` is bounded at 200.
+  const widgetAlertStatus = useMemo(() => {
+    const out: Record<string, WidgetAlertStatus> = {};
+    for (const event of alertEvents) {
+      if (event.acknowledged_at) continue;
+      const existing = out[event.widget_id];
+      if (!existing) {
+        out[event.widget_id] = { count: 1, severity: event.severity };
+      } else {
+        existing.count += 1;
+        if (severityRank(event.severity) < severityRank(existing.severity)) {
+          existing.severity = event.severity;
+        }
+      }
+    }
+    return out;
+  }, [alertEvents]);
+
+  const openBuildChatWithPrompt = useCallback((prompt: string) => {
+    setPendingBuildPrompt(prompt);
+    setChatMode('build');
+    setIsChatOpen(true);
+  }, []);
+
+  const handleTemplateSelect = useCallback(async (template: DashboardTemplate) => {
+    if (template.launch === 'playground') {
+      navigateToPlayground();
+      return;
+    }
+    try {
+      setIsBusy(true);
+      setStatusMessage('Creating dashboard from template...');
+      const dashboard = await dashboardApi.create(template.title, template.description, 'blank');
+      setDashboards(prev => [...prev, dashboard]);
+      setActiveId(dashboard.id);
+      navigateToDashboards();
+      if (template.launch === 'build_chat' && template.prompt) {
+        openBuildChatWithPrompt(template.prompt);
+      } else {
+        setChatMode('build');
+        setIsChatOpen(true);
+      }
+      setStatusMessage('Template ready — describe what you need in chat');
+    } catch (err) {
+      setError(errorMessage(err, 'Failed to create dashboard from template'));
+      setStatusMessage('Template launch failed');
+    } finally {
+      setIsBusy(false);
+    }
+  }, [navigateToDashboards, navigateToPlayground, openBuildChatWithPrompt]);
 
   const handleRefreshWidget = async (widgetId: string) => {
     if (!activeDashboard) return;
@@ -468,14 +659,21 @@ function App() {
       <Sidebar
         dashboards={dashboards}
         activeId={activeId}
-        onSelect={handleSelectDashboard}
-        onCreate={() => handleCreate('blank')}
+        onSelect={(id) => { navigateToDashboards(); handleSelectDashboard(id); }}
+        onCreate={() => { navigateToDashboards(); handleCreate('blank'); }}
+        onCreateFromTemplate={() => setIsTemplateGalleryOpen(true)}
         onDelete={handleDelete}
         theme={theme}
         onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
         onOpenSettings={() => setIsProviderSettingsOpen(true)}
         onOpenMcpSettings={() => setIsMcpSettingsOpen(true)}
         onOpenMemorySettings={() => setIsMemorySettingsOpen(true)}
+        onOpenCostsView={() => setIsCostsViewOpen(true)}
+        onOpenPlayground={navigateToPlayground}
+        isPlaygroundActive={route === 'playground'}
+        onOpenAlerts={navigateToAlerts}
+        isAlertsActive={route === 'alerts'}
+        unacknowledgedAlertCount={unacknowledgedAlertCount}
         isCollapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
       />
@@ -490,13 +688,30 @@ function App() {
           onOpenSettings={() => setIsProviderSettingsOpen(true)}
         />
 
-        <main className="flex-1 overflow-auto p-4 scrollbar-thin">
-          {error && (
+        <main className={`flex-1 min-h-0 overflow-hidden ${route === 'playground' ? '' : 'overflow-auto p-4 scrollbar-thin'}`}>
+          {error && route === 'dashboards' && (
             <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
               {error}
             </div>
           )}
-          {activeDashboard ? (
+          {route === 'playground' ? (
+            <Playground
+              onUseAsWidget={({ prompt }) => {
+                navigateToDashboards();
+                openBuildChatWithPrompt(prompt);
+              }}
+              onClose={navigateToDashboards}
+            />
+          ) : route === 'alerts' ? (
+            <AlertsView
+              dashboards={dashboards}
+              onJumpToWidget={(dashboardId) => {
+                navigateToDashboards();
+                handleSelectDashboard(dashboardId);
+              }}
+              onClose={navigateToDashboards}
+            />
+          ) : activeDashboard ? (
             <DashboardGrid
               dashboard={activeDashboard}
               widgetData={widgetData}
@@ -507,9 +722,16 @@ function App() {
               onLayoutCommit={handleLayoutCommit}
               onAddWidget={handleAddWidget}
               onUpdateWidgets={handleLayoutCommit}
+              onOpenHistory={() => setIsHistoryOpen(true)}
+              widgetAlertStatus={widgetAlertStatus}
+              onOpenAlertsEditor={(widgetId) => setAlertEditorWidgetId(widgetId)}
             />
           ) : (
-            <EmptyState onCreate={() => handleCreate('local_mvp')} onBuild={() => { setChatMode('build'); setIsChatOpen(true); }} />
+            <TemplateGallery
+              onSelect={handleTemplateSelect}
+              onOpenPlayground={navigateToPlayground}
+              onOpenMcpSettings={() => setIsMcpSettingsOpen(true)}
+            />
           )}
         </main>
 
@@ -523,9 +745,21 @@ function App() {
           dashboardName={activeDashboard?.name}
           activeProvider={activeProvider}
           canApplyToDashboard={Boolean(activeDashboard)}
+          initialPrompt={pendingBuildPrompt ?? undefined}
+          onInitialPromptConsumed={() => setPendingBuildPrompt(null)}
           onClose={() => setIsChatOpen(false)}
           onModeChange={setChatMode}
           onApplyBuildProposal={handleApplyBuildProposal}
+        />
+      )}
+
+      {isTemplateGalleryOpen && (
+        <TemplateGallery
+          variant="modal"
+          onSelect={handleTemplateSelect}
+          onOpenPlayground={navigateToPlayground}
+          onOpenMcpSettings={() => setIsMcpSettingsOpen(true)}
+          onClose={() => setIsTemplateGalleryOpen(false)}
         />
       )}
 
@@ -535,6 +769,10 @@ function App() {
 
       {isMemorySettingsOpen && (
         <MemorySettings onClose={() => setIsMemorySettingsOpen(false)} />
+      )}
+
+      {isCostsViewOpen && (
+        <CostsView onClose={() => setIsCostsViewOpen(false)} />
       )}
 
       {(isProviderSettingsOpen || providers.length === 0) && (
@@ -552,6 +790,53 @@ function App() {
           onSetActiveProvider={handleSetActiveProvider}
           onTestProvider={handleTestProvider}
         />
+      )}
+
+      {isHistoryOpen && activeDashboard && (
+        <HistoryDrawer
+          dashboardId={activeDashboard.id}
+          onClose={() => setIsHistoryOpen(false)}
+          onRestored={dashboard => {
+            setDashboards(prev => upsertDashboard(prev, dashboard));
+            setActiveId(dashboard.id);
+            setUndoToast(null);
+          }}
+        />
+      )}
+
+      {alertEditorWidgetId && activeDashboard && (
+        <AlertEditorModal
+          dashboardId={activeDashboard.id}
+          widgetId={alertEditorWidgetId}
+          widgetTitle={activeDashboard.layout.find(w => w.id === alertEditorWidgetId)?.title ?? ''}
+          lastData={widgetData[alertEditorWidgetId]}
+          onClose={() => setAlertEditorWidgetId(null)}
+          onSaved={() => {
+            setAlertEditorWidgetId(null);
+            refreshAlertCount();
+          }}
+        />
+      )}
+
+      {undoToast && (
+        <div className="pointer-events-auto fixed bottom-6 right-6 z-[60] flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-2 text-sm shadow-lg">
+          <span className="text-foreground">Applied: {undoToast.label}</span>
+          <button
+            onClick={() => handleRestoreVersion(undoToast.versionId)}
+            className="rounded-md border border-border px-2 py-1 text-xs font-medium hover:bg-muted"
+          >
+            ↩ Undo
+          </button>
+          <button
+            onClick={() => setUndoToast(null)}
+            className="rounded p-1 text-muted-foreground hover:bg-muted"
+            aria-label="Dismiss"
+          >
+            <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
       )}
     </div>
   );
@@ -573,33 +858,10 @@ function errorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
 }
 
-function EmptyState({ onCreate, onBuild }: { onCreate: () => void; onBuild: () => void }) {
-  return (
-    <div className="flex flex-col items-center justify-center h-full text-center gap-6">
-      <div className="w-20 h-20 rounded-2xl bg-primary/10 flex items-center justify-center">
-        <svg className="w-10 h-10 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z" />
-        </svg>
-      </div>
-      <div className="space-y-2">
-        <h2 className="text-2xl font-semibold text-foreground">Welcome to Datrina</h2>
-        <p className="text-muted-foreground max-w-md text-sm">
-          Create a local dashboard wired to a deterministic workflow, or open chat in its current provider-backed mode.
-        </p>
-      </div>
-      <div className="flex gap-3">
-        <button onClick={onCreate} className="px-4 py-2 bg-secondary text-secondary-foreground rounded-lg hover:bg-secondary/80 transition-colors text-sm">
-          Create Local MVP Dashboard
-        </button>
-        <button onClick={onBuild} className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 text-sm">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-          </svg>
-          Build with AI
-        </button>
-      </div>
-    </div>
-  );
+function severityRank(severity: AlertSeverity): number {
+  if (severity === 'critical') return 0;
+  if (severity === 'warning') return 1;
+  return 2;
 }
 
 export default App;

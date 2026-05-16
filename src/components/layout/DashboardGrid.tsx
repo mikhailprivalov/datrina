@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Responsive, WidthProvider } from 'react-grid-layout';
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
-import type { Dashboard, Widget, WidgetRuntimeData, WorkflowRun } from '../../lib/api';
+import type { Dashboard, Widget, WidgetRuntimeData, WorkflowRun, AlertSeverity } from '../../lib/api';
 import { ChartWidget } from '../widgets/ChartWidget';
 import { TextWidget } from '../widgets/TextWidget';
 import { TableWidget } from '../widgets/TableWidget';
@@ -13,9 +13,16 @@ import { LogsWidget } from '../widgets/LogsWidget';
 import { BarGaugeWidget } from '../widgets/BarGaugeWidget';
 import { StatusGridWidget } from '../widgets/StatusGridWidget';
 import { HeatmapWidget } from '../widgets/HeatmapWidget';
+import { PipelineDebugModal } from '../debug/PipelineDebugModal';
+import { ParameterBar } from '../dashboard/ParameterBar';
 import type { Layout } from 'react-grid-layout';
 
 const ResponsiveGridLayout = WidthProvider(Responsive);
+
+export interface WidgetAlertStatus {
+  count: number;
+  severity: AlertSeverity;
+}
 
 interface Props {
   dashboard: Dashboard;
@@ -27,6 +34,9 @@ interface Props {
   onLayoutCommit: (layout: Widget[]) => void;
   onAddWidget: (widgetType: 'text' | 'gauge') => void;
   onUpdateWidgets: (next: Widget[]) => void;
+  onOpenHistory: () => void;
+  widgetAlertStatus?: Record<string, WidgetAlertStatus | undefined>;
+  onOpenAlertsEditor?: (widgetId: string) => void;
 }
 
 export function DashboardGrid({
@@ -39,8 +49,12 @@ export function DashboardGrid({
   onLayoutCommit,
   onAddWidget,
   onUpdateWidgets,
+  onOpenHistory,
+  widgetAlertStatus,
+  onOpenAlertsEditor,
 }: Props) {
   const [inspecting, setInspecting] = useState<{ widget: Widget; data?: WidgetRuntimeData; run?: WorkflowRun } | null>(null);
+  const [debuggingWidget, setDebuggingWidget] = useState<Widget | null>(null);
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
   const handleDeleteWidget = (id: string) => {
     if (!window.confirm('Delete this widget? Its workflow stays so you can re-add it later.')) return;
@@ -100,7 +114,15 @@ export function DashboardGrid({
 
   return (
     <div className="space-y-3">
+      <ParameterBar
+        dashboardId={dashboard.id}
+        parameters={dashboard.parameters ?? []}
+        onAffectedWidgets={ids => ids.forEach(id => onRefreshWidget(id))}
+      />
       <div className="flex justify-end gap-2">
+        <button onClick={onOpenHistory} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted" title="View dashboard history and restore prior versions">
+          History
+        </button>
         <button onClick={() => onAddWidget('text')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add text</button>
         <button onClick={() => onAddWidget('gauge')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add gauge</button>
       </div>
@@ -139,6 +161,7 @@ export function DashboardGrid({
                   </span>
                 )}
                 <div className="flex items-center gap-1">
+                  <AlertDot status={widgetAlertStatus?.[widget.id]} />
                   <WorkflowBadge widget={widget} run={run} fallback={fallback} />
                   <button
                     className="p-1 rounded hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
@@ -156,6 +179,8 @@ export function DashboardGrid({
                     onDuplicate={() => handleDuplicateWidget(widget.id)}
                     onDelete={() => handleDeleteWidget(widget.id)}
                     onInspect={() => setInspecting({ widget, data, run })}
+                    onOpenAlerts={onOpenAlertsEditor ? () => onOpenAlertsEditor(widget.id) : undefined}
+                    onDebugPipeline={widget.datasource ? () => setDebuggingWidget(widget) : undefined}
                   />
                 </div>
               </div>
@@ -177,6 +202,24 @@ export function DashboardGrid({
           data={inspecting.data}
           run={inspecting.run}
           onClose={() => setInspecting(null)}
+        />
+      )}
+      {debuggingWidget && (
+        <PipelineDebugModal
+          dashboardId={dashboard.id}
+          widgetId={debuggingWidget.id}
+          widgetTitle={debuggingWidget.title}
+          initialCaptureTraces={!!debuggingWidget.datasource?.capture_traces}
+          onClose={() => setDebuggingWidget(null)}
+          onCaptureChange={next => {
+            onUpdateWidgets(
+              dashboard.layout.map(w =>
+                w.id === debuggingWidget.id && w.datasource
+                  ? { ...w, datasource: { ...w.datasource, capture_traces: next } }
+                  : w
+              )
+            );
+          }}
         />
       )}
     </div>
@@ -253,6 +296,23 @@ function Section({ title, children, copyable }: { title: string; children: React
   );
 }
 
+function AlertDot({ status }: { status?: WidgetAlertStatus }) {
+  if (!status || status.count <= 0) return null;
+  const tone =
+    status.severity === 'critical'
+      ? 'bg-destructive'
+      : status.severity === 'warning'
+        ? 'bg-amber-500'
+        : 'bg-blue-500';
+  return (
+    <span
+      title={`${status.count} unacknowledged alert${status.count === 1 ? '' : 's'} (${status.severity})`}
+      className={`mr-1 inline-flex h-2 w-2 rounded-full ${tone}`}
+      aria-label="Active alerts"
+    />
+  );
+}
+
 function WorkflowBadge({ widget, run, fallback }: { widget: Widget; run?: WorkflowRun; fallback: boolean }) {
   if (!widget.datasource && !fallback) return null;
   const status = fallback ? 'fallback' : (run?.status ?? 'idle');
@@ -280,11 +340,15 @@ function WidgetMenu({
   onDuplicate,
   onDelete,
   onInspect,
+  onOpenAlerts,
+  onDebugPipeline,
 }: {
   onRename: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
   onInspect: () => void;
+  onOpenAlerts?: () => void;
+  onDebugPipeline?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -313,6 +377,12 @@ function WidgetMenu({
           <MenuItem label="Rename" onClick={() => { setOpen(false); onRename(); }} />
           <MenuItem label="Duplicate" onClick={() => { setOpen(false); onDuplicate(); }} />
           <MenuItem label="View raw data" onClick={() => { setOpen(false); onInspect(); }} />
+          {onDebugPipeline && (
+            <MenuItem label="Debug pipeline…" onClick={() => { setOpen(false); onDebugPipeline(); }} />
+          )}
+          {onOpenAlerts && (
+            <MenuItem label="Alerts…" onClick={() => { setOpen(false); onOpenAlerts(); }} />
+          )}
           <div className="my-1 h-px bg-border/60" />
           <MenuItem label="Delete" destructive onClick={() => { setOpen(false); onDelete(); }} />
         </div>

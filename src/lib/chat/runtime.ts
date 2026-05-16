@@ -7,6 +7,8 @@ import type {
   ChatEventEnvelope,
   ChatMessage,
   ChatMessagePart,
+  PlanArtifact,
+  PlanStepStatus,
   ToolCall,
   ToolCallTrace,
   ToolResult,
@@ -188,6 +190,11 @@ export function applyChatEvent(
           event.emitted_at,
         ),
       }), agentEvent.status === 'started');
+    case 'plan_updated':
+      return updateRuntimeMessage(base, event.message_id, message => ({
+        ...message,
+        parts: upsertPlanPart(message.parts, agentEvent.plan, agentEvent.status),
+      }), true);
     case 'text_start':
     case 'text_end':
     case 'reasoning_start':
@@ -310,6 +317,7 @@ function legacyAgentEvent(event: ChatEventEnvelope): AgentEvent | null {
       return { type: 'abort_cancel', reason: event.error ?? 'cancelled by user' };
     case 'agent_phase':
     case 'proposal_validation':
+    case 'plan_updated':
       return null;
   }
 }
@@ -456,7 +464,22 @@ function agentPhaseKey(phase: AgentPhase): string {
       return `loop_detected:${phase.tool_name}`;
     case 'proposal_validation':
       return 'proposal_validation';
+    case 'plan_enforcement':
+      return 'plan_enforcement';
   }
+}
+
+function upsertPlanPart(
+  parts: ChatMessagePart[],
+  plan: PlanArtifact,
+  status: Record<string, PlanStepStatus>,
+): ChatMessagePart[] {
+  const nextPart: ChatMessagePart = { type: 'plan', plan, status };
+  const index = parts.findIndex(part => part.type === 'plan');
+  if (index === -1) {
+    return [nextPart, ...parts];
+  }
+  return parts.map((part, itemIndex) => (itemIndex === index ? nextPart : part));
 }
 
 function upsertProposalValidationPart(

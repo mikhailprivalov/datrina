@@ -18,3 +18,30 @@ pub async fn execute_curl(
         Err(e) => ApiResult::err(e.to_string()),
     })
 }
+
+#[derive(serde::Deserialize)]
+pub struct HttpRequestArgs {
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+    #[serde(default)]
+    pub headers: Option<serde_json::Value>,
+}
+
+#[tauri::command]
+pub async fn execute_http_request(
+    state: State<'_, AppState>,
+    req: HttpRequestArgs,
+) -> Result<ApiResult<serde_json::Value>, String> {
+    Ok(
+        match state
+            .tool_engine
+            .http_request(&req.method, &req.url, req.body, req.headers)
+            .await
+        {
+            Ok(result) => ApiResult::ok(result),
+            Err(e) => ApiResult::err(e.to_string()),
+        },
+    )
+}

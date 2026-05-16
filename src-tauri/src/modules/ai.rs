@@ -333,10 +333,7 @@ impl AIEngine {
         }
         Ok(AICompletion {
             content,
-            tokens: parsed.usage.map(|usage| crate::models::chat::TokenUsage {
-                prompt: usage.prompt_tokens.unwrap_or(0),
-                completion: usage.completion_tokens.unwrap_or(0),
-            }),
+            tokens: parsed.usage.map(token_usage_from_openai),
             tool_calls,
             reasoning: message
                 .reasoning
@@ -817,6 +814,7 @@ fn local_mock_tokens(messages: &[ChatMessage]) -> crate::models::chat::TokenUsag
     crate::models::chat::TokenUsage {
         prompt: (prompt_chars / 4).max(1) as u32,
         completion: 24,
+        reasoning: None,
     }
 }
 
@@ -941,10 +939,7 @@ where
     }
 
     if let Some(usage) = parsed.usage {
-        *tokens = Some(crate::models::chat::TokenUsage {
-            prompt: usage.prompt_tokens.unwrap_or(0),
-            completion: usage.completion_tokens.unwrap_or(0),
-        });
+        *tokens = Some(token_usage_from_openai(usage));
     }
 
     for choice in parsed.choices.unwrap_or_default() {
@@ -1031,6 +1026,33 @@ struct OpenAIFunctionCall {
 struct OpenAIUsage {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
+    /// OpenRouter / OpenAI o-series sometimes reports reasoning tokens
+    /// inside `completion_tokens_details.reasoning_tokens`. A handful of
+    /// providers also surface a flat `reasoning_tokens` field.
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAICompletionTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct OpenAICompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+fn token_usage_from_openai(usage: OpenAIUsage) -> crate::models::chat::TokenUsage {
+    let reasoning = usage.reasoning_tokens.or_else(|| {
+        usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+    });
+    crate::models::chat::TokenUsage {
+        prompt: usage.prompt_tokens.unwrap_or(0),
+        completion: usage.completion_tokens.unwrap_or(0),
+        reasoning,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1188,6 +1210,29 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("Provider disconnected"));
+    }
+
+    #[test]
+    fn stream_usage_chunk_yields_token_counts_including_reasoning() {
+        let mut tokens = None;
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tool_builders = BTreeMap::new();
+
+        process_openai_stream_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":30}}}"#,
+            &mut tokens,
+            &mut content,
+            &mut reasoning,
+            &mut tool_builders,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let parsed = tokens.expect("usage parsed");
+        assert_eq!(parsed.prompt, 120);
+        assert_eq!(parsed.completion, 80);
+        assert_eq!(parsed.reasoning, Some(30));
     }
 
     #[test]

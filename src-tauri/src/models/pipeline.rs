@@ -151,3 +151,76 @@ pub enum CoerceTarget {
 fn default_output_key() -> String {
     "value".to_string()
 }
+
+// ─── W23: Pipeline Debug Tracing ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineTrace {
+    pub workflow_id: String,
+    pub widget_id: String,
+    pub started_at: i64,
+    pub finished_at: i64,
+    pub source_summary: SourceSummary,
+    pub steps: Vec<PipelineStepTrace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceSummary {
+    McpTool {
+        server_id: String,
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments: Option<serde_json::Value>,
+    },
+    BuiltinTool {
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments: Option<serde_json::Value>,
+    },
+    ProviderPrompt {
+        prompt: String,
+    },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStepTrace {
+    pub index: u32,
+    pub kind: String,
+    pub config_json: serde_json::Value,
+    pub input_sample: SampleValue,
+    pub output_sample: SampleValue,
+    pub duration_ms: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleValue {
+    pub kind: SampleKind,
+    pub size_hint: SizeHint,
+    pub preview: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleKind {
+    Value,
+    ArrayHead,
+    Object,
+    Null,
+    TruncatedString,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SizeHint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<usize>,
+}

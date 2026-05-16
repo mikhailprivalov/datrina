@@ -1,0 +1,41 @@
+id: bad_pipeline_fails_validator
+description: |
+  Stat widget emitted without a datasource_plan and without a shared source_key.
+  The W16 validator must reject it with MissingDatasourcePlan; the
+  no_hardcoded_literals assertion piggybacks because the literal stat value
+  has no pipeline backing it.
+
+trace:
+  proposal:
+    id: prop-bad-pipeline
+    title: Broken stat
+    widgets:
+      - widget_type: stat
+        title: Releases (broken)
+        data: 0
+        config:
+          value: 42
+          unit: builds
+  tool_calls: []
+  plan:
+    summary: Skipped — agent failed to attach a pipeline.
+    steps: []
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 800
+    completion: 250
+
+assertions:
+  - kind: validator_fails_with
+    issue: missing_datasource_plan
+  # The same broken proposal also trips HardcodedLiteralValue (config.value
+  # is a literal with no pipeline backing it). We assert that variant
+  # explicitly here so both gates stay covered.
+  - kind: validator_fails_with
+    issue: hardcoded_literal_value
+  - kind: proposal_widget
+    count: 1
+    widget_type: stat
+  - kind: cost_lt_usd
+    value: 0.05

@@ -1,6 +1,6 @@
 # W22 Token And Cost Tracking
 
-Status: planned
+Status: shipped
 
 Date: 2026-05-16
 

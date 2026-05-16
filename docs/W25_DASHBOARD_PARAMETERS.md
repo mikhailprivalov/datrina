@@ -1,8 +1,44 @@
 # W25 Dashboard Parameters (Grafana-style Variables)
 
-Status: planned
+Status: shipped (v1)
 
-Date: 2026-05-16
+Date: 2026-05-17
+
+## v1 shipped surface
+
+- `DashboardParameter` / `DashboardParameterKind` / `ParameterValue` /
+  `ParameterOption` types extend `Dashboard` and `BuildProposal`.
+- `modules::parameter_engine` resolves a topo-ordered map of parameter
+  values and substitutes `$name` / `${name}` tokens in workflow node
+  configs. Whole-string tokens preserve JSON type; multi-value params
+  support `comma_join` / `json_array` / `first` render modes. TimeRange
+  params expose `.from` / `.to` / `.duration_ms` accessors.
+- Storage: `dashboards.parameters` JSON column + `dashboard_parameter_values`
+  table.
+- Tauri commands: `list_dashboard_parameters`,
+  `get_dashboard_parameter_values`, `set_dashboard_parameter_value`
+  (returns affected widget ids by scanning workflow configs for the
+  changed name), `resolve_dashboard_parameters`.
+- `refresh_widget`, `dry_run_widget` (UI + agent path), and the chat
+  agent's `execute_dry_run_widget` substitute parameters before the
+  workflow runs.
+- W16 validator: `UnknownParameterReference` + `ParameterCycle`.
+- UI: `ParameterBar` sticky controls row above `DashboardGrid` with
+  Select / MultiSelect / TextInput / TimeRangePicker / IntervalPicker
+  building blocks; commits trigger refresh of affected widgets.
+- Build chat system prompt explains the parameter contract +
+  `dry_run_widget` tool spec exposes `parameters` /
+  `parameter_values`.
+
+## v1 deferrals (intentional)
+
+- `mcp_query` / `http_query` option-list resolution: the parameter
+  declaration round-trips, but the dropdown is rendered as a plain text
+  input in v1 (UI shows the persisted selection). Wire option fetch in
+  v2.
+- `builtin` parameter source kind.
+- URL-hash sync for shareable parameter state across reloads.
+- Repeating widgets (Grafana `repeat`) — explicit out-of-scope below.
 
 ## Context
 

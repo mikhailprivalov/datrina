@@ -11,16 +11,27 @@ use tracing::info;
 use crate::models::chat::{
     AgentEvent, AgentPhase, AgentPhaseStatus, ChatEventEnvelope, ChatEventKind, ChatMessage,
     ChatMessagePart, ChatMode, ChatSession, CreateSessionRequest, MessageMetadata, MessageRole,
-    SendMessageRequest, ToolCallTrace, ToolPolicyDecision, ToolResult, ToolResultTrace,
-    ToolTraceStatus, CHAT_EVENT_CHANNEL,
+    PlanArtifact, PlanStep, PlanStepKind, PlanStepStatus, SendMessageRequest, TokenUsage,
+    ToolCallTrace, ToolPolicyDecision, ToolResult, ToolResultTrace, ToolTraceStatus,
+    CHAT_EVENT_CHANNEL,
 };
 use crate::models::dashboard::BuildProposal;
 use crate::models::mcp::{MCPServer, MCPTransport};
 use crate::models::memory::{MemoryHit, Scope};
+use crate::models::pricing::{pricing_for, ModelPricing, ModelPricingOverride, UsageReport};
 use crate::models::validation::ValidationIssue;
 use crate::models::ApiResult;
 use crate::modules::ai::{AIStreamEvent, AIToolSpec};
-use crate::AppState;
+use crate::{AppState, ReflectionPending};
+
+/// W18: tag a streaming assistant turn as a reflection follow-up. When
+/// set, the persisted assistant message gets a
+/// `ChatMessagePart::ReflectionMeta` part so the UI can badge it as a
+/// suggestion (one-click apply) instead of a fresh proposal.
+#[derive(Clone, Debug, Default)]
+pub struct ReflectionContext {
+    pub widget_ids: Vec<String>,
+}
 
 #[tauri::command]
 pub async fn list_sessions(
@@ -70,6 +81,13 @@ pub async fn create_session(
             ChatMode::Context => "Data Analysis".to_string(),
         },
         messages: vec![],
+        current_plan: None,
+        plan_status: None,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_reasoning_tokens: 0,
+        total_cost_usd: 0.0,
+        max_cost_usd: None,
         created_at: now,
         updated_at: now,
     };
@@ -174,7 +192,17 @@ pub async fn send_message(
         provider_messages.push(system_message(prompt_mcp_system_message(server)));
     }
 
-    let tool_specs = match chat_tool_specs_silent(state.inner(), prompt_mcp_server.is_some()).await
+    let pricing = pricing_for_provider(state.inner(), &provider).await;
+    if let Err(error) = enforce_session_budget(&session, pricing, &provider_messages) {
+        return Ok(ApiResult::err(error.to_string()));
+    }
+
+    let tool_specs = match chat_tool_specs_silent(
+        state.inner(),
+        prompt_mcp_server.is_some(),
+        matches!(session.mode, ChatMode::Build),
+    )
+    .await
     {
         Ok(specs) => specs,
         Err(e) => return Ok(ApiResult::err(format!("MCP tool discovery failed: {}", e))),
@@ -224,9 +252,16 @@ pub async fn send_message(
                 latency_ms: Some(ai_response.latency_ms),
                 build_proposal: None,
                 reasoning: ai_response.reasoning.clone(),
+                cost_usd: ai_response.tokens.as_ref().and_then(|tokens| {
+                    pricing.map(|p| p.cost_for(&usage_report_from_tokens(tokens)))
+                }),
             }),
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
+        // Accumulate the tool-call-only assistant turn into session totals
+        // so the running counter reflects every provider round trip, not
+        // just the final reply.
+        accumulate_session_usage(&mut session, ai_response.tokens.as_ref(), pricing);
         session.messages.push(assistant_tool_msg);
 
         for call in &ai_response.tool_calls {
@@ -283,6 +318,7 @@ pub async fn send_message(
         .and_then(|proposal| proposal.summary.clone())
         .filter(|summary| !summary.trim().is_empty())
         .unwrap_or(final_content);
+    let cost_usd = accumulate_session_usage(&mut session, final_tokens.as_ref(), pricing);
     let assistant_msg = ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::Assistant,
@@ -312,6 +348,7 @@ pub async fn send_message(
             latency_ms: Some(final_latency_ms),
             build_proposal,
             reasoning: final_reasoning,
+            cost_usd,
         }),
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
@@ -438,6 +475,7 @@ pub async fn send_message_stream(
             latency_ms: None,
             build_proposal: None,
             reasoning: None,
+            cost_usd: None,
         }),
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
@@ -457,6 +495,7 @@ pub async fn send_message_stream(
             &abort_flag,
             &mut local_sequence,
             synthetic_stream,
+            None,
         ))
         .catch_unwind()
         .await;
@@ -531,6 +570,7 @@ pub async fn cancel_chat_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_message_stream_inner(
     app: &AppHandle,
     state: &AppState,
@@ -541,6 +581,7 @@ async fn send_message_stream_inner(
     abort_flag: &Arc<AtomicBool>,
     sequence: &mut u32,
     synthetic_stream: bool,
+    reflection: Option<ReflectionContext>,
 ) -> anyhow::Result<ChatMessage> {
     let prompt_mcp_server = match extract_prompt_mcp_server(&req.content) {
         Some(server) => {
@@ -565,6 +606,23 @@ async fn send_message_stream_inner(
         provider_messages.push(system_message(prompt_mcp_system_message(server)));
     }
 
+    // W18: Build sessions get a planning preamble. If a plan already
+    // exists, surface its current state so the agent annotates new tool
+    // calls with `_plan_step`. Otherwise instruct it to call
+    // `submit_plan` first.
+    if matches!(session.mode, ChatMode::Build) {
+        provider_messages.push(system_message(plan_system_message(
+            session.current_plan.as_ref(),
+            session.plan_status.as_ref(),
+        )));
+    }
+
+    // W22: pre-flight budget gate. Fails fast before we open the network
+    // stream so the user gets an honest "budget_exceeded" error instead
+    // of a silently truncated reply.
+    let pricing = pricing_for_provider(state, provider).await;
+    enforce_session_budget(session, pricing, &provider_messages)?;
+
     emit_phase_event(
         app,
         &session.id,
@@ -585,6 +643,7 @@ async fn send_message_stream_inner(
         provider,
         prompt_mcp_server.is_some(),
         synthetic_stream,
+        matches!(session.mode, ChatMode::Build),
     )
     .await
     {
@@ -904,6 +963,12 @@ async fn send_message_stream_inner(
         } else {
             response_with_tools.content.clone()
         };
+        let turn_cost = pricing.and_then(|p| {
+            response_with_tools
+                .tokens
+                .as_ref()
+                .map(|tokens| p.cost_for(&usage_report_from_tokens(tokens)))
+        });
         let assistant_tool_msg = ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: MessageRole::Assistant,
@@ -925,10 +990,38 @@ async fn send_message_stream_inner(
                 latency_ms: Some(response_with_tools.latency_ms),
                 build_proposal: None,
                 reasoning: response_with_tools.reasoning.clone(),
+                cost_usd: turn_cost,
             }),
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
+        // W22: each tool-resume round trip burns tokens; fold them into
+        // session totals so the footer reflects every provider call.
+        accumulate_session_usage(session, response_with_tools.tokens.as_ref(), pricing);
         session.messages.push(assistant_tool_msg);
+
+        // W18: Build sessions enforce a plan before any other tool fires.
+        // If the agent's first batch contains no `submit_plan`, we
+        // synthesize a `plan_required` result for every call, force a
+        // resume, and skip executing the underlying tools.
+        let plan_required_now = matches!(session.mode, ChatMode::Build)
+            && session.current_plan.is_none()
+            && !response_with_tools
+                .tool_calls
+                .iter()
+                .any(|c| c.name == "submit_plan");
+        if plan_required_now {
+            emit_phase_event(
+                app,
+                &session.id,
+                assistant_message_id,
+                sequence,
+                provider,
+                AgentPhase::PlanEnforcement,
+                AgentPhaseStatus::Started,
+                Some("agent attempted a tool call before submitting a plan".to_string()),
+                synthetic_stream,
+            );
+        }
 
         let mut current_tool_results = Vec::new();
         for call in &response_with_tools.tool_calls {
@@ -949,6 +1042,150 @@ async fn send_message_stream_inner(
                 ToolTraceStatus::Requested,
                 synthetic_stream,
             );
+
+            if plan_required_now {
+                let synth = ToolResult {
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: serde_json::json!({ "status": "plan_required" }),
+                    error: Some(
+                        "plan_required: call submit_plan first to outline your steps before any other tool"
+                            .to_string(),
+                    ),
+                };
+                emit_tool_call_event(
+                    app,
+                    session,
+                    assistant_message_id,
+                    sequence,
+                    provider,
+                    call,
+                    ToolTraceStatus::Error,
+                    synthetic_stream,
+                );
+                emit_tool_result_event(
+                    app,
+                    session,
+                    assistant_message_id,
+                    sequence,
+                    provider,
+                    &synth,
+                    synthetic_stream,
+                );
+                current_tool_results.push(synth.clone());
+                persisted_tool_results.push(synth);
+                continue;
+            }
+
+            // W18: submit_plan establishes the per-session plan. We
+            // parse it inline (no external tool call), update the
+            // session, and emit PlanUpdated so the UI renders the
+            // checklist.
+            if call.name == "submit_plan" {
+                let outcome = parse_plan_artifact(&call.arguments);
+                let result_tool = match outcome {
+                    Ok(plan) => {
+                        let initial_status = initial_plan_status(&plan);
+                        session.current_plan = Some(plan.clone());
+                        session.plan_status = Some(initial_status.clone());
+                        emit_plan_updated(
+                            app,
+                            &session.id,
+                            assistant_message_id,
+                            sequence,
+                            provider,
+                            &plan,
+                            &initial_status,
+                            synthetic_stream,
+                        );
+                        emit_phase_event(
+                            app,
+                            &session.id,
+                            assistant_message_id,
+                            sequence,
+                            provider,
+                            AgentPhase::PlanEnforcement,
+                            AgentPhaseStatus::Completed,
+                            Some(format!("plan accepted ({} step(s))", plan.steps.len())),
+                            synthetic_stream,
+                        );
+                        ToolResult {
+                            tool_call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            result: serde_json::json!({
+                                "status": "ok",
+                                "step_count": plan.steps.len(),
+                            }),
+                            error: None,
+                        }
+                    }
+                    Err(error) => ToolResult {
+                        tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        result: serde_json::json!({ "status": "error" }),
+                        error: Some(error.to_string()),
+                    },
+                };
+                let final_status = if result_tool.error.is_some() {
+                    ToolTraceStatus::Error
+                } else {
+                    ToolTraceStatus::Success
+                };
+                emit_tool_call_event(
+                    app,
+                    session,
+                    assistant_message_id,
+                    sequence,
+                    provider,
+                    call,
+                    final_status,
+                    synthetic_stream,
+                );
+                emit_tool_result_event(
+                    app,
+                    session,
+                    assistant_message_id,
+                    sequence,
+                    provider,
+                    &result_tool,
+                    synthetic_stream,
+                );
+                current_tool_results.push(result_tool.clone());
+                persisted_tool_results.push(result_tool);
+                continue;
+            }
+
+            // W18: pop the optional `_plan_step` annotation before the
+            // real tool runs so its schema stays clean. When a step is
+            // tagged, advance status + re-emit PlanUpdated.
+            let mut arguments_owned = call.arguments.clone();
+            let stripped_step = pop_plan_step(&mut arguments_owned);
+            let call_for_exec = crate::models::chat::ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: arguments_owned,
+            };
+            if let (Some(step_id), Some(plan)) =
+                (stripped_step.as_deref(), session.current_plan.clone())
+            {
+                let mut status_map = session
+                    .plan_status
+                    .clone()
+                    .unwrap_or_else(|| initial_plan_status(&plan));
+                if advance_plan_step(&mut status_map, step_id) {
+                    session.plan_status = Some(status_map.clone());
+                    emit_plan_updated(
+                        app,
+                        &session.id,
+                        assistant_message_id,
+                        sequence,
+                        provider,
+                        &plan,
+                        &status_map,
+                        synthetic_stream,
+                    );
+                }
+            }
 
             let result = if recent_repeats > TOOL_LOOP_REPEAT_THRESHOLD {
                 // Short-circuit: same tool + same arguments seen too many
@@ -1017,7 +1254,7 @@ async fn send_message_stream_inner(
                     ToolTraceStatus::Running,
                     synthetic_stream,
                 );
-                let result = execute_chat_tool(state, session, call).await;
+                let result = execute_chat_tool(state, session, &call_for_exec).await;
                 info!(
                     "chat tool call finished: session={} message={} iteration={} tool={} status={}",
                     session.id,
@@ -1247,6 +1484,24 @@ async fn send_message_stream_inner(
         {
             break;
         }
+
+        // W22: post-flight budget gate. If the resume turn we just
+        // recorded already pushed us over the cap, stop before opening
+        // another resume turn instead of grinding more tokens.
+        if let Some(max) = session.max_cost_usd.filter(|m| *m > 0.0) {
+            if session.total_cost_usd >= max {
+                tracing::warn!(
+                    "chat stream stopped mid-resume: session {} hit budget cap ${:.4}",
+                    session.id,
+                    max
+                );
+                final_content = format!(
+                    "Stopped: session budget ${:.4} reached after {tool_iteration} tool iteration(s). Raise the cap or start a new session to continue.",
+                    max
+                );
+                break;
+            }
+        }
     }
 
     if let Some(final_response) =
@@ -1260,6 +1515,9 @@ async fn send_message_stream_inner(
         final_reasoning = final_response
             .reasoning
             .or_else(|| non_empty(reasoning_seen.clone()));
+        // W22: the terminal response (no tool calls) skipped the resume
+        // loop's accumulator path; fold its usage into the session now.
+        accumulate_session_usage(session, final_tokens.as_ref(), pricing);
     }
 
     let mut build_proposal = if matches!(session.mode, ChatMode::Build) {
@@ -1441,22 +1699,69 @@ async fn send_message_stream_inner(
 
     let _ = residual_validation_issues; // surfaced via the typed validation event
 
+    // W18: clean up the session plan now that the assistant turn is
+    // about to end. Any step still `Running` flips to `Done` so the UI
+    // stops spinning on it; a separate `PlanUpdated` event flushes the
+    // final state to subscribers.
+    if let Some(plan) = session.current_plan.clone() {
+        let mut status_map = session
+            .plan_status
+            .clone()
+            .unwrap_or_else(|| initial_plan_status(&plan));
+        if finalize_plan_status(&mut status_map, false) {
+            session.plan_status = Some(status_map.clone());
+            emit_plan_updated(
+                app,
+                &session.id,
+                assistant_message_id,
+                sequence,
+                provider,
+                &plan,
+                &status_map,
+                synthetic_stream,
+            );
+        }
+    }
+
     let assistant_content = build_proposal
         .as_ref()
         .and_then(|proposal| proposal.summary.clone())
         .filter(|summary| !summary.trim().is_empty())
         .unwrap_or(final_content);
+    let mut final_parts = assistant_parts(
+        &assistant_content,
+        final_reasoning.as_ref(),
+        &persisted_tool_calls,
+        &persisted_tool_results,
+        build_proposal.as_ref(),
+    );
+    // W18: surface the plan + current status as a typed part on the
+    // assistant message that owned this turn. UI renders it as a
+    // checklist above the message body.
+    if let (Some(plan), Some(status)) =
+        (session.current_plan.as_ref(), session.plan_status.as_ref())
+    {
+        final_parts.insert(
+            0,
+            ChatMessagePart::Plan {
+                plan: plan.clone(),
+                status: status.clone(),
+            },
+        );
+    }
+    // W18: tag reflection turns so the UI can badge the resulting
+    // message as a suggestion rather than a fresh proposal.
+    if let Some(reflection) = reflection.as_ref() {
+        final_parts.push(ChatMessagePart::ReflectionMeta {
+            widget_ids: reflection.widget_ids.clone(),
+        });
+    }
+
     let assistant_msg = ChatMessage {
         id: assistant_message_id.to_string(),
         role: MessageRole::Assistant,
         content: assistant_content.clone(),
-        parts: assistant_parts(
-            &assistant_content,
-            final_reasoning.as_ref(),
-            &persisted_tool_calls,
-            &persisted_tool_results,
-            build_proposal.as_ref(),
-        ),
+        parts: final_parts,
         mode: session.mode.clone(),
         tool_calls: if persisted_tool_calls.is_empty() {
             None
@@ -1471,10 +1776,15 @@ async fn send_message_stream_inner(
         metadata: Some(MessageMetadata {
             model: Some(final_model),
             provider: Some(final_provider_id),
-            tokens: final_tokens,
+            tokens: final_tokens.clone(),
             latency_ms: Some(final_latency_ms),
             build_proposal,
             reasoning: final_reasoning,
+            cost_usd: pricing.and_then(|p| {
+                final_tokens
+                    .as_ref()
+                    .map(|tokens| p.cost_for(&usage_report_from_tokens(tokens)))
+            }),
         }),
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
@@ -1541,6 +1851,513 @@ async fn send_message_stream_inner(
 fn next_sequence(sequence: &mut u32) -> u32 {
     *sequence += 1;
     *sequence
+}
+
+// ─── W18: plan handling ─────────────────────────────────────────────────────
+
+fn submit_plan_tool_spec() -> AIToolSpec {
+    AIToolSpec {
+        name: "submit_plan".to_string(),
+        description: "Submit your execution plan before running any other tool in this Build session. Required as the FIRST tool call. Each step has a stable id, a one-line title, a kind, optional depends_on, and a one-sentence rationale. After submit_plan, every subsequent tool call MUST include a top-level `_plan_step: \"<step_id>\"` argument so the UI can show progress.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": { "type": "string", "description": "1-2 sentence elevator pitch of the whole plan." },
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "Stable kebab-case id, e.g. 'explore_mcp'." },
+                            "title": { "type": "string", "description": "User-facing one-line description." },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["explore", "fetch", "design", "test", "propose", "other"]
+                            },
+                            "depends_on": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "rationale": { "type": "string", "description": "One sentence on why this step." }
+                        },
+                        "required": ["id", "title", "kind"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["steps", "summary"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Parse a `submit_plan` tool call's arguments into a [`PlanArtifact`].
+fn parse_plan_artifact(args: &serde_json::Value) -> anyhow::Result<PlanArtifact> {
+    #[derive(serde::Deserialize)]
+    struct RawStep {
+        id: String,
+        title: String,
+        kind: PlanStepKind,
+        #[serde(default)]
+        depends_on: Vec<String>,
+        #[serde(default)]
+        rationale: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        summary: String,
+        steps: Vec<RawStep>,
+    }
+    let raw: Raw = serde_json::from_value(args.clone())
+        .map_err(|e| anyhow::anyhow!("submit_plan: invalid arguments: {}", e))?;
+    if raw.steps.is_empty() {
+        return Err(anyhow::anyhow!(
+            "submit_plan: at least one step is required"
+        ));
+    }
+    Ok(PlanArtifact {
+        summary: raw.summary,
+        steps: raw
+            .steps
+            .into_iter()
+            .map(|s| PlanStep {
+                id: s.id,
+                title: s.title,
+                kind: s.kind,
+                depends_on: s.depends_on,
+                rationale: s.rationale,
+            })
+            .collect(),
+        created_at: chrono::Utc::now().timestamp_millis(),
+    })
+}
+
+fn initial_plan_status(plan: &PlanArtifact) -> std::collections::BTreeMap<String, PlanStepStatus> {
+    plan.steps
+        .iter()
+        .map(|step| (step.id.clone(), PlanStepStatus::Pending))
+        .collect()
+}
+
+/// Pop a `_plan_step` argument from the tool call's payload (if any).
+/// Removing it before downstream execution keeps the underlying tools
+/// schema-clean — they never see the plan annotation.
+fn pop_plan_step(arguments: &mut serde_json::Value) -> Option<String> {
+    let map = arguments.as_object_mut()?;
+    let value = map.remove("_plan_step")?;
+    value.as_str().map(|s| s.to_string())
+}
+
+/// Mark `step_id` as running and flush any prior `Running` entry to
+/// `Done`. Returns `true` if the status map actually changed.
+fn advance_plan_step(
+    status: &mut std::collections::BTreeMap<String, PlanStepStatus>,
+    step_id: &str,
+) -> bool {
+    let mut changed = false;
+    for (id, value) in status.iter_mut() {
+        if id == step_id {
+            continue;
+        }
+        if matches!(value, PlanStepStatus::Running) {
+            *value = PlanStepStatus::Done;
+            changed = true;
+        }
+    }
+    let entry = status
+        .entry(step_id.to_string())
+        .or_insert(PlanStepStatus::Pending);
+    if !matches!(entry, PlanStepStatus::Running | PlanStepStatus::Done) {
+        *entry = PlanStepStatus::Running;
+        changed = true;
+    } else if matches!(entry, PlanStepStatus::Pending) {
+        *entry = PlanStepStatus::Running;
+        changed = true;
+    }
+    changed
+}
+
+/// Finalize the plan when the assistant run ends. On `Done` finishes the
+/// remaining `Running` step and leaves untouched `Pending` ones; on
+/// failure flips the active step to `Failed` instead.
+fn finalize_plan_status(
+    status: &mut std::collections::BTreeMap<String, PlanStepStatus>,
+    failed: bool,
+) -> bool {
+    let mut changed = false;
+    for (_, value) in status.iter_mut() {
+        if matches!(value, PlanStepStatus::Running) {
+            *value = if failed {
+                PlanStepStatus::Failed
+            } else {
+                PlanStepStatus::Done
+            };
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_plan_updated(
+    app: &AppHandle,
+    session_id: &str,
+    message_id: &str,
+    sequence: &mut u32,
+    provider: &crate::models::provider::LLMProvider,
+    plan: &PlanArtifact,
+    status: &std::collections::BTreeMap<String, PlanStepStatus>,
+    synthetic: bool,
+) {
+    emit_chat_event(
+        app,
+        ChatEventEnvelope {
+            kind: ChatEventKind::PlanUpdated,
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            sequence: next_sequence(sequence),
+            agent_event: Some(AgentEvent::PlanUpdated {
+                plan: plan.clone(),
+                status: status.clone(),
+            }),
+            provider_id: Some(provider.id.clone()),
+            model: Some(provider.default_model.clone()),
+            content_delta: None,
+            reasoning_delta: None,
+            reasoning: None,
+            tool_call: None,
+            tool_result: None,
+            build_proposal: None,
+            final_message: None,
+            error: None,
+            synthetic,
+            emitted_at: chrono::Utc::now().timestamp_millis(),
+        },
+    );
+}
+
+fn plan_system_message(
+    plan: Option<&PlanArtifact>,
+    status: Option<&std::collections::BTreeMap<String, PlanStepStatus>>,
+) -> String {
+    match plan {
+        None => "## Plan / Execute discipline (W18)\nThis Build session has NO plan yet. Your FIRST tool call MUST be `submit_plan(summary, steps)`. Each step needs id, title, kind, optional depends_on, rationale. After plan submission, every subsequent tool call MUST include a `_plan_step: \"<step_id>\"` argument so the UI tracks progress.".to_string(),
+        Some(plan) => {
+            let status_default = std::collections::BTreeMap::<String, PlanStepStatus>::new();
+            let status = status.unwrap_or(&status_default);
+            let mut body = String::from(
+                "## Current plan (W18)\nA plan is already in flight for this Build session. Continue executing it; include `_plan_step: \"<step_id>\"` in EVERY subsequent tool call so the UI advances. If the user has redirected, you may finish steps as `done` and add new ones via a fresh `submit_plan` call only when the user clearly asked for a new direction.\n\nSummary: ",
+            );
+            body.push_str(&plan.summary);
+            body.push_str("\n\nSteps:\n");
+            for step in &plan.steps {
+                let s = status.get(&step.id).copied().unwrap_or(PlanStepStatus::Pending);
+                let marker = match s {
+                    PlanStepStatus::Pending => "[ ]",
+                    PlanStepStatus::Running => "[~]",
+                    PlanStepStatus::Done => "[x]",
+                    PlanStepStatus::Failed => "[!]",
+                };
+                body.push_str(&format!("- {} {} ({}): {}\n", marker, step.id, kind_label(step.kind), step.title));
+            }
+            body
+        }
+    }
+}
+
+fn kind_label(kind: PlanStepKind) -> &'static str {
+    match kind {
+        PlanStepKind::Explore => "explore",
+        PlanStepKind::Fetch => "fetch",
+        PlanStepKind::Design => "design",
+        PlanStepKind::Test => "test",
+        PlanStepKind::Propose => "propose",
+        PlanStepKind::Other => "other",
+    }
+}
+
+// ─── W18: post-apply reflection turn ────────────────────────────────────────
+
+/// Spawn an asynchronous reflection turn for one widget. Called from
+/// `refresh_widget` when a freshly applied widget produces its first
+/// successful runtime payload.
+pub fn enqueue_reflection_turn(
+    app: AppHandle,
+    state: AppState,
+    pending: ReflectionPending,
+    data: serde_json::Value,
+) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = run_reflection_turn(&app, &state, &pending, &data).await {
+            tracing::warn!(
+                "post-apply reflection failed for widget {}: {}",
+                pending.widget_id,
+                error
+            );
+        }
+    });
+}
+
+async fn run_reflection_turn(
+    app: &AppHandle,
+    state: &AppState,
+    pending: &ReflectionPending,
+    data: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let session = match state.storage.get_chat_session(&pending.session_id).await? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    if !matches!(session.mode, ChatMode::Build) {
+        // Reflection only makes sense in Build mode — the agent has
+        // proposal-shaped tooling there.
+        return Ok(());
+    }
+
+    let providers = state.storage.list_providers().await?;
+    let active_provider_id = state
+        .storage
+        .get_config("active_provider_id")
+        .await?
+        .filter(|id| !id.trim().is_empty());
+    let provider = match active_provider_id
+        .as_deref()
+        .and_then(|id| providers.iter().find(|p| p.id == id && p.is_enabled))
+        .or_else(|| providers.iter().find(|p| p.is_enabled))
+        .cloned()
+    {
+        Some(p) => p,
+        None => {
+            tracing::info!("reflection skipped: no enabled provider");
+            return Ok(());
+        }
+    };
+
+    let preview = preview_json(data);
+    let preview_text = serde_json::to_string(&preview).unwrap_or_default();
+    let action = if pending.replaced {
+        "replaced"
+    } else {
+        "added"
+    };
+    let content = format!(
+        "[reflection] Widget you just {action} just rendered live data after applying the proposal.\n- widget_id: {}\n- title: \"{}\"\n- kind: {}\n- runtime preview: {}\n\nCritique your own output. If the value looks broken (null / empty / zero / wrong shape / off-domain), emit a fix-up BuildProposal as a DELTA with `replace_widget_id: \"{}\"` and an updated pipeline. If the value looks correct for the user's intent, reply with one short line acknowledging it — DO NOT emit JSON.",
+        pending.widget_id, pending.widget_title, pending.widget_kind, preview_text, pending.widget_id
+    );
+    spawn_chat_streaming_turn(
+        app.clone(),
+        state.clone(),
+        session,
+        provider,
+        SendMessageRequest { content },
+        Some(ReflectionContext {
+            widget_ids: vec![pending.widget_id.clone()],
+        }),
+    )
+    .await
+}
+
+/// W21: spin up a new chat session and run an autonomous turn off the
+/// back of a firing alert. Returns the session id so the caller can
+/// persist it on the `alert_events` row for budget tracking + the
+/// "View" deep link in the follow-up notification.
+pub async fn spawn_autonomous_alert_turn(
+    app: AppHandle,
+    state: AppState,
+    mode: ChatMode,
+    dashboard_id: Option<String>,
+    widget_id: Option<String>,
+    title: String,
+    prompt: String,
+    max_cost_usd: Option<f64>,
+) -> anyhow::Result<String> {
+    let providers = state.storage.list_providers().await?;
+    let active_provider_id = state
+        .storage
+        .get_config("active_provider_id")
+        .await?
+        .filter(|id| !id.trim().is_empty());
+    let provider = active_provider_id
+        .as_deref()
+        .and_then(|id| providers.iter().find(|p| p.id == id && p.is_enabled))
+        .or_else(|| providers.iter().find(|p| p.is_enabled))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no enabled LLM provider to run autonomous alert"))?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let session = ChatSession {
+        id: uuid::Uuid::new_v4().to_string(),
+        mode,
+        dashboard_id,
+        widget_id,
+        title,
+        messages: vec![],
+        current_plan: None,
+        plan_status: None,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_reasoning_tokens: 0,
+        total_cost_usd: 0.0,
+        max_cost_usd,
+        created_at: now,
+        updated_at: now,
+    };
+    state.storage.create_chat_session(&session).await?;
+    let session_id = session.id.clone();
+
+    spawn_chat_streaming_turn(
+        app,
+        state,
+        session,
+        provider,
+        SendMessageRequest { content: prompt },
+        None,
+    )
+    .await?;
+    Ok(session_id)
+}
+
+/// Shared entry point that mirrors `send_message_stream` for callers
+/// that already hold the session and provider (W18 reflection,
+/// W21 alerts).
+async fn spawn_chat_streaming_turn(
+    app: AppHandle,
+    state: AppState,
+    mut session: ChatSession,
+    provider: crate::models::provider::LLMProvider,
+    req: SendMessageRequest,
+    reflection: Option<ReflectionContext>,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let user_msg = ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: MessageRole::User,
+        content: req.content.clone(),
+        parts: text_parts(&req.content),
+        mode: session.mode.clone(),
+        tool_calls: None,
+        tool_results: None,
+        metadata: None,
+        timestamp: now,
+    };
+    session.messages.push(user_msg);
+    session.updated_at = now;
+    state.storage.update_chat_session(&session).await?;
+
+    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+    let synthetic_stream = !matches!(
+        provider.kind,
+        crate::models::provider::ProviderKind::Openrouter
+            | crate::models::provider::ProviderKind::Custom
+    );
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let session_id = session.id.clone();
+    state
+        .chat_abort_flags
+        .insert(session_id.clone(), abort_flag.clone());
+
+    let mut sequence = 0_u32;
+    emit_chat_event(
+        &app,
+        ChatEventEnvelope {
+            kind: ChatEventKind::MessageStarted,
+            session_id: session_id.clone(),
+            message_id: assistant_message_id.clone(),
+            sequence: next_sequence(&mut sequence),
+            agent_event: Some(AgentEvent::RunStarted),
+            provider_id: Some(provider.id.clone()),
+            model: Some(provider.default_model.clone()),
+            content_delta: None,
+            reasoning_delta: None,
+            reasoning: None,
+            tool_call: None,
+            tool_result: None,
+            build_proposal: None,
+            final_message: None,
+            error: None,
+            synthetic: synthetic_stream,
+            emitted_at: chrono::Utc::now().timestamp_millis(),
+        },
+    );
+
+    let app_for_task = app.clone();
+    let state_for_task = state.clone();
+    let session_id_for_task = session_id.clone();
+    let provider_for_task = provider.clone();
+    let assistant_message_id_for_task = assistant_message_id.clone();
+    let reflection_for_task = reflection.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut local_sequence = sequence;
+        let outcome = AssertUnwindSafe(send_message_stream_inner(
+            &app_for_task,
+            &state_for_task,
+            &mut session,
+            &provider_for_task,
+            &req,
+            &assistant_message_id_for_task,
+            &abort_flag,
+            &mut local_sequence,
+            synthetic_stream,
+            reflection_for_task,
+        ))
+        .catch_unwind()
+        .await;
+
+        state_for_task.chat_abort_flags.remove(&session_id_for_task);
+
+        let terminal: Option<(ChatEventKind, AgentEvent, String)> = match outcome {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some((
+                failed_event_kind(&error),
+                failed_agent_event(&error),
+                error.to_string(),
+            )),
+            Err(panic) => {
+                let message = panic_message(panic);
+                tracing::error!(
+                    "reflection stream panicked: session={} message={} reason={}",
+                    session_id_for_task,
+                    assistant_message_id_for_task,
+                    message
+                );
+                Some((
+                    ChatEventKind::MessageFailed,
+                    AgentEvent::RunError {
+                        message: format!("chat_stream_panicked: {message}"),
+                        recoverable: true,
+                    },
+                    format!("chat_stream_panicked: {message}"),
+                ))
+            }
+        };
+
+        if let Some((kind, agent_event, error_text)) = terminal {
+            emit_chat_event(
+                &app_for_task,
+                ChatEventEnvelope {
+                    kind,
+                    session_id: session_id_for_task,
+                    message_id: assistant_message_id_for_task,
+                    sequence: next_sequence(&mut local_sequence),
+                    agent_event: Some(agent_event),
+                    provider_id: Some(provider_for_task.id),
+                    model: Some(provider_for_task.default_model),
+                    content_delta: None,
+                    reasoning_delta: None,
+                    reasoning: None,
+                    tool_call: None,
+                    tool_result: None,
+                    build_proposal: None,
+                    final_message: None,
+                    error: Some(error_text),
+                    synthetic: synthetic_stream,
+                    emitted_at: chrono::Utc::now().timestamp_millis(),
+                },
+            );
+        }
+    });
+    Ok(())
 }
 
 fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
@@ -1759,6 +2576,129 @@ fn non_empty(value: String) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+// ─── W22: token + cost accounting ───────────────────────────────────────────
+
+/// Convert a wire `TokenUsage` into the richer `UsageReport` used by the
+/// pricing layer.
+fn usage_report_from_tokens(tokens: &TokenUsage) -> UsageReport {
+    UsageReport::new(tokens.prompt, tokens.completion, tokens.reasoning)
+}
+
+/// Resolve the pricing entry for this provider+model, consulting the
+/// user-editable overrides file first. Errors are downgraded to `None`
+/// (means "no pricing data, can't compute cost") so a broken overrides
+/// file never blocks a chat turn.
+pub async fn pricing_for_provider(
+    state: &AppState,
+    provider: &crate::models::provider::LLMProvider,
+) -> Option<ModelPricing> {
+    let overrides = load_pricing_overrides(state).await.unwrap_or_default();
+    pricing_for(provider.kind, &provider.default_model, &overrides)
+}
+
+/// Load and parse `pricing_overrides.json`. Missing file or invalid
+/// JSON returns an empty list — never an error — so the chat path keeps
+/// flowing.
+pub async fn load_pricing_overrides(state: &AppState) -> anyhow::Result<Vec<ModelPricingOverride>> {
+    let path = state.storage.pricing_overrides_path();
+    match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => {
+            let parsed: crate::models::pricing::PricingOverridesFile =
+                serde_json::from_str(&raw).unwrap_or_default();
+            Ok(parsed.overrides)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => {
+            tracing::warn!(
+                "pricing_overrides.json read failed at {}: {}",
+                path.display(),
+                error
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Pre-flight estimate: how many extra USD will this provider request
+/// add to the session, given the messages we're about to send? Uses
+/// input pricing on a chars/4 token approximation when the provider
+/// doesn't pre-report usage, plus a small completion buffer so the gate
+/// trips before the request actually overruns.
+fn estimate_request_cost(
+    pricing: ModelPricing,
+    provider_messages: &[ChatMessage],
+    completion_token_buffer: u32,
+) -> f64 {
+    let approx_input_tokens: u32 = provider_messages
+        .iter()
+        .map(|message| (message.content.len() / 4).max(1) as u32)
+        .sum();
+    let estimate_usage = UsageReport::new(approx_input_tokens, completion_token_buffer, None);
+    pricing.cost_for(&estimate_usage)
+}
+
+/// Returns `Err(budget_exceeded)` if running this request would push the
+/// session past its `max_cost_usd` cap. `None` for either argument means
+/// "skip the check" — no cap configured or no pricing data available.
+pub fn enforce_session_budget(
+    session: &ChatSession,
+    pricing: Option<ModelPricing>,
+    provider_messages: &[ChatMessage],
+) -> anyhow::Result<()> {
+    let Some(max) = session.max_cost_usd.filter(|m| *m > 0.0) else {
+        return Ok(());
+    };
+    if session.total_cost_usd >= max {
+        return Err(anyhow::anyhow!(
+            "budget_exceeded: session limit ${:.4} already reached (spent ${:.4})",
+            max,
+            session.total_cost_usd
+        ));
+    }
+    let Some(pricing) = pricing else {
+        return Ok(());
+    };
+    // Reserve ~512 completion tokens so a single follow-up reply can't
+    // silently overshoot the cap.
+    let projected = session.total_cost_usd + estimate_request_cost(pricing, provider_messages, 512);
+    if projected > max {
+        return Err(anyhow::anyhow!(
+            "budget_exceeded: next request would push session past ${:.4} (spent ${:.4}, projected +${:.4})",
+            max,
+            session.total_cost_usd,
+            projected - session.total_cost_usd
+        ));
+    }
+    Ok(())
+}
+
+/// Apply a single assistant turn's usage to the session's running
+/// totals. Returns the computed `cost_usd` for the turn (so callers can
+/// stamp it onto `MessageMetadata`).
+fn accumulate_session_usage(
+    session: &mut ChatSession,
+    tokens: Option<&TokenUsage>,
+    pricing: Option<ModelPricing>,
+) -> Option<f64> {
+    let tokens = tokens?;
+    session.total_input_tokens = session
+        .total_input_tokens
+        .saturating_add(tokens.prompt as u64);
+    session.total_output_tokens = session
+        .total_output_tokens
+        .saturating_add(tokens.completion as u64);
+    if let Some(reasoning) = tokens.reasoning {
+        session.total_reasoning_tokens = session
+            .total_reasoning_tokens
+            .saturating_add(reasoning as u64);
+    }
+    let pricing = pricing?;
+    let usage = usage_report_from_tokens(tokens);
+    let cost = pricing.cost_for(&usage);
+    session.total_cost_usd += cost;
+    Some(cost)
 }
 
 /// W16: deterministic serialisation for tool-call argument comparison.
@@ -2346,6 +3286,42 @@ All sizes assume a **12-col** grid. Typical sizes per widget kind:
   runtime: either `{{ cells: [{{x, y, value}}] }}` or a 2D array `[[v00, v01, ...], [v10, ...]]`.
   config: `{{ color_scheme?: 'viridis'|'magma'|'cool'|'warm'|'green_red', x_label?, y_label?, unit?, show_legend?, log_scale? }}`.
 
+Dashboard parameters (Grafana-style template variables)
+When the user's request implies switching between several values (project names, environments, time ranges, services, regions), declare a `parameters` entry on the proposal root and reference it as `$name` or `${{name}}` inside widget `datasource_plan.arguments` / pipeline step configs instead of hardcoding the value.
+
+How to use:
+1. Add `parameters: [{{id, name, label, kind, default?, ...}}]` to the proposal root. `name` is what the widget refs as `$name`. `kind` is one of: `static_list` (fixed dropdown), `text_input`, `time_range`, `interval`, `constant`, `mcp_query`, `http_query`.
+2. Reference the parameter inside widget arguments: `"arguments": {{"project": "$project"}}`. Whole-string tokens (`"$project"`) preserve type; mixed strings (`"/api/$project/list"`) interpolate as text.
+3. Call `dry_run_widget` with `parameters` AND `parameter_values` so the dry-run substitutes a concrete value.
+
+Example: build dashboard for any of several projects
+```
+parameters: [{{
+  id: "project",
+  name: "project",
+  label: "Project",
+  kind: "static_list",
+  options: [{{label: "Alpha", value: "alpha"}}, {{label: "Beta", value: "beta"}}],
+  default: "alpha"
+}}]
+widgets: [{{
+  title: "Release count",
+  widget_type: "stat",
+  datasource_plan: {{
+    kind: "mcp_tool",
+    server_id: "yandex",
+    tool_name: "get_releases",
+    arguments: {{"project": "$project"}},
+    pipeline: [{{kind: "length"}}]
+  }}
+}}]
+```
+
+When NOT to use:
+- Single-value dashboards where the value will never change (a literal is fine).
+- Values derived from MCP tool output (use a pipeline step instead).
+- The widget label / title — parameters drive datasource arguments, not display strings.
+
 Shared datasources (share data across widgets)
 When 2+ widgets pull from the same MCP/HTTP call, declare a SHARED datasource at the proposal level and have each widget reference it. The shared workflow runs once per refresh and fans out to every consumer - one MCP call, multiple widgets, consistent data.
 
@@ -2544,8 +3520,13 @@ async fn chat_tool_specs(
     provider: &crate::models::provider::LLMProvider,
     require_mcp: bool,
     synthetic_stream: bool,
+    build_mode: bool,
 ) -> anyhow::Result<Vec<AIToolSpec>> {
-    let mut specs = vec![AIToolSpec {
+    let mut specs: Vec<AIToolSpec> = Vec::new();
+    if build_mode {
+        specs.push(submit_plan_tool_spec());
+    }
+    specs.push(AIToolSpec {
         name: "http_request".to_string(),
         description: "Make a policy-gated HTTP request through Datrina's Rust ToolEngine. Localhost, private networks, and blocked schemes are denied.".to_string(),
         parameters: serde_json::json!({
@@ -2559,7 +3540,7 @@ async fn chat_tool_specs(
             "required": ["method", "url"],
             "additionalProperties": false
         }),
-    }];
+    });
 
     let mcp_tools = match tokio::time::timeout(
         tokio::time::Duration::from_secs(20),
@@ -2631,7 +3612,7 @@ async fn chat_tool_specs(
     // aggregates, anything with `llm_postprocess`.
     specs.push(AIToolSpec {
         name: "dry_run_widget".to_string(),
-        description: "Test a single widget proposal end-to-end without persisting anything: builds the workflow, runs the datasource_plan + pipeline once, and returns the actual widget runtime data or the error. Use this BEFORE committing widgets to the final dashboard proposal so you can verify the pipeline produces the right shape (a number for stat/gauge, an array of objects for chart/table, etc.). Cheap to call. For widgets with datasource_plan.kind='shared', ALSO pass the matching `shared_datasources` entry so the dry run can inline the source + base pipeline.".to_string(),
+        description: "Test a single widget proposal end-to-end without persisting anything: builds the workflow, runs the datasource_plan + pipeline once, and returns the actual widget runtime data or the error. Use this BEFORE committing widgets to the final dashboard proposal so you can verify the pipeline produces the right shape (a number for stat/gauge, an array of objects for chart/table, etc.). Cheap to call. For widgets with datasource_plan.kind='shared', ALSO pass the matching `shared_datasources` entry so the dry run can inline the source + base pipeline. If the widget references `$param` tokens, pass `parameters` (declarations) and `parameter_values` (concrete values) so substitution happens at dry-run time.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -2644,6 +3625,16 @@ async fn chat_tool_specs(
                     "type": "array",
                     "description": "Optional list of SharedDatasource entries the widget might reference via source_key. Required when proposal.datasource_plan.kind='shared'.",
                     "items": { "type": "object", "additionalProperties": true }
+                },
+                "parameters": {
+                    "type": "array",
+                    "description": "W25: dashboard parameter declarations referenced by the widget. Required when the widget references `$name` tokens so the dry-run can substitute them.",
+                    "items": { "type": "object", "additionalProperties": true }
+                },
+                "parameter_values": {
+                    "type": "object",
+                    "description": "W25: concrete values keyed by parameter name. Used to substitute `$name` tokens before the dry-run executes.",
+                    "additionalProperties": true
                 }
             },
             "required": ["proposal"],
@@ -2657,8 +3648,13 @@ async fn chat_tool_specs(
 async fn chat_tool_specs_silent(
     state: &AppState,
     require_mcp: bool,
+    build_mode: bool,
 ) -> anyhow::Result<Vec<AIToolSpec>> {
-    let mut specs = vec![AIToolSpec {
+    let mut specs: Vec<AIToolSpec> = Vec::new();
+    if build_mode {
+        specs.push(submit_plan_tool_spec());
+    }
+    specs.push(AIToolSpec {
         name: "http_request".to_string(),
         description: "Make a policy-gated HTTP request through Datrina's Rust ToolEngine. Localhost, private networks, and blocked schemes are denied.".to_string(),
         parameters: serde_json::json!({
@@ -2672,7 +3668,7 @@ async fn chat_tool_specs_silent(
             "required": ["method", "url"],
             "additionalProperties": false
         }),
-    }];
+    });
 
     let mcp_tools = match tokio::time::timeout(
         tokio::time::Duration::from_secs(20),
@@ -2750,6 +3746,8 @@ async fn execute_dry_run_widget(
     state: &AppState,
     proposal_value: serde_json::Value,
     shared_value: Option<serde_json::Value>,
+    parameters_value: Option<serde_json::Value>,
+    parameter_values_value: Option<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
     let proposal: crate::models::dashboard::BuildWidgetProposal =
         serde_json::from_value(proposal_value)
@@ -2762,6 +3760,35 @@ async fn execute_dry_run_widget(
     };
     let proposal =
         crate::commands::dashboard::inline_shared_into_widget(proposal, shared_datasources)?;
+
+    // W25: optional parameter substitution. The agent may pass declared
+    // parameters + concrete values so a dry-run with `$project` resolves
+    // to a real value at proposal time.
+    let parameters: Vec<crate::models::dashboard::DashboardParameter> = match parameters_value {
+        Some(value) => serde_json::from_value(value)
+            .map_err(|e| anyhow::anyhow!("dry_run_widget: invalid parameters shape: {}", e))?,
+        None => Vec::new(),
+    };
+    let parameter_values: std::collections::BTreeMap<
+        String,
+        crate::models::dashboard::ParameterValue,
+    > = match parameter_values_value {
+        Some(value) => serde_json::from_value(value).map_err(|e| {
+            anyhow::anyhow!("dry_run_widget: invalid parameter_values shape: {}", e)
+        })?,
+        None => std::collections::BTreeMap::new(),
+    };
+    let resolved_params = if parameters.is_empty() && parameter_values.is_empty() {
+        None
+    } else if parameters.is_empty() {
+        Some(crate::modules::parameter_engine::ResolvedParameters::from_map(parameter_values))
+    } else {
+        crate::modules::parameter_engine::ResolvedParameters::resolve(
+            &parameters,
+            &parameter_values,
+        )
+        .ok()
+    };
     let now = chrono::Utc::now().timestamp_millis();
     let pipeline_steps = proposal
         .datasource_plan
@@ -2781,11 +3808,20 @@ async fn execute_dry_run_widget(
         })
         .unwrap_or(false);
 
-    let (widget, workflow) = crate::commands::dashboard::proposal_widget_public(&proposal, 0, now)?;
+    let (widget, mut workflow) =
+        crate::commands::dashboard::proposal_widget_public(&proposal, 0, now)?;
     use crate::commands::dashboard::WidgetDatasource;
     let datasource = widget
         .datasource()
         .ok_or_else(|| anyhow::anyhow!("Widget has no datasource workflow"))?;
+
+    if let Some(params) = &resolved_params {
+        crate::modules::parameter_engine::substitute_workflow(
+            &mut workflow,
+            params,
+            crate::modules::parameter_engine::SubstituteOptions::default(),
+        );
+    }
 
     // Reconnect MCP servers for the duration of this single run.
     let mcp_servers = state.storage.list_mcp_servers().await?;
@@ -2926,7 +3962,16 @@ async fn execute_chat_tool(
                 serde_json::Value::Object(call.arguments.as_object().cloned().unwrap_or_default())
             });
             let shared_value = call.arguments.get("shared_datasources").cloned();
-            execute_dry_run_widget(state, proposal_value, shared_value).await
+            let parameters_value = call.arguments.get("parameters").cloned();
+            let parameter_values_value = call.arguments.get("parameter_values").cloned();
+            execute_dry_run_widget(
+                state,
+                proposal_value,
+                shared_value,
+                parameters_value,
+                parameter_values_value,
+            )
+            .await
         }
         "recall" => execute_recall_tool(state, session, &call.arguments).await,
         _ => Err(anyhow::anyhow!(
@@ -3555,5 +4600,100 @@ mod tests {
         assert_eq!(count_recent_repeats(&deque, &key), 2);
         deque.push_back(("other".to_string(), "{}".to_string()));
         assert_eq!(count_recent_repeats(&deque, &key), 2);
+    }
+
+    fn empty_session_with_cap(cap: Option<f64>, spent: f64) -> ChatSession {
+        ChatSession {
+            id: "s".to_string(),
+            mode: ChatMode::Build,
+            dashboard_id: None,
+            widget_id: None,
+            title: "t".to_string(),
+            messages: vec![],
+            current_plan: None,
+            plan_status: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_reasoning_tokens: 0,
+            total_cost_usd: spent,
+            max_cost_usd: cap,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn budget_check_passes_without_cap() {
+        let session = empty_session_with_cap(None, 0.0);
+        assert!(enforce_session_budget(&session, None, &[]).is_ok());
+    }
+
+    #[test]
+    fn budget_check_blocks_when_already_over_cap() {
+        let session = empty_session_with_cap(Some(0.01), 0.05);
+        let err = enforce_session_budget(&session, None, &[]).unwrap_err();
+        assert!(err.to_string().contains("budget_exceeded"));
+    }
+
+    #[test]
+    fn budget_check_blocks_when_projection_exceeds_cap() {
+        // 200k input tokens at $10/1M = $2.00 input cost alone.
+        let session = empty_session_with_cap(Some(0.50), 0.0);
+        let pricing = ModelPricing {
+            input_usd_per_1m: 10.0,
+            output_usd_per_1m: 30.0,
+            reasoning_usd_per_1m: None,
+        };
+        let messages: Vec<ChatMessage> = (0..200)
+            .map(|i| ChatMessage {
+                id: format!("m-{i}"),
+                role: MessageRole::User,
+                content: "x".repeat(4_000),
+                parts: vec![],
+                mode: ChatMode::Build,
+                tool_calls: None,
+                tool_results: None,
+                metadata: None,
+                timestamp: 0,
+            })
+            .collect();
+        let err = enforce_session_budget(&session, Some(pricing), &messages).unwrap_err();
+        assert!(err.to_string().contains("budget_exceeded"));
+    }
+
+    #[test]
+    fn accumulate_session_usage_updates_totals_and_cost() {
+        let mut session = empty_session_with_cap(Some(1.00), 0.0);
+        let pricing = ModelPricing {
+            input_usd_per_1m: 1.0,
+            output_usd_per_1m: 3.0,
+            reasoning_usd_per_1m: None,
+        };
+        let tokens = TokenUsage {
+            prompt: 1_000_000,
+            completion: 1_000_000,
+            reasoning: None,
+        };
+        let cost = accumulate_session_usage(&mut session, Some(&tokens), Some(pricing));
+        assert_eq!(session.total_input_tokens, 1_000_000);
+        assert_eq!(session.total_output_tokens, 1_000_000);
+        assert!((session.total_cost_usd - 4.0).abs() < 1e-9);
+        assert!((cost.unwrap() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn accumulate_without_pricing_still_tracks_tokens() {
+        let mut session = empty_session_with_cap(None, 0.0);
+        let tokens = TokenUsage {
+            prompt: 100,
+            completion: 50,
+            reasoning: Some(20),
+        };
+        let cost = accumulate_session_usage(&mut session, Some(&tokens), None);
+        assert_eq!(session.total_input_tokens, 100);
+        assert_eq!(session.total_output_tokens, 50);
+        assert_eq!(session.total_reasoning_tokens, 20);
+        assert_eq!(session.total_cost_usd, 0.0);
+        assert!(cost.is_none());
     }
 }

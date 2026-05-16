@@ -21,6 +21,71 @@ export interface Dashboard {
   is_default: boolean;
   created_at: number;
   updated_at: number;
+  /** W25: Grafana-style template variables. */
+  parameters?: DashboardParameter[];
+}
+
+// ─── W25: Dashboard parameters ──────────────────────────────────────────────
+
+export type ParameterValue =
+  | string
+  | number
+  | boolean
+  | { from: number; to: number }
+  | ParameterValue[];
+
+export interface ParameterOption {
+  label: string;
+  value: ParameterValue;
+}
+
+export type DashboardParameterKind =
+  | { kind: 'static_list'; options: ParameterOption[] }
+  | { kind: 'text_input'; placeholder?: string }
+  | { kind: 'time_range'; default_preset?: string }
+  | { kind: 'interval'; presets: string[] }
+  | {
+      kind: 'mcp_query';
+      server_id: string;
+      tool_name: string;
+      arguments?: unknown;
+      pipeline?: unknown[];
+    }
+  | {
+      kind: 'http_query';
+      method: string;
+      url: string;
+      headers?: unknown;
+      body?: unknown;
+      pipeline?: unknown[];
+    }
+  | { kind: 'constant'; value: ParameterValue };
+
+export type DashboardParameter = {
+  id: string;
+  name: string;
+  label: string;
+  multi?: boolean;
+  include_all?: boolean;
+  default?: ParameterValue;
+  depends_on?: string[];
+  description?: string;
+} & DashboardParameterKind;
+
+export interface DashboardParameterState {
+  parameter: DashboardParameter;
+  value?: ParameterValue;
+  options: ParameterOption[];
+  options_error?: string;
+}
+
+export interface SetDashboardParameterResult {
+  affected_widget_ids: string[];
+}
+
+export interface ResolveDashboardParametersResult {
+  values: Record<string, ParameterValue>;
+  cycle?: string[];
 }
 
 export type WidgetType = 'chart' | 'text' | 'table' | 'image' | 'gauge' | 'stat' | 'logs' | 'bar_gauge' | 'status_grid' | 'heatmap';
@@ -333,6 +398,8 @@ export interface DatasourceConfig {
   workflow_id: string;
   output_key: string;
   post_process?: PostProcessStep[];
+  /** W23: opt-in pipeline trace capture on every refresh. */
+  capture_traces?: boolean;
 }
 
 export interface PostProcessStep {
@@ -389,8 +456,34 @@ export interface ChatSession {
   widget_id?: string;
   title: string;
   messages: ChatMessage[];
+  current_plan?: PlanArtifact | null;
+  plan_status?: Record<string, PlanStepStatus> | null;
+  /** W22: running per-session token + cost totals. */
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  total_reasoning_tokens?: number;
+  total_cost_usd?: number;
+  /** W22: optional per-session USD budget cap. Null/undefined == no cap. */
+  max_cost_usd?: number | null;
   created_at: number;
   updated_at: number;
+}
+
+export type PlanStepKind = 'explore' | 'fetch' | 'design' | 'test' | 'propose' | 'other';
+export type PlanStepStatus = 'pending' | 'running' | 'done' | 'failed';
+
+export interface PlanStep {
+  id: string;
+  title: string;
+  kind: PlanStepKind;
+  depends_on?: string[];
+  rationale?: string;
+}
+
+export interface PlanArtifact {
+  summary: string;
+  steps: PlanStep[];
+  created_at: number;
 }
 
 export interface ChatMessage {
@@ -440,7 +533,13 @@ export type ChatMessagePart =
       issues: ValidationIssue[];
       retried: boolean;
       updated_at: number;
-    };
+    }
+  | {
+      type: 'plan';
+      plan: PlanArtifact;
+      status: Record<string, PlanStepStatus>;
+    }
+  | { type: 'reflection_meta'; widget_ids: string[] };
 
 export interface AgentPhaseEntry {
   key: string;
@@ -467,10 +566,12 @@ export interface ToolResult {
 export interface MessageMetadata {
   model?: string;
   provider?: string;
-  tokens?: { prompt: number; completion: number };
+  tokens?: { prompt: number; completion: number; reasoning?: number };
   latency_ms?: number;
   build_proposal?: BuildProposal;
   reasoning?: string;
+  /** W22: resolved USD cost for this single assistant turn. */
+  cost_usd?: number;
 }
 
 export type ChatEventKind =
@@ -486,7 +587,8 @@ export type ChatEventKind =
   | 'message_failed'
   | 'message_cancelled'
   | 'agent_phase'
-  | 'proposal_validation';
+  | 'proposal_validation'
+  | 'plan_updated';
 
 export type AgentPhaseStatus = 'started' | 'completed' | 'failed';
 
@@ -497,7 +599,8 @@ export type AgentPhase =
   | { kind: 'provider_first_byte' }
   | { kind: 'tool_resume'; iteration: number }
   | { kind: 'loop_detected'; tool_name: string }
-  | { kind: 'proposal_validation' };
+  | { kind: 'proposal_validation' }
+  | { kind: 'plan_enforcement' };
 
 export type ValidationIssue =
   | {
@@ -587,6 +690,11 @@ export type AgentEvent =
       status: AgentPhaseStatus;
       issues: ValidationIssue[];
       retried: boolean;
+    }
+  | {
+      type: 'plan_updated';
+      plan: PlanArtifact;
+      status: Record<string, PlanStepStatus>;
     };
 
 export interface ChatEventEnvelope {
@@ -645,6 +753,8 @@ export interface BuildProposal {
   widgets: BuildWidgetProposal[];
   remove_widget_ids?: string[];
   shared_datasources?: SharedDatasource[];
+  /** W25: dashboard-level template variables proposed alongside widgets. */
+  parameters?: DashboardParameter[];
 }
 
 export interface SharedDatasource {
@@ -809,6 +919,55 @@ async function callVoid(command: string, args?: Record<string, unknown>): Promis
 
 // ─── Dashboard API ───────────────────────────────────────────────────────────
 
+export type DashboardVersionSource = 'agent_apply' | 'manual_edit' | 'restore' | 'pre_delete';
+
+export interface DashboardVersionSummary {
+  id: string;
+  dashboard_id: string;
+  applied_at: number;
+  source: DashboardVersionSource;
+  summary: string;
+  widget_count: number;
+  source_session_id?: string;
+  parent_version_id?: string;
+}
+
+export interface DashboardVersion extends DashboardVersionSummary {
+  snapshot: Dashboard;
+}
+
+export interface JsonPathChange {
+  path: string;
+  before: unknown;
+  after: unknown;
+}
+
+export interface WidgetSummary {
+  id: string;
+  title: string;
+  kind: string;
+}
+
+export interface WidgetDiff {
+  widget_id: string;
+  widget_title: string;
+  kind_changed?: [string, string];
+  title_changed?: [string, string];
+  config_changes: JsonPathChange[];
+  datasource_plan_changed: boolean;
+}
+
+export interface DashboardDiff {
+  from_version_id: string;
+  to_version_id: string;
+  added_widgets: WidgetSummary[];
+  removed_widgets: WidgetSummary[];
+  modified_widgets: WidgetDiff[];
+  name_changed?: [string, string];
+  description_changed?: [string | null, string | null];
+  layout_changed: boolean;
+}
+
 export const dashboardApi = {
   list: () => call<Dashboard[]>('list_dashboards'),
   get: (id: string) => call<Dashboard>('get_dashboard', { id }),
@@ -833,12 +992,92 @@ export const dashboardApi = {
     proposal: BuildProposal;
     dashboard_id?: string;
     confirmed: boolean;
+    session_id?: string;
   }) => call<Dashboard>('apply_build_proposal', { req }),
   dryRunWidget: (proposal: BuildWidgetProposal, sharedDatasources?: SharedDatasource[]) =>
     call<WidgetDryRunResult>('dry_run_widget', { proposal, sharedDatasources }),
   delete: (id: string) => call<boolean>('delete_dashboard', { id }),
   refreshWidget: (dashboardId: string, widgetId: string) =>
     call<WidgetRefreshResult>('refresh_widget', { dashboardId, widgetId }),
+  listVersions: (dashboardId: string) =>
+    call<DashboardVersionSummary[]>('list_dashboard_versions', { dashboardId }),
+  getVersion: (versionId: string) =>
+    call<DashboardVersion>('get_dashboard_version', { versionId }),
+  diffVersions: (fromId: string, toId: string) =>
+    call<DashboardDiff>('diff_dashboard_versions', { fromId, toId }),
+  restoreVersion: (versionId: string) =>
+    call<Dashboard>('restore_dashboard_version', { versionId }),
+  // W25: parameters
+  listParameters: (dashboardId: string) =>
+    call<DashboardParameterState[]>('list_dashboard_parameters', { dashboardId }),
+  getParameterValues: (dashboardId: string) =>
+    call<Record<string, ParameterValue>>('get_dashboard_parameter_values', { dashboardId }),
+  setParameterValue: (dashboardId: string, paramName: string, value: ParameterValue) =>
+    call<SetDashboardParameterResult>('set_dashboard_parameter_value', {
+      dashboardId,
+      paramName,
+      value,
+    }),
+  resolveParameters: (dashboardId: string) =>
+    call<ResolveDashboardParametersResult>('resolve_dashboard_parameters', { dashboardId }),
+};
+
+// ─── W23: Pipeline Debug API ────────────────────────────────────────────────
+
+export interface SizeHint {
+  items?: number;
+  bytes?: number;
+}
+
+export type SampleKind = 'value' | 'array_head' | 'object' | 'null' | 'truncated_string';
+
+export interface SampleValue {
+  kind: SampleKind;
+  size_hint: SizeHint;
+  preview: unknown;
+}
+
+export interface PipelineStepTrace {
+  index: number;
+  kind: string;
+  config_json: unknown;
+  input_sample: SampleValue;
+  output_sample: SampleValue;
+  duration_ms: number;
+  error?: string;
+}
+
+export type SourceSummary =
+  | { kind: 'mcp_tool'; server_id: string; tool_name: string; arguments?: unknown }
+  | { kind: 'builtin_tool'; tool_name: string; arguments?: unknown }
+  | { kind: 'provider_prompt'; prompt: string }
+  | { kind: 'unknown' };
+
+export interface PipelineTrace {
+  workflow_id: string;
+  widget_id: string;
+  started_at: number;
+  finished_at: number;
+  source_summary: SourceSummary;
+  steps: PipelineStepTrace[];
+  final_value?: unknown;
+  error?: string;
+}
+
+export interface TraceEntry {
+  captured_at: number;
+  trace: PipelineTrace;
+}
+
+export const debugApi = {
+  traceWidget: (dashboardId: string, widgetId: string) =>
+    call<PipelineTrace>('trace_widget_pipeline', { dashboardId, widgetId }),
+  listTraces: (widgetId: string) =>
+    call<TraceEntry[]>('list_widget_traces', { widgetId }),
+  getTrace: (widgetId: string, capturedAt: number) =>
+    call<PipelineTrace | null>('get_widget_trace', { widgetId, capturedAt }),
+  setCaptureTraces: (dashboardId: string, widgetId: string, capture: boolean) =>
+    call<boolean>('set_widget_capture_traces', { dashboardId, widgetId, capture }),
 };
 
 // ─── Chat API ────────────────────────────────────────────────────────────────
@@ -912,9 +1151,23 @@ export const workflowApi = {
 
 // ─── Tool API ────────────────────────────────────────────────────────────────
 
+export interface HttpRequestArgs {
+  method: string;
+  url: string;
+  body?: unknown;
+  headers?: Record<string, string>;
+}
+
+export interface HttpRequestResponse {
+  status: number;
+  body: unknown;
+}
+
 export const toolApi = {
   getWhitelist: () => call<string[]>('get_whitelist'),
   executeCurl: (args: string[]) => call<unknown>('execute_curl', { args }),
+  executeHttpRequest: (req: HttpRequestArgs) =>
+    call<HttpRequestResponse>('execute_http_request', { req }),
 };
 
 // ─── Config API ──────────────────────────────────────────────────────────────
@@ -994,4 +1247,166 @@ export const memoryApi = {
   listToolShapes: (serverId: string) =>
     call<ToolShape[]>('list_tool_shapes', { serverId }),
   listKinds: () => call<MemoryKind[]>('list_memory_kinds'),
+};
+
+// ─── Playground API (W20) ────────────────────────────────────────────────────
+
+export type PlaygroundToolKind = 'mcp' | 'http';
+
+export interface PlaygroundPreset {
+  id: string;
+  tool_kind: PlaygroundToolKind;
+  server_id?: string;
+  tool_name: string;
+  display_name: string;
+  arguments: unknown;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface SavePlaygroundPresetRequest {
+  tool_kind: PlaygroundToolKind;
+  server_id?: string;
+  tool_name: string;
+  display_name: string;
+  arguments: unknown;
+}
+
+export const playgroundApi = {
+  listPresets: () => call<PlaygroundPreset[]>('list_playground_presets'),
+  savePreset: (req: SavePlaygroundPresetRequest) =>
+    call<PlaygroundPreset>('save_playground_preset', { req }),
+  deletePreset: (id: string) => call<boolean>('delete_playground_preset', { id }),
+};
+
+// ─── Alert API (W21) ─────────────────────────────────────────────────────────
+
+export const ALERT_EVENT_CHANNEL = 'alert:event';
+
+export type AlertSeverity = 'info' | 'warning' | 'critical';
+
+export type ThresholdOp = 'gt' | 'lt' | 'gte' | 'lte' | 'eq' | 'neq';
+
+export type PresenceExpectation = 'present' | 'absent' | 'empty' | 'non_empty';
+
+export type AlertCondition =
+  | { kind: 'threshold'; path: string; op: ThresholdOp; value: unknown }
+  | { kind: 'path_present'; path: string; expected: PresenceExpectation }
+  | { kind: 'status_equals'; path: string; status: string }
+  | { kind: 'custom'; jmespath_expr: string };
+
+export interface AgentAction {
+  mode: 'build' | 'context';
+  prompt_template: string;
+  max_runs_per_day: number;
+  allow_apply: boolean;
+  /** W22: per-autonomous-spawn USD budget cap. Defaults to 0.10 server-side. */
+  max_cost_usd?: number;
+}
+
+export interface WidgetAlert {
+  id: string;
+  name: string;
+  condition: AlertCondition;
+  severity: AlertSeverity;
+  message_template: string;
+  cooldown_seconds: number;
+  enabled: boolean;
+  agent_action?: AgentAction;
+}
+
+export interface AlertEvent {
+  id: string;
+  widget_id: string;
+  dashboard_id: string;
+  alert_id: string;
+  fired_at: number;
+  severity: AlertSeverity;
+  message: string;
+  context: { value?: unknown; path?: string; threshold?: unknown };
+  acknowledged_at?: number | null;
+  triggered_session_id?: string | null;
+}
+
+export interface SetWidgetAlertsRequest {
+  dashboard_id: string;
+  widget_id: string;
+  alerts: WidgetAlert[];
+}
+
+export interface TestAlertConditionResult {
+  fired: boolean;
+  resolved_value: unknown;
+  reason?: string | null;
+}
+
+export const alertApi = {
+  listEvents: (onlyUnacknowledged = false, limit = 200) =>
+    call<AlertEvent[]>('list_alert_events', { onlyUnacknowledged, limit }),
+  acknowledge: (eventId: string) =>
+    call<boolean>('acknowledge_alert', { eventId }),
+  getForWidget: (widgetId: string) =>
+    call<WidgetAlert[]>('get_widget_alerts', { widgetId }),
+  setForWidget: (req: SetWidgetAlertsRequest) =>
+    call<WidgetAlert[]>('set_widget_alerts', { req }),
+  countUnacknowledged: () => call<number>('count_unacknowledged_alerts'),
+  testCondition: (condition: AlertCondition, data: unknown) =>
+    call<TestAlertConditionResult>('test_alert_condition', { req: { condition, data } }),
+};
+
+// ─── Cost API (W22) ──────────────────────────────────────────────────────────
+
+export interface SessionCostSnapshot {
+  session_id: string;
+  model?: string;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cost_usd: number;
+  max_cost_usd?: number | null;
+  today_cost_usd: number;
+}
+
+export interface DailyCostBucket {
+  day_start_ms: number;
+  cost_usd: number;
+}
+
+export interface CostSessionEntry {
+  session_id: string;
+  title: string;
+  mode: 'build' | 'context';
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  updated_at: number;
+}
+
+export interface CostSummary {
+  today_cost_usd: number;
+  last_30_days: DailyCostBucket[];
+  top_sessions: CostSessionEntry[];
+}
+
+export interface ModelPricingOverride {
+  model_pattern: string;
+  provider_kind?: 'openrouter' | 'ollama' | 'custom' | 'local_mock';
+  input_usd_per_1m: number;
+  output_usd_per_1m: number;
+  reasoning_usd_per_1m?: number;
+}
+
+export const costApi = {
+  getSessionSnapshot: (sessionId: string) =>
+    call<SessionCostSnapshot>('get_session_cost_snapshot', { sessionId }),
+  getSummary: (days?: number) => call<CostSummary>('get_cost_summary', { days }),
+  setSessionBudget: (sessionId: string, maxCostUsd: number | null) =>
+    call<ChatSession>('set_session_budget', {
+      req: { session_id: sessionId, max_cost_usd: maxCostUsd },
+    }),
+  getPricingOverrides: () =>
+    call<ModelPricingOverride[]>('get_pricing_overrides'),
+  setPricingOverrides: (overrides: ModelPricingOverride[]) =>
+    call<ModelPricingOverride[]>('set_pricing_overrides', { req: { overrides } }),
 };

@@ -452,6 +452,15 @@ pub struct DatasourceConfig {
     pub output_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_process: Option<Vec<PostProcessStep>>,
+    /// W23: opt-in pipeline trace capture on every refresh. The Debug
+    /// view auto-enables this on first open so the next refresh becomes
+    /// visible without manual intervention.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_traces: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
