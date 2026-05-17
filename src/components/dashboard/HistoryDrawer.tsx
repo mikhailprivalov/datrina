@@ -67,10 +67,11 @@ export function HistoryDrawer({ dashboardId, onClose, onRestored }: Props) {
   return (
     <div className="fixed inset-0 z-50 flex">
       <div className="flex-1 bg-background/60 backdrop-blur-sm" onClick={onClose} />
-      <aside className="flex w-[min(95vw,52rem)] flex-col border-l border-border bg-card shadow-xl">
-        <header className="flex items-center justify-between border-b border-border px-4 py-3">
+      <aside className="flex w-[min(95vw,52rem)] flex-col border-l border-border bg-card shadow-2xl">
+        <header className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/20">
           <div>
-            <h2 className="text-sm font-medium">Dashboard history</h2>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// history</p>
+            <h2 className="mt-0.5 text-sm font-semibold tracking-tight">Dashboard history</h2>
             <p className="text-[11px] text-muted-foreground">
               Snapshots before each apply, manual edit, restore, or delete.
             </p>
@@ -106,8 +107,8 @@ export function HistoryDrawer({ dashboardId, onClose, onRestored }: Props) {
                 <li key={version.id}>
                   <button
                     onClick={() => setSelectedId(version.id)}
-                    className={`w-full px-3 py-2 text-left text-xs transition-colors ${
-                      isSelected ? 'bg-muted/70' : 'hover:bg-muted/40'
+                    className={`w-full px-3 py-2 text-left text-xs transition-colors border-l-2 ${
+                      isSelected ? 'bg-primary/10 border-l-primary' : 'border-l-transparent hover:bg-muted/40'
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -122,7 +123,7 @@ export function HistoryDrawer({ dashboardId, onClose, onRestored }: Props) {
                     <p className="mt-0.5 text-[10px] text-muted-foreground">
                       {version.widget_count} widget(s)
                       {previous && delta !== 0 && (
-                        <span className={delta > 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-destructive'}>
+                        <span className={delta > 0 ? 'text-neon-lime' : 'text-destructive'}>
                           {' '}
                           ({delta > 0 ? `+${delta}` : delta} vs prior)
                         </span>
@@ -220,10 +221,10 @@ function SelectedVersionPanel({
 
 function SourceBadge({ source }: { source: DashboardVersionSource }) {
   const styles: Record<DashboardVersionSource, string> = {
-    agent_apply: 'bg-blue-500/15 text-blue-700 dark:text-blue-400',
-    manual_edit: 'bg-amber-500/15 text-amber-700 dark:text-amber-400',
-    restore: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400',
-    pre_delete: 'bg-destructive/15 text-destructive',
+    agent_apply: 'bg-primary/15 text-primary border-primary/40',
+    manual_edit: 'bg-neon-amber/15 text-neon-amber border-neon-amber/40',
+    restore: 'bg-neon-lime/15 text-neon-lime border-neon-lime/40',
+    pre_delete: 'bg-destructive/15 text-destructive border-destructive/40',
   };
   const labels: Record<DashboardVersionSource, string> = {
     agent_apply: 'Agent',
@@ -232,7 +233,7 @@ function SourceBadge({ source }: { source: DashboardVersionSource }) {
     pre_delete: 'Pre-delete',
   };
   return (
-    <span className={`rounded px-1.5 py-0.5 text-[10px] ${styles[source]}`}>
+    <span className={`rounded-sm border px-1.5 py-0.5 text-[9px] mono font-semibold uppercase tracking-wider ${styles[source]}`}>
       {labels[source]}
     </span>
   );

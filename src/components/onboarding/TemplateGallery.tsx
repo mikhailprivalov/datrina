@@ -65,13 +65,16 @@ export function TemplateGallery({
 
   if (variant === 'modal') {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
-        <div className="flex max-h-[85vh] w-[min(96vw,68rem)] flex-col rounded-xl border border-border bg-card shadow-xl">
-          <div className="flex items-center justify-between border-b border-border px-5 py-3">
-            <h2 className="text-sm font-semibold">New dashboard from template</h2>
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+        <div className="flex max-h-[85vh] w-[min(96vw,68rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
+          <div className="flex items-center justify-between border-b border-border px-5 py-3 bg-muted/20">
+            <div>
+              <p className="text-[10px] mono uppercase tracking-[0.18em] text-primary">// templates</p>
+              <h2 className="mt-0.5 text-sm font-semibold tracking-tight">New dashboard from template</h2>
+            </div>
             <button
               onClick={onClose}
-              className="rounded p-1 text-muted-foreground hover:bg-muted"
+              className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
               aria-label="Close"
             >
               <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -87,9 +90,10 @@ export function TemplateGallery({
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col items-center gap-6 py-8">
-      <div className="space-y-2 text-center">
-        <h1 className="text-2xl font-semibold text-foreground">Welcome to Datrina</h1>
-        <p className="max-w-xl text-sm text-muted-foreground">
+      <div className="space-y-3 text-center">
+        <p className="mono text-[10px] uppercase tracking-[0.2em] text-primary">// welcome</p>
+        <h1 className="text-2xl font-semibold text-foreground tracking-tight">Datrina <span className="text-primary">·</span> local AI console</h1>
+        <p className="mx-auto max-w-xl text-sm text-muted-foreground">
           Pick a starting point. Each template seeds the Build Chat with a tailored prompt, so the agent already knows what to build.
         </p>
       </div>
@@ -111,15 +115,15 @@ function TemplateCard({
 }) {
   const hasMissing = missing.length > 0;
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4 shadow-sm transition-colors hover:border-primary/40">
+    <div className="group flex flex-col gap-3 rounded-md border border-border bg-card p-4 shadow-sm transition-all hover:border-primary/40 hover:shadow-[0_0_20px_-8px_hsl(var(--primary)/0.35)]">
       <div className="flex items-start gap-3">
-        <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+        <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary border border-primary/20 group-hover:border-primary/50 transition-colors">
           <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d={template.icon_path} />
           </svg>
         </div>
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium text-foreground">{template.title}</p>
+          <p className="text-sm font-semibold text-foreground tracking-tight">{template.title}</p>
           <p className="mt-0.5 text-xs text-muted-foreground">{template.description}</p>
         </div>
       </div>
@@ -129,7 +133,7 @@ function TemplateCard({
           {template.example_widgets.map(widget => (
             <li
               key={widget}
-              className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground"
+              className="rounded-sm border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] mono uppercase tracking-wider text-muted-foreground"
             >
               {widget}
             </li>
@@ -138,8 +142,8 @@ function TemplateCard({
       )}
 
       {hasMissing && (
-        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
-          Needs MCP server: {missing.join(', ')}.{' '}
+        <div className="rounded-md border border-neon-amber/40 bg-neon-amber/10 px-2 py-1.5 text-[11px] text-neon-amber">
+          <span className="mono uppercase tracking-wider text-[10px]">// needs MCP:</span> {missing.join(', ')}.{' '}
           {onOpenMcpSettings && (
             <button
               onClick={e => {
@@ -156,7 +160,7 @@ function TemplateCard({
 
       <button
         onClick={onLaunch}
-        className="mt-auto rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+        className="mt-auto rounded-md bg-primary border border-primary px-3 py-1.5 text-xs mono uppercase tracking-wider font-semibold text-primary-foreground hover:glow-primary transition-all"
       >
         {template.launch === 'playground' ? 'Open Playground' : 'Start building'}
       </button>

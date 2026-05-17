@@ -50,11 +50,12 @@ export function SessionBudgetModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="w-[28rem] rounded-lg bg-card border border-border shadow-xl p-5">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="w-[28rem] rounded-md bg-card border border-border shadow-2xl p-5">
         <div className="flex items-start justify-between mb-3">
           <div>
-            <h3 className="text-sm font-semibold">Session cost budget</h3>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// budget</p>
+            <h3 className="mt-0.5 text-sm font-semibold tracking-tight">Session cost cap</h3>
             <p className="text-[11px] text-muted-foreground mt-1">
               Hard cap in USD. The next provider request is denied once
               this session's running total reaches the cap.
@@ -112,7 +113,7 @@ export function SessionBudgetModal({
           <button
             onClick={() => handleSave(false)}
             disabled={pending}
-            className="text-[12px] px-3 py-1.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            className="text-[12px] mono uppercase tracking-wider font-semibold px-3 py-1.5 rounded-md bg-primary text-primary-foreground border border-primary hover:glow-primary disabled:opacity-50 transition-all"
           >
             {pending ? 'Saving…' : 'Save cap'}
           </button>

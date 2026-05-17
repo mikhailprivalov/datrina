@@ -8,9 +8,9 @@ interface Props {
 
 const LEVEL_COLORS: Record<string, string> = {
   debug: 'text-muted-foreground',
-  info: 'text-blue-600',
-  warn: 'text-amber-600',
-  warning: 'text-amber-600',
+  info: 'text-primary',
+  warn: 'text-neon-amber',
+  warning: 'text-neon-amber',
   error: 'text-destructive',
   fatal: 'text-destructive',
   critical: 'text-destructive',
@@ -29,20 +29,24 @@ export function LogsWidget({ config, data }: Props) {
   }, [data, config.max_entries, config.reverse, query]);
 
   if (!data) {
-    return <div className="flex h-full items-center justify-center text-xs text-muted-foreground">No log entries</div>;
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
+        <span className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60">// no data</span>
+      </div>
+    );
   }
 
   return (
     <div className="flex h-full flex-col">
-      <div className="px-1 pb-1.5">
+      <div className="pb-1.5">
         <input
           value={query}
           onChange={e => setQuery(e.target.value)}
-          placeholder="Filter logs..."
-          className="w-full rounded-md border border-border/60 bg-background/80 px-2 py-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-primary/30"
+          placeholder="filter logs…"
+          className="w-full rounded-md border border-border bg-muted/30 px-2 py-1 text-[11px] mono placeholder:text-muted-foreground/60 focus:outline-none focus:border-primary/50"
         />
       </div>
-      <div className="flex-1 overflow-auto rounded-md border border-border/60 bg-background/70 font-mono text-[11px] leading-tight">
+      <div className="flex-1 overflow-auto rounded-md border border-border bg-muted/20 mono text-[11px] leading-tight">
         {filtered.length === 0 ? (
           <p className="p-2 text-muted-foreground">No matching entries.</p>
         ) : (

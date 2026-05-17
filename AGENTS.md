@@ -68,10 +68,11 @@ Default order:
    product work beyond the accepted reconciliation slice.
 10. Later `W11+` product-readiness and runtime streams follow
     `docs/RECONCILIATION_PLAN.md` in order. Active product backlog as of
-    2026-05-16: `W16` (Proposal Validation Gate) implemented; `W17`–`W25`
-    planned with one dedicated `docs/W<N>_*.md` each. New W tasks must
-    ship a doc in `docs/` with the same `Status / Context / Goal /
-    Approach / Files / Validation / Out of scope / Related` shape.
+    2026-05-17: `W16`–`W28` have dedicated `docs/W<N>_*.md` records, with
+    `W27` as the frontend-only Cyberpunk UI Redesign stream and `W28` as the
+    chat UX hardening stream. New W tasks must ship a doc in `docs/` with the
+    same `Status / Context / Goal / Approach / Files / Validation / Out of
+    scope / Related` shape.
 
 When multiple agents are used, split by ownership paths from the plan. Do not
 run concurrent agents over `src/lib/api.ts`, `src-tauri/src/models/*`, or

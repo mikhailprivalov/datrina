@@ -94,7 +94,8 @@ export function ParameterBar({ dashboardId, parameters, onAffectedWidgets }: Pro
   if (parameters.length === 0) return null;
 
   return (
-    <div className="sticky top-0 z-10 mb-2 flex flex-wrap items-center gap-3 rounded-md border border-border bg-card/95 px-3 py-2 shadow-sm backdrop-blur">
+    <div className="sticky top-0 z-10 mb-2 flex flex-wrap items-center gap-3 rounded-md border border-border bg-card/90 px-3 py-2 shadow-sm backdrop-blur">
+      <span className="hidden md:inline mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">// vars</span>
       {loading ? (
         <span className="text-xs text-muted-foreground">Loading parameters…</span>
       ) : (
@@ -125,11 +126,13 @@ function ParameterControl({ state, disabled, onCommit }: ControlProps) {
 
   return (
     <label className="flex items-center gap-2 text-xs" title={tooltip}>
-      <span className="font-medium text-muted-foreground">{label}</span>
+      <span className="mono text-[10px] uppercase tracking-wider text-muted-foreground">${label}</span>
       {renderInput(parameter, value, options, disabled, onCommit)}
     </label>
   );
 }
+
+const PARAM_INPUT_CLASS = 'rounded-md border border-border bg-muted/40 px-2 py-1 text-xs tabular focus:border-primary/60';
 
 function renderInput(
   parameter: DashboardParameter,
@@ -158,7 +161,7 @@ function renderInput(
               .filter((v): v is ParameterValue => v !== undefined);
             onCommit(mapped);
           }}
-          className="min-w-[120px] rounded border border-border bg-background px-2 py-1"
+          className={`min-w-[120px] ${PARAM_INPUT_CLASS}`}
         >
           {opts.map(opt => (
             <option key={valueToString(opt.value)} value={valueToString(opt.value)}>
@@ -177,7 +180,7 @@ function renderInput(
           const match = parameter.options.find(opt => valueToString(opt.value) === e.target.value);
           if (match) onCommit(match.value);
         }}
-        className="min-w-[100px] rounded border border-border bg-background px-2 py-1"
+        className={`min-w-[100px] ${PARAM_INPUT_CLASS}`}
       >
         {options.map(opt => (
           <option key={valueToString(opt.value)} value={valueToString(opt.value)}>
@@ -206,7 +209,7 @@ function renderInput(
         disabled={disabled}
         value={typeof value === 'string' ? value : presets[0] ?? ''}
         onChange={e => onCommit(e.target.value)}
-        className="rounded border border-border bg-background px-2 py-1"
+        className={PARAM_INPUT_CLASS}
       >
         {presets.map(preset => (
           <option key={preset} value={preset}>
@@ -235,7 +238,7 @@ function renderInput(
           const to = Date.now();
           onCommit({ from: to - ms, to });
         }}
-        className="rounded border border-border bg-background px-2 py-1"
+        className={PARAM_INPUT_CLASS}
       >
         {TIME_RANGE_PRESETS.map(preset => (
           <option key={preset.label} value={String(preset.ms)}>
@@ -247,7 +250,7 @@ function renderInput(
   }
 
   if (parameter.kind === 'constant') {
-    return <span className="rounded border border-dashed border-border px-2 py-1 text-muted-foreground">
+    return <span className="rounded-md border border-dashed border-border bg-muted/30 px-2 py-1 text-xs mono text-muted-foreground">
       {valueToString(value ?? parameter.value)}
     </span>;
   }
@@ -293,7 +296,7 @@ function TextInputControl({ placeholder, value, disabled, onCommit }: TextInputC
           setDraft(value);
         }
       }}
-      className="rounded border border-border bg-background px-2 py-1"
+      className={PARAM_INPUT_CLASS}
     />
   );
 }

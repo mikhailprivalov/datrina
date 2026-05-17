@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -379,7 +379,7 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
   };
 
   return (
-    <div className="flex bg-card border-l border-border shadow-lg">
+    <div className="flex bg-card/95 backdrop-blur-sm border-l border-border shadow-2xl">
       {sidebarOpen && (
         <SessionsSidebar
           sessions={sessions}
@@ -391,8 +391,8 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
         />
       )}
     <aside className="w-96 flex flex-col">
-      <div className="flex items-center justify-between h-12 px-4 border-b border-border">
-        <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between h-12 px-3 border-b border-border bg-muted/20">
+        <div className="flex items-center gap-2 min-w-0">
           {!sidebarOpen && (
             <button
               onClick={() => setSidebarOpen(true)}
@@ -404,15 +404,20 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
               </svg>
             </button>
           )}
-          <div className={`w-2 h-2 rounded-full ${mode === 'build' ? 'bg-amber-500' : 'bg-blue-500'}`} />
+          <span
+            className={`inline-flex h-5 items-center rounded-sm px-1.5 text-[10px] mono font-semibold uppercase tracking-wider border ${mode === 'build' ? 'bg-neon-amber/15 text-neon-amber border-neon-amber/40' : 'bg-primary/15 text-primary border-primary/40'}`}
+            title={mode === 'build' ? 'Build mode' : 'Context mode'}
+          >
+            {mode === 'build' ? 'build' : 'ctx'}
+          </span>
           <div className="min-w-0">
-            <span className="block text-sm font-medium">
+            <span className="block text-sm font-semibold tracking-tight truncate">
               {mode === 'build'
                 ? (dashboardName ? `Editing "${dashboardName}"` : 'Build new dashboard')
                 : (dashboardName ? `Context: "${dashboardName}"` : 'Context Chat')}
             </span>
-            <span className="block max-w-56 truncate text-[10px] text-muted-foreground">
-              {activeProvider ? `${activeProvider.name} - ${activeProvider.default_model}` : 'No LLM provider configured'}
+            <span className="block max-w-56 truncate text-[10px] mono uppercase tracking-wider text-muted-foreground">
+              {activeProvider ? `${activeProvider.name} · ${activeProvider.default_model}` : 'no provider'}
             </span>
           </div>
         </div>
@@ -469,10 +474,12 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
       >
         {runtime.messages.length === 0 && (
           <div className="text-center text-muted-foreground text-sm mt-8">
-            <svg className="w-10 h-10 mx-auto mb-3 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-            </svg>
-            <p className="font-medium">
+            <div className="relative inline-flex w-12 h-12 rounded-md bg-primary/10 border border-primary/30 items-center justify-center mb-3">
+              <svg className="w-6 h-6 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+              </svg>
+            </div>
+            <p className="font-semibold text-foreground">
               {mode === 'build' ? 'Ask for build guidance' : 'Ask about your dashboard data'}
             </p>
             <p className="text-xs mt-1 opacity-70">
@@ -482,9 +489,9 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
         )}
 
         {mode === 'build' && (
-          <div className="rounded-lg border border-border bg-background/70 p-3 text-xs">
-            <p className="font-medium text-foreground">Build proposals</p>
-            <p className="mt-1 text-muted-foreground">
+          <div className="rounded-md border border-neon-amber/30 bg-neon-amber/5 p-3 text-xs">
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-neon-amber">// build proposals</p>
+            <p className="mt-1.5 text-muted-foreground">
               Ask the provider for a dashboard, widget, or workflow change. The next structured proposal will show a preview before apply{canApplyToDashboard ? '.' : ' or create a new dashboard.'}
             </p>
           </div>
@@ -495,12 +502,24 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
           const isLastAssistant = msg.role === 'assistant'
             && msgIndex === runtime.messages.length - 1
             && (msg.status === 'complete' || msg.status === 'failed' || msg.status === 'cancelled');
+          // W18: hide internal reflection trigger user messages — they are
+          // not authored by the human and the follow-up assistant turn
+          // already carries a reflection badge.
+          if (msg.role === 'user' && messageText(msg).startsWith('[reflection]')) {
+            return (
+              <div key={msg.id} className="flex justify-center">
+                <span className="mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+                  // auto self-check triggered
+                </span>
+              </div>
+            );
+          }
           return (
             <div key={msg.id} className={`group flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`relative max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${
+              <div className={`relative max-w-[85%] rounded-md px-3.5 py-2.5 text-sm leading-relaxed border ${
                 msg.role === 'user'
-                  ? 'bg-primary text-primary-foreground rounded-br-md'
-                  : 'bg-muted text-foreground rounded-bl-md'
+                  ? 'bg-primary/15 text-foreground border-primary/40 rounded-br-sm'
+                  : 'bg-muted/40 text-foreground border-border rounded-bl-sm'
               }`}>
                 {!isEditing && <CopyMessageButton message={msg} />}
                 {!isEditing && msg.role === 'user' && !runtime.isLoading && (
@@ -582,11 +601,11 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
 
         {runtime.isLoading && runtime.messages[runtime.messages.length - 1]?.role !== 'assistant' && (
           <div className="flex justify-start">
-            <div className="bg-muted rounded-2xl rounded-bl-md px-4 py-3">
+            <div className="bg-muted/40 border border-border rounded-md rounded-bl-sm px-4 py-3">
               <div className="flex gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '300ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-bounce" style={{ animationDelay: '300ms' }} />
               </div>
             </div>
           </div>
@@ -608,24 +627,24 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
       </div>
 
       {costSnapshot && (
-        <div className="px-3 pt-2 pb-1 border-t border-border/60 text-[10px] text-muted-foreground/80 flex items-center justify-between gap-2">
-          <span className="truncate" title={formatCostFooterTitle(costSnapshot)}>
+        <div className="px-3 pt-2 pb-1 border-t border-border/60 text-[10px] mono text-muted-foreground/80 flex items-center justify-between gap-2 bg-muted/20">
+          <span className="truncate uppercase tracking-wider" title={formatCostFooterTitle(costSnapshot)}>
             {formatCostFooter(costSnapshot)}
           </span>
           {costSnapshot.max_cost_usd != null && costSnapshot.max_cost_usd > 0 && (
             <span
-              className={
+              className={`uppercase tracking-wider ${
                 costSnapshot.cost_usd >= costSnapshot.max_cost_usd
                   ? 'text-destructive'
                   : 'text-muted-foreground/70'
-              }
+              }`}
             >
               cap ${costSnapshot.max_cost_usd.toFixed(2)}
             </span>
           )}
         </div>
       )}
-      <div className="p-3 border-t border-border">
+      <div className="p-3 border-t border-border bg-muted/20">
         <div className="flex items-end gap-2">
           <textarea
             ref={inputRef}
@@ -637,13 +656,18 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
             autoCorrect="off"
             autoComplete="off"
             spellCheck={false}
-            className="flex-1 resize-none overflow-y-auto rounded-xl border border-border bg-muted/50 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 min-h-[40px] max-h-32"
+            className="flex-1 resize-none overflow-y-auto rounded-md border border-border bg-card px-3 py-2.5 text-sm focus:outline-none focus:border-primary/60 min-h-[40px] max-h-32"
             rows={1}
           />
           <button
             onClick={runtime.isLoading ? handleCancel : handleSend}
             disabled={!runtime.isLoading && !input.trim()}
-            className="p-2.5 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+            title={runtime.isLoading ? 'Cancel' : 'Send'}
+            className={`p-2.5 rounded-md disabled:opacity-40 disabled:cursor-not-allowed transition-all flex-shrink-0 border ${
+              runtime.isLoading
+                ? 'bg-destructive/15 text-destructive border-destructive/40 hover:bg-destructive/25'
+                : 'bg-primary text-primary-foreground border-primary hover:glow-primary'
+            }`}
           >
             {runtime.isLoading ? (
               <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
@@ -656,7 +680,7 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
             )}
           </button>
         </div>
-        <p className="text-[10px] text-muted-foreground/60 mt-1.5 text-center">Shift+Enter for new line</p>
+        <p className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60 mt-1.5 text-center">Shift+Enter for newline</p>
       </div>
     </aside>
     {isBudgetModalOpen && session && (
@@ -721,9 +745,9 @@ function SessionsSidebar({
   onClose: () => void;
 }) {
   return (
-    <div className="w-56 flex flex-col border-r border-border bg-card">
-      <div className="flex items-center justify-between h-12 px-3 border-b border-border">
-        <span className="text-xs font-medium text-foreground">Chats</span>
+    <div className="w-56 flex flex-col border-r border-border bg-card/95">
+      <div className="flex items-center justify-between h-12 px-3 border-b border-border bg-muted/20">
+        <span className="text-[10px] mono uppercase tracking-[0.18em] text-primary">// chats</span>
         <div className="flex items-center gap-1">
           <button
             onClick={onNew}
@@ -776,9 +800,9 @@ function SessionRow({
 }) {
   const preview = summaryPreview(session);
   return (
-    <div className={`group flex items-center gap-1 rounded-md px-2 py-1.5 text-[11px] ${active ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted/60'}`}>
+    <div className={`group flex items-center gap-1 rounded-md px-2 py-1.5 text-[11px] border ${active ? 'bg-primary/10 border-primary/30 text-foreground' : 'border-transparent text-muted-foreground hover:bg-muted/40 hover:border-border'}`}>
       <button onClick={onSelect} className="min-w-0 flex-1 text-left">
-        <span className={`block truncate ${session.mode === 'build' ? 'text-amber-600' : ''}`}>{preview.title}</span>
+        <span className={`block truncate ${session.mode === 'build' ? 'text-neon-amber' : ''}`}>{preview.title}</span>
         <span className="block truncate text-[10px] opacity-70">{preview.subtitle}</span>
       </button>
       <button
@@ -957,16 +981,9 @@ function MessageParts({
     || part.type === 'tool_result'
     || part.type === 'build_proposal'
   );
-  return (
+  const hasFixupProposal = renderableParts.some(p => p.type === 'build_proposal');
+  const body = (
     <>
-      {planPart && (
-        <PlanArtifactTile
-          plan={planPart.plan}
-          status={planPart.status}
-          isLive={isStreaming}
-        />
-      )}
-      {reflectionPart && <ReflectionBadge widgetIds={reflectionPart.widget_ids} />}
       {timelinePart && (
         <AgentTimeline
           phases={timelinePart.phases}
@@ -979,8 +996,7 @@ function MessageParts({
         if (part.type === 'text') {
           if (!part.text) return null;
           if (isProposalLikeText(part.text)) {
-            const hasProposal = renderableParts.some(p => p.type === 'build_proposal');
-            if (hasProposal) return null;
+            if (hasFixupProposal) return null;
             return (
               <ProposalDraftBuilding
                 key={`text-${index}`}
@@ -1011,6 +1027,32 @@ function MessageParts({
       ) : null}
     </>
   );
+  // W18: when the reflection turn produced no fix-up proposal, collapse
+  // the whole body under the badge — it's just an "ok, looks good" note
+  // and clutters the chat after Apply.
+  if (reflectionPart && !hasFixupProposal && !isStreaming) {
+    return (
+      <>
+        {planPart && (
+          <PlanArtifactTile plan={planPart.plan} status={planPart.status} isLive={isStreaming} />
+        )}
+        <ReflectionCollapsible widgetIds={reflectionPart.widget_ids}>{body}</ReflectionCollapsible>
+      </>
+    );
+  }
+  return (
+    <>
+      {planPart && (
+        <PlanArtifactTile
+          plan={planPart.plan}
+          status={planPart.status}
+          isLive={isStreaming}
+        />
+      )}
+      {reflectionPart && <ReflectionBadge widgetIds={reflectionPart.widget_ids} />}
+      {body}
+    </>
+  );
 }
 
 function isProposalLikeText(text: string): boolean {
@@ -1024,10 +1066,10 @@ function isProposalLikeText(text: string): boolean {
 
 function ProposalDraftBuilding({ length }: { length: number }) {
   return (
-    <div className="flex items-center gap-2 rounded-md border border-dashed border-border/60 bg-background/50 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+    <div className="flex items-center gap-2 rounded-md border border-dashed border-primary/30 bg-primary/5 px-2.5 py-1.5 text-[11px] text-muted-foreground">
       <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
-      <span>Composing dashboard proposal...</span>
-      <span className="ml-auto tabular-nums opacity-60">{length} chars</span>
+      <span className="mono uppercase tracking-wider text-[10px] text-primary">composing proposal</span>
+      <span className="ml-auto tabular mono opacity-60">{length} chars</span>
     </div>
   );
 }
@@ -1075,19 +1117,20 @@ function PlanArtifactTile({
         ? 'Plan ready'
         : 'Plan complete';
   return (
-    <div className={`mt-1 mb-2 rounded-md border ${failed ? 'border-destructive/40 bg-destructive/5' : 'border-amber-500/30 bg-amber-500/5'} p-2 text-[11px]`}>
+    <div className={`mt-1 mb-2 rounded-md border ${failed ? 'border-destructive/40 bg-destructive/5' : 'border-neon-amber/30 bg-neon-amber/5'} p-2 text-[11px]`}>
       <button
         type="button"
         onClick={() => setExpanded(v => !v)}
         className="flex w-full items-center justify-between gap-2 text-left"
       >
-        <span className="flex items-center gap-1.5 font-medium text-foreground">
+        <span className="flex items-center gap-1.5 font-semibold text-foreground">
           <svg className={`h-3 w-3 transition-transform ${expanded ? 'rotate-90' : ''}`} viewBox="0 0 20 20" fill="currentColor">
             <path fillRule="evenodd" d="M7.293 5.293a1 1 0 011.414 0l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414-1.414L10.586 10 7.293 6.707a1 1 0 010-1.414z" clipRule="evenodd" />
           </svg>
-          Plan ({done}/{total})
+          <span className="mono uppercase tracking-wider text-[10px] text-neon-amber">// plan</span>
+          <span className="tabular text-foreground/80">{done}/{total}</span>
         </span>
-        <span className="text-muted-foreground">{summaryLabel}</span>
+        <span className="text-muted-foreground mono text-[10px] uppercase tracking-wider">{summaryLabel}</span>
       </button>
       {expanded && (
         <>
@@ -1129,11 +1172,11 @@ function PlanArtifactTile({
 
 function PlanStepIcon({ status }: { status: PlanStepStatus }) {
   if (status === 'running') {
-    return <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-amber-500/30 border-t-amber-500" />;
+    return <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-neon-amber/30 border-t-neon-amber" />;
   }
   if (status === 'done') {
     return (
-      <svg className="h-3 w-3 text-emerald-500" viewBox="0 0 20 20" fill="currentColor">
+      <svg className="h-3 w-3 text-neon-lime" viewBox="0 0 20 20" fill="currentColor">
         <path fillRule="evenodd" d="M16.704 5.296a1 1 0 010 1.408l-8 8a1 1 0 01-1.408 0l-4-4a1 1 0 011.408-1.408L8 12.592l7.296-7.296a1 1 0 011.408 0z" clipRule="evenodd" />
       </svg>
     );
@@ -1161,13 +1204,37 @@ function planKindLabel(kind: PlanStepKind): string {
 
 function ReflectionBadge({ widgetIds }: { widgetIds: string[] }) {
   return (
-    <div className="mt-1 mb-2 flex items-center gap-2 rounded-md border border-blue-500/30 bg-blue-500/5 px-2 py-1 text-[11px] text-blue-700 dark:text-blue-300">
+    <div className="mt-1 mb-2 flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-2 py-1 text-[11px] text-primary">
       <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
         <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-5a1 1 0 112 0 1 1 0 01-2 0zM9 6a1 1 0 112 0v4a1 1 0 11-2 0V6z" clipRule="evenodd" />
       </svg>
       <span>
         Reflection suggestion — agent reviewed {widgetIds.length} widget{widgetIds.length === 1 ? '' : 's'} after first refresh.
       </span>
+    </div>
+  );
+}
+
+function ReflectionCollapsible({ widgetIds, children }: { widgetIds: string[]; children: ReactNode }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="mt-1 mb-1 rounded-md border border-primary/20 bg-primary/5 text-[11px] text-primary">
+      <button
+        type="button"
+        onClick={() => setExpanded(v => !v)}
+        className="flex w-full items-center justify-between gap-2 px-2 py-1 mono uppercase tracking-wider hover:bg-primary/10 transition-colors"
+      >
+        <span className="flex items-center gap-2">
+          <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-5a1 1 0 112 0 1 1 0 01-2 0zM9 6a1 1 0 112 0v4a1 1 0 11-2 0V6z" clipRule="evenodd" />
+          </svg>
+          <span className="text-[10px]">// self-check passed · {widgetIds.length} widget{widgetIds.length === 1 ? '' : 's'}</span>
+        </span>
+        <span className="text-[10px] opacity-70">{expanded ? 'hide' : 'show'}</span>
+      </button>
+      {expanded && (
+        <div className="border-t border-primary/20 px-2 py-1.5 text-foreground">{children}</div>
+      )}
     </div>
   );
 }
@@ -1180,22 +1247,19 @@ function ProposalValidationTile({
   const { status, issues, retried } = part;
   if (status === 'completed' && issues.length === 0) {
     return (
-      <div className="mt-2 flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-[11px] text-emerald-700 dark:text-emerald-300">
+      <div className="mt-2 flex items-center gap-2 rounded-md border border-neon-lime/30 bg-neon-lime/5 px-2 py-1.5 text-[11px] text-neon-lime">
         <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
           <path fillRule="evenodd" d="M16.704 5.296a1 1 0 010 1.408l-8 8a1 1 0 01-1.408 0l-4-4a1 1 0 011.408-1.408L8 12.592l7.296-7.296a1 1 0 011.408 0z" clipRule="evenodd" />
         </svg>
-        <span>
-          Proposal passed validation
-          {retried ? ' (after one retry)' : ''}
-        </span>
+        <span className="mono uppercase tracking-wider text-[10px]">validation passed{retried ? ' (after retry)' : ''}</span>
       </div>
     );
   }
   if (status === 'started') {
     return (
-      <div className="mt-2 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
-        <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-amber-500/30 border-t-amber-500" />
-        <span>Validator found {issues.length} issue(s); retrying with agent...</span>
+      <div className="mt-2 flex items-center gap-2 rounded-md border border-neon-amber/30 bg-neon-amber/5 px-2 py-1.5 text-[11px] text-neon-amber">
+        <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-neon-amber/30 border-t-neon-amber" />
+        <span className="mono uppercase tracking-wider text-[10px]">retrying · {issues.length} issue{issues.length === 1 ? '' : 's'}</span>
       </div>
     );
   }
@@ -1254,7 +1318,7 @@ function PhaseStatusIcon({ status }: { status: AgentPhaseEntry['status'] }) {
   }
   if (status === 'completed') {
     return (
-      <svg className="h-3 w-3 text-emerald-500" viewBox="0 0 20 20" fill="currentColor">
+      <svg className="h-3 w-3 text-neon-lime" viewBox="0 0 20 20" fill="currentColor">
         <path fillRule="evenodd" d="M16.704 5.296a1 1 0 010 1.408l-8 8a1 1 0 01-1.408 0l-4-4a1 1 0 011.408-1.408L8 12.592l7.296-7.296a1 1 0 011.408 0z" clipRule="evenodd" />
       </svg>
     );
@@ -1297,23 +1361,23 @@ function AgentTimeline({
       <button
         type="button"
         onClick={() => setCollapsed(false)}
-        className="mt-1 mb-2 inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-background/60 px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground"
+        className="mt-1 mb-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/30 px-2 py-1 text-[10px] mono uppercase tracking-wider text-muted-foreground hover:text-primary hover:border-primary/40 transition-colors"
       >
         <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
           <path fillRule="evenodd" d="M6.293 9.293a1 1 0 011.414 0L10 11.586l2.293-2.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clipRule="evenodd" />
         </svg>
-        Agent steps ({phases.length})
+        agent steps · {phases.length}
       </button>
     );
   }
   return (
-    <div className="mb-2 rounded-md border border-border/60 bg-background/60 p-2">
+    <div className="mb-2 rounded-md border border-border bg-muted/30 p-2">
       <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-[11px] font-medium text-foreground">Agent run</span>
+        <span className="text-[10px] mono uppercase tracking-[0.18em] text-primary">// agent run</span>
         <button
           type="button"
           onClick={() => setCollapsed(true)}
-          className="text-[10px] text-muted-foreground hover:text-foreground"
+          className="text-[10px] mono uppercase tracking-wider text-muted-foreground hover:text-primary transition-colors"
         >
           Hide
         </button>
@@ -1406,8 +1470,8 @@ function MessagePart({
 function ReasoningTrace({ reasoning }: { reasoning: string }) {
   if (!reasoning.trim()) return null;
   return (
-    <div className="mt-2 rounded-md border border-border/60 bg-background/70 p-2 text-[11px] text-muted-foreground">
-      <p className="mb-1 font-medium text-foreground">Reasoning</p>
+    <div className="mt-2 rounded-md border border-neon-violet/30 bg-neon-violet/5 p-2 text-[11px] text-muted-foreground">
+      <p className="mb-1 mono uppercase tracking-wider text-[10px] text-neon-violet">// reasoning</p>
       <Markdown source={reasoning} dense />
     </div>
   );
@@ -1416,7 +1480,7 @@ function ReasoningTrace({ reasoning }: { reasoning: string }) {
 function ToolCallPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool_call' }> }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="mt-2 rounded-md border border-border/60 bg-background/70 text-[11px]">
+    <div className="mt-2 rounded-md border border-border bg-muted/30 text-[11px]">
       <button
         type="button"
         onClick={() => setExpanded(v => !v)}
@@ -1427,19 +1491,19 @@ function ToolCallPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool_c
           <svg className={`h-3 w-3 flex-shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`} viewBox="0 0 20 20" fill="currentColor">
             <path fillRule="evenodd" d="M7.293 5.293a1 1 0 011.414 0l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414-1.414L10.586 10 7.293 6.707a1 1 0 010-1.414z" clipRule="evenodd" />
           </svg>
-          <span className="truncate font-medium text-foreground">{part.name}</span>
+          <span className="truncate font-semibold text-primary mono">{part.name}</span>
         </span>
-        <span className={`flex-shrink-0 ${part.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>
-          {part.policy_decision} / {part.status}
+        <span className={`flex-shrink-0 text-[10px] mono uppercase tracking-wider ${part.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>
+          {part.policy_decision} · {part.status}
         </span>
       </button>
       {expanded ? (
-        <div className="border-t border-border/40 p-2">
-          <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Arguments</p>
+        <div className="border-t border-border p-2">
+          <p className="mb-1 text-[10px] mono uppercase tracking-wider text-muted-foreground">// arguments</p>
           <JsonView data={part.arguments_preview} />
         </div>
       ) : (
-        <p className="px-2 pb-2 line-clamp-2 text-muted-foreground">{previewData(part.arguments_preview)}</p>
+        <p className="px-2 pb-2 line-clamp-2 text-muted-foreground mono">{previewData(part.arguments_preview)}</p>
       )}
     </div>
   );
@@ -1448,7 +1512,7 @@ function ToolCallPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool_c
 function ToolResultPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool_result' }> }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="mt-2 rounded-md border border-border/60 bg-background/70 text-[11px]">
+    <div className="mt-2 rounded-md border border-border bg-muted/30 text-[11px]">
       <button
         type="button"
         onClick={() => setExpanded(v => !v)}
@@ -1459,25 +1523,25 @@ function ToolResultPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool
           <svg className={`h-3 w-3 flex-shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`} viewBox="0 0 20 20" fill="currentColor">
             <path fillRule="evenodd" d="M7.293 5.293a1 1 0 011.414 0l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414-1.414L10.586 10 7.293 6.707a1 1 0 010-1.414z" clipRule="evenodd" />
           </svg>
-          <span className="truncate font-medium text-foreground">{part.name} result</span>
+          <span className="truncate font-semibold mono text-foreground">{part.name} <span className="text-muted-foreground">→</span></span>
         </span>
-        <span className={`flex-shrink-0 ${part.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>
+        <span className={`flex-shrink-0 text-[10px] mono uppercase tracking-wider ${part.status === 'error' ? 'text-destructive' : part.status === 'success' ? 'text-neon-lime' : 'text-muted-foreground'}`}>
           {part.status}
         </span>
       </button>
       {expanded ? (
-        <div className="border-t border-border/40 p-2">
+        <div className="border-t border-border p-2">
           {part.error ? (
             <p className="text-destructive break-words">Error: {part.error}</p>
           ) : (
             <>
-              <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Result</p>
+              <p className="mb-1 text-[10px] mono uppercase tracking-wider text-muted-foreground">// result</p>
               <JsonView data={part.result_preview} />
             </>
           )}
         </div>
       ) : (
-        <p className="px-2 pb-2 line-clamp-2 text-muted-foreground">
+        <p className="px-2 pb-2 line-clamp-2 text-muted-foreground mono">
           {part.error ? `Error: ${part.error}` : previewData(part.result_preview)}
         </p>
       )}
@@ -1497,7 +1561,7 @@ function JsonView({ data }: { data: unknown }) {
     }
   })();
   return (
-    <pre className="max-h-96 overflow-auto rounded bg-background/80 p-2 font-mono text-[10px] leading-snug whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+    <pre className="max-h-96 overflow-auto rounded bg-card/70 border border-border/60 p-2 mono text-[10px] leading-snug whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
       {formatted}
     </pre>
   );
@@ -1534,8 +1598,8 @@ function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApp
 
   if (dismissed) {
     return (
-      <div className="mt-3 rounded-lg border border-border bg-background/60 p-2 text-[11px] text-muted-foreground">
-        Proposal "{proposal.title}" rejected.
+      <div className="mt-3 rounded-md border border-border bg-muted/30 p-2 text-[11px] text-muted-foreground">
+        <span className="mono uppercase tracking-wider text-[10px]">// rejected</span> · {proposal.title}
       </div>
     );
   }
@@ -1550,38 +1614,39 @@ function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApp
   };
 
   return (
-    <div className="mt-3 rounded-lg border border-border bg-background p-3 text-xs text-foreground">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="font-medium">{proposal.title}</p>
-          {proposal.dashboard_name && (
-            <p className="mt-0.5 text-muted-foreground">Dashboard: {proposal.dashboard_name}</p>
-          )}
-          {proposal.summary && (
-            <p className="mt-1 text-[11px] text-muted-foreground">{proposal.summary}</p>
-          )}
-        </div>
-        <div className="flex flex-shrink-0 items-center gap-1.5">
+    <div className="mt-3 rounded-md border border-primary/40 bg-primary/5 p-3 text-xs text-foreground">
+      <div className="flex items-center justify-between gap-2">
+        <p className="mono uppercase tracking-[0.18em] text-[10px] text-primary">// proposal</p>
+        <div className="flex flex-wrap items-center justify-end gap-1.5">
           <button
             onClick={runAll}
-            className="rounded-md border border-border bg-background px-2 py-1.5 text-[11px] hover:bg-muted"
+            className="rounded-md border border-border bg-card px-2 py-1 text-[10px] mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
           >
             Test all
           </button>
           <button
             onClick={() => setDismissed(true)}
-            className="rounded-md border border-border bg-background px-2 py-1.5 text-[11px] hover:bg-muted"
+            className="rounded-md border border-border bg-card px-2 py-1 text-[10px] mono uppercase tracking-wider hover:bg-muted hover:border-destructive/40 hover:text-destructive transition-colors"
           >
             Reject
           </button>
           <button
             onClick={apply}
             disabled={isApplying || proposal.widgets.length === 0}
-            className="rounded-md bg-primary px-2.5 py-1.5 text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-md bg-primary text-primary-foreground border border-primary px-2.5 py-1 text-[10px] mono uppercase tracking-wider font-semibold hover:glow-primary disabled:cursor-not-allowed disabled:opacity-50 transition-all"
           >
-            {isApplying ? 'Applying...' : 'Apply'}
+            {isApplying ? 'Applying…' : 'Apply'}
           </button>
         </div>
+      </div>
+      <div className="mt-2">
+        <p className="font-semibold tracking-tight break-words">{proposal.title}</p>
+        {proposal.dashboard_name && (
+          <p className="mt-0.5 text-[11px] text-muted-foreground break-words">Dashboard: <span className="text-foreground">{proposal.dashboard_name}</span></p>
+        )}
+        {proposal.summary && (
+          <p className="mt-1 text-[11px] text-muted-foreground break-words">{proposal.summary}</p>
+        )}
       </div>
 
       <div className="mt-2 space-y-1.5">
@@ -1594,8 +1659,8 @@ function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApp
           />
         ))}
         {proposal.remove_widget_ids && proposal.remove_widget_ids.length > 0 && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1.5 text-[11px] text-destructive">
-            Removes {proposal.remove_widget_ids.length} existing widget(s) on Apply
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1.5 text-[11px] mono text-destructive">
+            <span className="uppercase tracking-wider text-[10px]">// removes</span> {proposal.remove_widget_ids.length} existing widget{proposal.remove_widget_ids.length === 1 ? '' : 's'} on apply
           </div>
         )}
       </div>
@@ -1622,50 +1687,50 @@ function WidgetProposalRow({
         ? 'Re-test'
         : 'Retry';
   const testTone = !dryRun
-    ? 'border-border bg-background'
+    ? 'border-border bg-card'
     : dryRun.status === 'running'
       ? 'border-border bg-muted opacity-70'
       : dryRun.status === 'ok'
-        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+        ? 'border-neon-lime/40 bg-neon-lime/10 text-neon-lime'
         : 'border-destructive/40 bg-destructive/10 text-destructive';
   return (
-    <div className="rounded-md border border-border/70 px-2 py-1.5">
+    <div className="rounded-md border border-border bg-card/60 px-2 py-1.5">
       <div className="flex items-center justify-between gap-2">
         <span className="font-medium truncate">{widget.title}</span>
-        <div className="flex items-center gap-1">
-          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{widget.widget_type}</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[9px] mono font-semibold uppercase tracking-wider rounded-sm border border-border bg-muted/60 px-1.5 py-0.5 text-muted-foreground">{widget.widget_type}</span>
           <button
             onClick={onTest}
             disabled={dryRun?.status === 'running'}
-            className={`rounded-md border px-2 py-0.5 text-[10px] hover:opacity-90 disabled:cursor-wait ${testTone}`}
+            className={`rounded-md border px-2 py-0.5 text-[10px] mono uppercase tracking-wider hover:opacity-90 disabled:cursor-wait ${testTone}`}
           >
             {testLabel}
           </button>
         </div>
       </div>
       {widget.datasource_plan ? (
-        <p className="mt-1 text-[10px] text-muted-foreground">
+        <p className="mt-1 text-[10px] mono text-muted-foreground">
           {widget.datasource_plan.kind}
-          {widget.datasource_plan.tool_name ? ` / ${widget.datasource_plan.tool_name}` : ''}
-          {widget.datasource_plan.server_id ? ` / ${widget.datasource_plan.server_id}` : ''}
-          {widget.datasource_plan.refresh_cron ? ` / ${widget.datasource_plan.refresh_cron}` : ''}
-          {pipelineSteps > 0 ? ` / ${pipelineSteps} pipeline step(s)` : ''}
-          {widget.replace_widget_id ? ' / REPLACES existing' : ''}
+          {widget.datasource_plan.tool_name ? ` · ${widget.datasource_plan.tool_name}` : ''}
+          {widget.datasource_plan.server_id ? ` · ${widget.datasource_plan.server_id}` : ''}
+          {widget.datasource_plan.refresh_cron ? ` · ${widget.datasource_plan.refresh_cron}` : ''}
+          {pipelineSteps > 0 ? ` · ${pipelineSteps} step${pipelineSteps === 1 ? '' : 's'}` : ''}
+          {widget.replace_widget_id ? <span className="text-neon-amber"> · REPLACES</span> : ''}
         </p>
       ) : (
-        <p className="mt-1 text-[10px] text-destructive">Missing executable datasource plan</p>
+        <p className="mt-1 text-[10px] mono text-destructive">// missing executable datasource plan</p>
       )}
       {dryRun && dryRun.status === 'ok' && (
-        <div className="mt-1 rounded border border-emerald-500/30 bg-emerald-500/5 p-1.5">
+        <div className="mt-1 rounded border border-neon-lime/30 bg-neon-lime/5 p-1.5">
           <button
             onClick={() => setExpanded(v => !v)}
-            className="flex w-full items-center justify-between text-[10px] text-emerald-700 dark:text-emerald-300"
+            className="flex w-full items-center justify-between text-[10px] mono uppercase tracking-wider text-neon-lime"
           >
-            <span>OK · {dryRun.duration_ms}ms · {dryRun.pipeline_steps} step(s){dryRun.has_llm_step ? ' · LLM' : ''}</span>
+            <span>ok · {dryRun.duration_ms}ms · {dryRun.pipeline_steps} step{dryRun.pipeline_steps === 1 ? '' : 's'}{dryRun.has_llm_step ? ' · llm' : ''}</span>
             <span>{expanded ? 'hide' : 'show output'}</span>
           </button>
           {expanded && (
-            <pre className="mt-1 max-h-40 overflow-auto rounded bg-background/60 p-1 font-mono text-[10px]">
+            <pre className="mt-1 max-h-40 overflow-auto rounded bg-card/70 border border-border/60 p-1 mono text-[10px]">
               {JSON.stringify(dryRun.widget_runtime, null, 2)}
             </pre>
           )}
@@ -1673,7 +1738,7 @@ function WidgetProposalRow({
       )}
       {dryRun && dryRun.status === 'error' && (
         <div className="mt-1 rounded border border-destructive/30 bg-destructive/5 p-1.5">
-          <p className="text-[10px] text-destructive break-words">{dryRun.error ?? 'Unknown error'}</p>
+          <p className="text-[10px] mono text-destructive break-words">{dryRun.error ?? 'Unknown error'}</p>
         </div>
       )}
       {!dryRun && (

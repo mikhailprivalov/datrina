@@ -57,14 +57,15 @@ export function CostsView({ onClose }: Props) {
   }, [summary]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
-      <div className="flex max-h-[88vh] w-[min(92vw,64rem)] flex-col rounded-xl border border-border bg-card shadow-xl">
-        <div className="flex items-center justify-between border-b border-border px-5 py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="flex max-h-[88vh] w-[min(92vw,64rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-5 py-3 bg-muted/20">
           <div>
-            <h2 className="text-sm font-semibold text-foreground">Provider costs</h2>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// costs</p>
+            <h2 className="mt-0.5 text-sm font-semibold text-foreground tracking-tight">Provider costs</h2>
             <p className="text-[11px] text-muted-foreground">
               Token + dollar spend across all chat sessions. Editable per-model
-              pricing overrides live in <code className="font-mono">pricing_overrides.json</code>.
+              pricing overrides live in <code className="mono text-foreground/80">pricing_overrides.json</code>.
             </p>
           </div>
           <button onClick={onClose} className="p-1 rounded hover:bg-muted text-muted-foreground" aria-label="Close">
@@ -75,7 +76,7 @@ export function CostsView({ onClose }: Props) {
         </div>
 
         {(status || error) && (
-          <div className={`border-b border-border px-5 py-2 text-xs ${error ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400'}`}>
+          <div className={`border-b border-border px-5 py-2 text-xs ${error ? 'text-destructive' : 'text-neon-lime'}`}>
             {error ?? status}
           </div>
         )}
@@ -83,7 +84,7 @@ export function CostsView({ onClose }: Props) {
         <div className="flex-1 overflow-auto p-5 space-y-5">
           <section className="rounded-lg border border-border bg-background/50 p-3">
             <div className="flex items-baseline justify-between mb-2">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              <h3 className="text-[10px] mono font-semibold uppercase tracking-[0.18em] text-primary">
                 Last 30 days
               </h3>
               <span className="text-xs text-muted-foreground">
@@ -104,10 +105,10 @@ export function CostsView({ onClose }: Props) {
                       title={`${date.toLocaleDateString()} · $${bucket.cost_usd.toFixed(4)}`}
                     >
                       <div
-                        className="w-full bg-primary/70 rounded-sm"
-                        style={{ height: `${height}%` }}
+                        className="w-full bg-gradient-to-t from-primary to-primary/40 rounded-sm"
+                        style={{ height: `${height}%`, boxShadow: '0 0 6px hsl(var(--primary) / 0.4)' }}
                       />
-                      <span className="text-[8px] text-muted-foreground/70">
+                      <span className="text-[8px] mono text-muted-foreground/70 tabular">
                         {date.getUTCDate()}
                       </span>
                     </div>
@@ -120,7 +121,7 @@ export function CostsView({ onClose }: Props) {
           </section>
 
           <section className="rounded-lg border border-border bg-background/50">
-            <div className="border-b border-border/60 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            <div className="border-b border-border/60 px-3 py-2 text-[10px] mono font-semibold uppercase tracking-[0.18em] text-primary">
               Top sessions
             </div>
             {summary?.top_sessions.length ? (
@@ -128,7 +129,7 @@ export function CostsView({ onClose }: Props) {
                 {summary.top_sessions.map(entry => (
                   <li key={entry.session_id} className="flex items-center justify-between px-3 py-2 text-xs">
                     <div className="min-w-0 flex-1">
-                      <span className={`mr-2 inline-block rounded px-1.5 py-0.5 text-[9px] uppercase tracking-wide ${entry.mode === 'build' ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400' : 'bg-blue-500/10 text-blue-600 dark:text-blue-400'}`}>
+                      <span className={`mr-2 inline-block rounded-sm border px-1.5 py-0.5 text-[9px] mono font-semibold uppercase tracking-wider ${entry.mode === 'build' ? 'bg-neon-amber/10 border-neon-amber/40 text-neon-amber' : 'bg-primary/10 border-primary/40 text-primary'}`}>
                         {entry.mode}
                       </span>
                       <span className="truncate text-foreground">{entry.title}</span>
@@ -148,7 +149,7 @@ export function CostsView({ onClose }: Props) {
           <section className="rounded-lg border border-border bg-background/50">
             <div className="border-b border-border/60 px-3 py-2 flex items-center justify-between">
               <div>
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Pricing overrides</h3>
+                <h3 className="text-[10px] mono font-semibold uppercase tracking-[0.18em] text-primary">Pricing overrides</h3>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
                   Edit the rates Datrina uses to compute cost. Pattern is a case-insensitive substring on model id.
                 </p>

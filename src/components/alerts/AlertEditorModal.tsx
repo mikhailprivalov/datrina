@@ -155,11 +155,12 @@ export function AlertEditorModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
-      <div className="flex h-[min(85vh,42rem)] w-[min(95vw,60rem)] flex-col rounded-xl border border-border bg-card shadow-xl">
-        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="flex h-[min(85vh,42rem)] w-[min(95vw,60rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/20">
           <div>
-            <p className="text-sm font-semibold">Alerts — {widgetTitle}</p>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// alerts editor</p>
+            <p className="mt-0.5 text-sm font-semibold tracking-tight">{widgetTitle}</p>
             <p className="text-[11px] text-muted-foreground">
               Each alert is evaluated after every successful refresh.
             </p>

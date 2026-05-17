@@ -155,13 +155,14 @@ export function ProviderSettings({
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 p-4 backdrop-blur-sm">
-      <div className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xl">
-        <div className="flex items-center justify-between border-b border-border px-5 py-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/85 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-md border border-border bg-card shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-5 py-4 bg-muted/20">
           <div>
-            <h2 className="text-base font-semibold">{initialSetup ? 'LLM provider setup' : 'Settings'}</h2>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// providers</p>
+            <h2 className="mt-0.5 text-base font-semibold tracking-tight">{initialSetup ? 'LLM provider setup' : 'Settings'}</h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              {activeProvider ? `Active: ${activeProvider.name} - ${activeProvider.default_model}` : 'No active LLM provider'}
+              {activeProvider ? <>Active: <span className="text-foreground">{activeProvider.name}</span> · <span className="mono">{activeProvider.default_model}</span></> : 'No active LLM provider'}
             </p>
           </div>
           {!initialSetup && (
@@ -253,7 +254,7 @@ export function ProviderSettings({
             {testResult && (
               <div className={`rounded-lg border px-3 py-2 text-sm ${
                 testResult.status === 'ok'
-                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700'
+                  ? 'border-neon-lime/30 bg-neon-lime/10 text-neon-lime'
                   : 'border-destructive/30 bg-destructive/5 text-destructive'
               }`}>
                 Test {testResult.status}: {testResult.error || `${testResult.provider} responded for ${testResult.model}`}
@@ -308,7 +309,7 @@ export function ProviderSettings({
                         <div className="flex items-center gap-2">
                           <span className="truncate text-sm font-medium">{provider.name}</span>
                           {provider.id === activeProviderId && (
-                            <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-700">active</span>
+                            <span className="rounded-sm border border-neon-lime/40 bg-neon-lime/15 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider font-semibold text-neon-lime">active</span>
                           )}
                         </div>
                         <p className="mt-1 truncate text-xs text-muted-foreground">

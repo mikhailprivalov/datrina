@@ -29,34 +29,31 @@ pub struct ToolAuditEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolPolicySnapshot {
     pub builtin_tools: Vec<String>,
-    pub mcp_commands: Vec<String>,
     pub network_schemes: Vec<String>,
     pub blocked_networks: Vec<String>,
 }
 
-/// Policy gateway for built-in tools, MCP process launch, and network access.
+/// Policy gateway for built-in tools and network access. MCP server launch
+/// is no longer gated by an executable allowlist — the user is trusted to
+/// register only commands they intend to run. Every connect attempt is still
+/// audited via `validate_mcp_server`.
 pub struct ToolEngine {
     builtin_tools: HashSet<String>,
-    mcp_commands: HashSet<String>,
 }
 
 impl ToolEngine {
-    pub fn new(builtin_tools: Vec<String>, mcp_commands: Vec<String>) -> Self {
+    pub fn new(builtin_tools: Vec<String>) -> Self {
         Self {
             builtin_tools: builtin_tools.into_iter().collect(),
-            mcp_commands: mcp_commands.into_iter().collect(),
         }
     }
 
     pub fn policy_snapshot(&self) -> ToolPolicySnapshot {
         let mut builtin_tools: Vec<_> = self.builtin_tools.iter().cloned().collect();
-        let mut mcp_commands: Vec<_> = self.mcp_commands.iter().cloned().collect();
         builtin_tools.sort();
-        mcp_commands.sort();
 
         ToolPolicySnapshot {
             builtin_tools,
-            mcp_commands,
             network_schemes: vec!["https".to_string(), "http".to_string()],
             blocked_networks: vec![
                 "localhost".to_string(),
@@ -206,24 +203,26 @@ impl ToolEngine {
 
     fn validate_mcp_server_inner(&self, server: &MCPServer) -> Result<()> {
         match server.transport {
-            MCPTransport::Stdio => {}
-            MCPTransport::Http => {
-                return Err(anyhow!(
-                    "HTTP MCP transport is unsupported in MVP; configure a stdio MCP server"
-                ));
+            MCPTransport::Stdio => {
+                let command = server
+                    .command
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("No command specified for stdio MCP server"))?;
+                if command.trim().is_empty() {
+                    return Err(anyhow!("MCP stdio command cannot be empty"));
+                }
             }
-        }
-
-        let command = server
-            .command
-            .as_deref()
-            .ok_or_else(|| anyhow!("No command specified for stdio MCP server"))?;
-        let command_name = command.rsplit('/').next().unwrap_or(command);
-        if !self.mcp_commands.contains(command_name) {
-            return Err(anyhow!(
-                "MCP command '{}' is not in the allowlist",
-                command_name
-            ));
+            MCPTransport::Http => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("No url specified for HTTP MCP server"))?;
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(anyhow!(
+                        "HTTP MCP server url must start with http:// or https://"
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -320,17 +319,7 @@ impl ToolEngine {
 
 impl Default for ToolEngine {
     fn default() -> Self {
-        Self::new(
-            vec!["curl".to_string(), "http_request".to_string()],
-            vec![
-                "node".to_string(),
-                "npx".to_string(),
-                "bun".to_string(),
-                "bunx".to_string(),
-                "uvx".to_string(),
-                "yandex-mcp-store-proxy".to_string(),
-            ],
-        )
+        Self::new(vec!["curl".to_string(), "http_request".to_string()])
     }
 }
 

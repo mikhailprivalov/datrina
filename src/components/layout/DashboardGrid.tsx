@@ -97,21 +97,23 @@ export function DashboardGrid({
 
   if (dashboard.layout.length === 0) {
     return (
-      <div className="flex h-full min-h-[320px] items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 text-center">
-        <div className="max-w-sm px-6">
-          <h2 className="text-sm font-medium text-foreground">No widgets yet</h2>
+      <div className="grid-backdrop flex h-full min-h-[320px] items-center justify-center rounded-md border border-dashed border-border bg-muted/10 text-center">
+        <div className="max-w-sm px-6 panel py-6 shadow-sm">
+          <p className="mono text-[10px] uppercase tracking-[0.2em] text-primary">empty dashboard</p>
+          <h2 className="mt-2 text-sm font-medium text-foreground">No widgets yet</h2>
           <p className="mt-2 text-sm text-muted-foreground">
-            This dashboard is saved locally. Widgets will appear here after a workflow or build step adds them.
+            Saved locally. Widgets appear after a workflow or Build step adds them.
           </p>
           <div className="mt-4 flex justify-center gap-2">
-            <button onClick={() => onAddWidget('text')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add text</button>
-            <button onClick={() => onAddWidget('gauge')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add gauge</button>
+            <button onClick={() => onAddWidget('text')} className="rounded-md border border-border bg-muted/40 px-3 py-1.5 text-xs hover:bg-muted hover:border-primary/40 transition-colors">+ Text</button>
+            <button onClick={() => onAddWidget('gauge')} className="rounded-md border border-border bg-muted/40 px-3 py-1.5 text-xs hover:bg-muted hover:border-primary/40 transition-colors">+ Gauge</button>
           </div>
         </div>
       </div>
     );
   }
 
+  const toolbarBtn = 'rounded-md border border-border bg-muted/30 px-2.5 py-1 text-xs hover:bg-muted hover:border-primary/40 transition-colors mono uppercase tracking-wider';
   return (
     <div className="space-y-3">
       <ParameterBar
@@ -119,12 +121,12 @@ export function DashboardGrid({
         parameters={dashboard.parameters ?? []}
         onAffectedWidgets={ids => ids.forEach(id => onRefreshWidget(id))}
       />
-      <div className="flex justify-end gap-2">
-        <button onClick={onOpenHistory} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted" title="View dashboard history and restore prior versions">
+      <div className="flex justify-end gap-1.5">
+        <button onClick={onOpenHistory} className={toolbarBtn} title="View dashboard history and restore prior versions">
           History
         </button>
-        <button onClick={() => onAddWidget('text')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add text</button>
-        <button onClick={() => onAddWidget('gauge')} className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted">Add gauge</button>
+        <button onClick={() => onAddWidget('text')} className={toolbarBtn}>+ Text</button>
+        <button onClick={() => onAddWidget('gauge')} className={toolbarBtn}>+ Gauge</button>
       </div>
       <ResponsiveGridLayout
         className="layout"
@@ -143,8 +145,8 @@ export function DashboardGrid({
           const fallback = isFallback(data);
           const refreshing = refreshingWidgetId === widget.id;
           return (
-            <div key={widget.id} className="bg-card rounded-xl border border-border shadow-sm overflow-hidden flex flex-col">
-              <div className="widget-drag-handle flex items-center justify-between px-3 py-2 border-b border-border/50 cursor-move">
+            <div key={widget.id} className="group/widget bg-card rounded-md border border-border hover:border-primary/30 shadow-sm overflow-hidden flex flex-col transition-colors">
+              <div className="widget-drag-handle flex items-center justify-between px-3 py-1.5 border-b border-border/60 cursor-move bg-muted/30">
                 {editingTitleId === widget.id ? (
                   <TitleEditor
                     initial={widget.title}
@@ -153,7 +155,7 @@ export function DashboardGrid({
                   />
                 ) : (
                   <span
-                    className="text-sm font-medium truncate"
+                    className="text-xs font-semibold truncate tracking-tight"
                     onDoubleClick={event => { event.stopPropagation(); setEditingTitleId(widget.id); }}
                     title="Double-click to rename"
                   >
@@ -164,13 +166,13 @@ export function DashboardGrid({
                   <AlertDot status={widgetAlertStatus?.[widget.id]} />
                   <WorkflowBadge widget={widget} run={run} fallback={fallback} />
                   <button
-                    className="p-1 rounded hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    className="p-1 rounded hover:bg-muted hover:text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                     title="Refresh widget data"
                     disabled={refreshing}
                     onMouseDown={event => event.stopPropagation()}
                     onClick={() => onRefreshWidget(widget.id)}
                   >
-                    <svg className={`w-3.5 h-3.5 text-muted-foreground ${refreshing ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className={`w-3.5 h-3.5 text-muted-foreground ${refreshing ? 'animate-spin text-primary' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                     </svg>
                   </button>
@@ -240,14 +242,14 @@ function InspectModal({
   const dataJson = data ? JSON.stringify(data, null, 2) : 'No runtime data captured.';
   const runJson = run ? JSON.stringify(run, null, 2) : 'No workflow run recorded yet.';
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
-      <div className="flex max-h-[80vh] w-[min(90vw,52rem)] flex-col rounded-xl border border-border bg-card shadow-xl">
-        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="flex max-h-[80vh] w-[min(90vw,52rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/30">
           <div className="min-w-0">
-            <p className="text-sm font-medium truncate">{widget.title}</p>
-            <p className="text-[11px] text-muted-foreground truncate">{widget.type} - id {widget.id}</p>
+            <p className="text-sm font-semibold truncate">{widget.title}</p>
+            <p className="text-[10px] mono uppercase tracking-wider text-muted-foreground truncate">{widget.type} · id <span className="text-foreground/80">{widget.id}</span></p>
           </div>
-          <button onClick={onClose} className="p-1 rounded hover:bg-muted">
+          <button onClick={onClose} className="p-1 rounded hover:bg-muted hover:text-foreground transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
@@ -255,13 +257,13 @@ function InspectModal({
         </div>
         <div className="flex-1 overflow-auto p-4 space-y-4">
           <Section title="Runtime data" copyable={dataJson}>
-            <pre className="max-h-72 overflow-auto rounded bg-background/70 p-2 text-[11px] font-mono">{dataJson}</pre>
+            <pre className="max-h-72 overflow-auto rounded bg-muted/40 border border-border/60 p-2 text-[11px] mono">{dataJson}</pre>
           </Section>
           <Section title="Last workflow run" copyable={runJson}>
-            <pre className="max-h-72 overflow-auto rounded bg-background/70 p-2 text-[11px] font-mono">{runJson}</pre>
+            <pre className="max-h-72 overflow-auto rounded bg-muted/40 border border-border/60 p-2 text-[11px] mono">{runJson}</pre>
           </Section>
           <Section title="Widget config" copyable={JSON.stringify(widget, null, 2)}>
-            <pre className="max-h-72 overflow-auto rounded bg-background/70 p-2 text-[11px] font-mono">{JSON.stringify(widget, null, 2)}</pre>
+            <pre className="max-h-72 overflow-auto rounded bg-muted/40 border border-border/60 p-2 text-[11px] mono">{JSON.stringify(widget, null, 2)}</pre>
           </Section>
         </div>
       </div>
@@ -284,9 +286,9 @@ function Section({ title, children, copyable }: { title: string; children: React
   return (
     <div>
       <div className="mb-1 flex items-center justify-between">
-        <p className="text-[11px] uppercase tracking-wide text-muted-foreground">{title}</p>
+        <p className="text-[10px] mono uppercase tracking-[0.18em] text-primary">// {title}</p>
         {copyable && (
-          <button onClick={onCopy} className="text-[11px] text-muted-foreground hover:text-foreground">
+          <button onClick={onCopy} className="text-[10px] mono uppercase tracking-wider text-muted-foreground hover:text-primary transition-colors">
             {copied ? 'Copied' : 'Copy'}
           </button>
         )}
@@ -300,10 +302,10 @@ function AlertDot({ status }: { status?: WidgetAlertStatus }) {
   if (!status || status.count <= 0) return null;
   const tone =
     status.severity === 'critical'
-      ? 'bg-destructive'
+      ? 'bg-destructive glow-destructive'
       : status.severity === 'warning'
-        ? 'bg-amber-500'
-        : 'bg-blue-500';
+        ? 'bg-neon-amber'
+        : 'bg-primary';
   return (
     <span
       title={`${status.count} unacknowledged alert${status.count === 1 ? '' : 's'} (${status.severity})`}
@@ -320,16 +322,16 @@ function WorkflowBadge({ widget, run, fallback }: { widget: Widget; run?: Workfl
     ? 'Data did not match the widget shape; showing raw output'
     : run?.error ? `Last refresh failed: ${run.error}` : `Last refresh: ${status}`;
   const tone = status === 'success'
-    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
+    ? 'bg-neon-lime/15 text-neon-lime border-neon-lime/30'
     : status === 'error'
-      ? 'bg-destructive/15 text-destructive'
+      ? 'bg-destructive/15 text-destructive border-destructive/40'
       : status === 'running'
-        ? 'bg-blue-500/15 text-blue-700 dark:text-blue-400'
+        ? 'bg-primary/15 text-primary border-primary/30'
         : status === 'fallback'
-          ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
-          : 'bg-muted text-muted-foreground';
+          ? 'bg-neon-amber/15 text-neon-amber border-neon-amber/30'
+          : 'bg-muted text-muted-foreground border-border';
   return (
-    <span title={title} className={`rounded px-1.5 py-0.5 text-[10px] ${tone}`}>
+    <span title={title} className={`rounded-sm border px-1.5 py-0.5 text-[9px] mono font-semibold uppercase tracking-wider ${tone}`}>
       {status}
     </span>
   );
@@ -373,7 +375,7 @@ function WidgetMenu({
         </svg>
       </button>
       {open && (
-        <div className="absolute right-0 top-7 z-40 w-44 rounded-md border border-border bg-popover py-1 shadow-lg">
+        <div className="absolute right-0 top-7 z-40 w-44 rounded-md border border-border bg-popover py-1 shadow-xl">
           <MenuItem label="Rename" onClick={() => { setOpen(false); onRename(); }} />
           <MenuItem label="Duplicate" onClick={() => { setOpen(false); onDuplicate(); }} />
           <MenuItem label="View raw data" onClick={() => { setOpen(false); onInspect(); }} />
@@ -383,7 +385,7 @@ function WidgetMenu({
           {onOpenAlerts && (
             <MenuItem label="Alerts…" onClick={() => { setOpen(false); onOpenAlerts(); }} />
           )}
-          <div className="my-1 h-px bg-border/60" />
+          <div className="my-1 h-px bg-border" />
           <MenuItem label="Delete" destructive onClick={() => { setOpen(false); onDelete(); }} />
         </div>
       )}
@@ -442,12 +444,12 @@ function WidgetFooter({ widget, run }: { widget: Widget; run?: WorkflowRun }) {
   const durationMs = run?.finished_at && run?.started_at ? run.finished_at - run.started_at : undefined;
   const errored = run?.status === 'error';
   return (
-    <div className="flex items-center justify-between gap-2 border-t border-border/40 px-3 py-1 text-[10px] text-muted-foreground">
-      <span className={errored ? 'text-destructive' : ''}>
-        {errored ? `Failed ${last}` : `Updated ${last}`}
+    <div className="flex items-center justify-between gap-2 border-t border-border/60 bg-muted/20 px-3 py-1 text-[10px] mono uppercase tracking-wider">
+      <span className={errored ? 'text-destructive' : 'text-muted-foreground'}>
+        {errored ? `failed ${last}` : `updated ${last}`}
       </span>
       {durationMs !== undefined && durationMs > 0 && (
-        <span className="tabular-nums opacity-70">{Math.round(durationMs)}ms</span>
+        <span className="tabular text-muted-foreground/70">{Math.round(durationMs)}ms</span>
       )}
     </div>
   );
@@ -485,8 +487,9 @@ function WidgetRenderer({ widget, data }: { widget: Dashboard['layout'][number];
 
 function WidgetError({ message }: { message?: string }) {
   return (
-    <div className="flex h-full min-h-24 items-center justify-center rounded-md border border-destructive/30 bg-destructive/5 p-3 text-center text-xs text-destructive">
-      {message}
+    <div className="flex h-full min-h-24 flex-col items-center justify-center gap-1 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-center text-xs text-destructive">
+      <span className="mono uppercase tracking-wider text-[10px] text-destructive/70">// error</span>
+      <span>{message}</span>
     </div>
   );
 }

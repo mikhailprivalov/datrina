@@ -20,8 +20,9 @@ export function TextWidget({ config, data }: Props) {
 
   if (!content) {
     return (
-      <div className="flex h-full min-h-24 items-center justify-center text-center text-xs text-muted-foreground">
-        Text data unavailable
+      <div className="flex h-full min-h-24 flex-col items-center justify-center gap-1 text-center">
+        <span className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60">// no data</span>
+        <span className="text-xs text-muted-foreground">Text data unavailable</span>
       </div>
     );
   }
@@ -71,19 +72,19 @@ export function TextWidget({ config, data }: Props) {
           code: ({ className, children, ...rest }) => {
             const inline = !className;
             if (inline) {
-              return <code className="rounded bg-foreground/10 px-1 py-0.5 text-[11px] font-mono" {...rest}>{children}</code>;
+              return <code className="rounded-sm bg-primary/10 px-1 py-0.5 text-[11px] mono text-primary" {...rest}>{children}</code>;
             }
-            return <code className={`${className ?? ''} font-mono text-[11px]`} {...rest}>{children}</code>;
+            return <code className={`${className ?? ''} mono text-[11px]`} {...rest}>{children}</code>;
           },
           pre: ({ children }) => (
-            <pre className="overflow-x-auto rounded-md border border-border/60 bg-background/80 p-2 text-[11px]">{children}</pre>
+            <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-2 text-[11px]">{children}</pre>
           ),
           table: ({ children }) => (
             <div className="overflow-x-auto">
               <table className="min-w-full text-[11px] border-collapse">{children}</table>
             </div>
           ),
-          th: ({ children }) => <th className="border border-border/60 px-2 py-1 bg-background/50 text-left font-medium">{children}</th>,
+          th: ({ children }) => <th className="border border-border/60 px-2 py-1 bg-muted/40 text-left font-semibold uppercase tracking-wider text-[10px] mono">{children}</th>,
           td: ({ children }) => <td className="border border-border/60 px-2 py-1 align-top">{children}</td>,
         }}
       >

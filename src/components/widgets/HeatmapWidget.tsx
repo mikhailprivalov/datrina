@@ -51,7 +51,11 @@ export function HeatmapWidget({ config, data }: Props) {
   const scheme = SCHEMES[config.color_scheme ?? 'viridis'] ?? SCHEMES.viridis;
 
   if (!data || data.cells.length === 0) {
-    return <div className="flex h-full items-center justify-center text-xs text-muted-foreground">No heatmap data</div>;
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
+        <span className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60">// no data</span>
+      </div>
+    );
   }
   const useLog = (config.log_scale ?? false) && min > 0;
   return (
@@ -101,9 +105,9 @@ export function HeatmapWidget({ config, data }: Props) {
 function HeatmapLegend({ min, max, scheme, unit }: { min: number; max: number; scheme: Stop[]; unit?: string }) {
   const gradient = `linear-gradient(to right, ${scheme.map(([stop, rgb]) => `rgb(${rgb.join(',')}) ${Math.round(stop * 100)}%`).join(', ')})`;
   return (
-    <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+    <div className="flex items-center gap-2 text-[10px] mono tabular text-muted-foreground">
       <span>{formatValue(min)}{unit ?? ''}</span>
-      <div className="flex-1 h-2 rounded-full" style={{ background: gradient }} />
+      <div className="flex-1 h-2 rounded-sm border border-border/60" style={{ background: gradient }} />
       <span>{formatValue(max)}{unit ?? ''}</span>
     </div>
   );

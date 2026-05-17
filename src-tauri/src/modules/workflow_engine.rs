@@ -291,8 +291,14 @@ impl<'a> WorkflowEngine<'a> {
                         let steps: Vec<crate::models::pipeline::PipelineStep> =
                             serde_json::from_value(steps_value.clone())
                                 .map_err(|e| anyhow!("Invalid pipeline steps: {}", e))?;
-                        run_pipeline(input_data, &steps, self.ai_engine, self.provider.as_ref())
-                            .await
+                        run_pipeline(
+                            input_data,
+                            &steps,
+                            self.ai_engine,
+                            self.provider.as_ref(),
+                            self.mcp_manager,
+                        )
+                        .await
                     }
                     other => Err(anyhow!("Unsupported transform '{}'", other)),
                 }
@@ -608,15 +614,105 @@ fn resolve_segments(value: &Value, segments: &[String]) -> Value {
     }
 }
 
+/// Walk an arguments template and replace `$_` / `$_.path` references with
+/// the current pipeline value. Used by `PipelineStep::McpCall` so each step
+/// can build its tool arguments from upstream data.
+///
+/// Substitution rules:
+/// - Whole-string `"$_"` → current value, type-preserving.
+/// - Whole-string `"$_.a.b"` → result of `resolve_path(current, "a.b")`,
+///   type-preserving.
+/// - Mixed string like `"prefix-$_.id"` → string render via `Display`.
+/// - Literal `$$` escapes to a single `$`.
+fn substitute_current(args: &Value, current: &Value) -> Value {
+    match args {
+        Value::String(s) => substitute_current_string(s, current),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| substitute_current(item, current))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), substitute_current(v, current));
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn substitute_current_string(raw: &str, current: &Value) -> Value {
+    // Whole-string tokens preserve types — `"$_"` substitutes the value as-is,
+    // `"$_.a.b"` plucks a field by path.
+    if raw == "$_" {
+        return current.clone();
+    }
+    if let Some(path) = raw.strip_prefix("$_.") {
+        if !path.contains(['$', ' ']) {
+            return resolve_path(current, path);
+        }
+    }
+    // Mixed strings: interpolate as text. Walk the raw string and substitute
+    // any `$_` or `$_.path` references inline.
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+            out.push('$');
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
+            let mut j = i + 2;
+            if j < bytes.len() && bytes[j] == b'.' {
+                j += 1;
+                let path_start = j;
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'[' || c == b']'
+                    {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let path = &raw[path_start..j];
+                let value = resolve_path(current, path);
+                out.push_str(&value_to_display(&value));
+            } else {
+                out.push_str(&value_to_display(current));
+            }
+            i = j;
+            continue;
+        }
+        out.push(raw[i..].chars().next().unwrap());
+        i += raw[i..].chars().next().unwrap().len_utf8();
+    }
+    Value::String(out)
+}
+
+fn value_to_display(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 async fn run_pipeline(
     input: Value,
     steps: &[crate::models::pipeline::PipelineStep],
     ai_engine: Option<&crate::modules::ai::AIEngine>,
     provider: Option<&crate::models::provider::LLMProvider>,
+    mcp_manager: Option<&MCPManager>,
 ) -> Result<Value> {
     let mut current = input;
     for step in steps {
-        current = apply_pipeline_step(current, step, ai_engine, provider).await?;
+        current = apply_pipeline_step(current, step, ai_engine, provider, mcp_manager).await?;
     }
     Ok(current)
 }
@@ -630,6 +726,7 @@ pub(crate) async fn run_pipeline_with_trace(
     steps: &[crate::models::pipeline::PipelineStep],
     ai_engine: Option<&crate::modules::ai::AIEngine>,
     provider: Option<&crate::models::provider::LLMProvider>,
+    mcp_manager: Option<&MCPManager>,
 ) -> (Value, Vec<crate::models::pipeline::PipelineStepTrace>) {
     let mut current = input;
     let mut traces = Vec::with_capacity(steps.len());
@@ -638,7 +735,7 @@ pub(crate) async fn run_pipeline_with_trace(
         let started = std::time::Instant::now();
         let kind = pipeline_step_kind(step);
         let config_json = serde_json::to_value(step).unwrap_or(Value::Null);
-        match apply_pipeline_step(current.clone(), step, ai_engine, provider).await {
+        match apply_pipeline_step(current.clone(), step, ai_engine, provider, mcp_manager).await {
             Ok(next) => {
                 let duration_ms = started.elapsed().as_millis() as u32;
                 let output_sample = prune_for_trace(&next);
@@ -689,6 +786,7 @@ fn pipeline_step_kind(step: &crate::models::pipeline::PipelineStep) -> String {
         Format { .. } => "format",
         Coerce { .. } => "coerce",
         LlmPostprocess { .. } => "llm_postprocess",
+        McpCall { .. } => "mcp_call",
     }
     .to_string()
 }
@@ -802,6 +900,7 @@ async fn apply_pipeline_step(
     step: &crate::models::pipeline::PipelineStep,
     ai_engine: Option<&crate::modules::ai::AIEngine>,
     provider: Option<&crate::models::provider::LLMProvider>,
+    mcp_manager: Option<&MCPManager>,
 ) -> Result<Value> {
     use crate::models::pipeline::{LlmExpect, PipelineStep, SortOrder};
     match step {
@@ -970,6 +1069,28 @@ async fn apply_pipeline_step(
                 LlmExpect::Json => serde_json::from_str(&response.content)
                     .map_err(|e| anyhow!("LlmPostprocess: response was not valid JSON: {}", e)),
             }
+        }
+        PipelineStep::McpCall {
+            server_id,
+            tool_name,
+            arguments,
+        } => {
+            let manager = mcp_manager.ok_or_else(|| {
+                anyhow!("McpCall step requires an MCP manager (pipeline ran in a context without one)")
+            })?;
+            if !manager.is_connected(server_id).await {
+                return Err(anyhow!(
+                    "McpCall: MCP server '{}' not connected",
+                    server_id
+                ));
+            }
+            let resolved = match arguments {
+                Some(args) => substitute_current(args, &current),
+                None => json!({}),
+            };
+            manager
+                .call_tool(server_id, tool_name, Some(resolved))
+                .await
         }
     }
 }
@@ -1404,7 +1525,8 @@ mod tests {
             PipelineStep::Length,
         ];
         let initial = json!({ "items": [{"id":1},{"id":2},{"id":3},{"id":4}] });
-        let (final_value, traces) = run_pipeline_with_trace(initial, &steps, None, None).await;
+        let (final_value, traces) =
+            run_pipeline_with_trace(initial, &steps, None, None, None).await;
         assert_eq!(final_value, json!(2));
         assert_eq!(traces.len(), 3);
         assert_eq!(traces[0].kind, "pick");
@@ -1415,6 +1537,75 @@ mod tests {
         for step in &traces {
             assert!(step.error.is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn substitute_current_replaces_whole_string_and_path() {
+        let current = json!({
+            "id": 42,
+            "nested": { "name": "alpha" },
+            "tags": ["x", "y"]
+        });
+
+        // Whole-string $_ preserves the entire current value.
+        assert_eq!(
+            substitute_current(&json!({"payload": "$_"}), &current),
+            json!({"payload": current})
+        );
+
+        // Whole-string $_.path is type-preserving (number stays number).
+        assert_eq!(
+            substitute_current(&json!({"id": "$_.id"}), &current),
+            json!({"id": 42})
+        );
+
+        // Nested object access preserves type.
+        assert_eq!(
+            substitute_current(&json!({"name": "$_.nested.name"}), &current),
+            json!({"name": "alpha"})
+        );
+
+        // Mixed string interpolates as text.
+        assert_eq!(
+            substitute_current(&json!({"q": "id=$_.id"}), &current),
+            json!({"q": "id=42"})
+        );
+
+        // $$ escapes to literal $.
+        assert_eq!(
+            substitute_current(&json!({"price": "$$5"}), &current),
+            json!({"price": "$5"})
+        );
+
+        // Recursion through arrays.
+        assert_eq!(
+            substitute_current(&json!({"tags": ["literal", "$_.tags"]}), &current),
+            json!({"tags": ["literal", ["x", "y"]]})
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_mcp_call_without_manager_errors() -> Result<()> {
+        use crate::models::pipeline::PipelineStep;
+        let steps = vec![PipelineStep::McpCall {
+            server_id: "any".into(),
+            tool_name: "any".into(),
+            arguments: None,
+        }];
+        let (final_value, traces) =
+            run_pipeline_with_trace(json!({}), &steps, None, None, None).await;
+        assert_eq!(final_value, Value::Null);
+        assert_eq!(traces.len(), 1);
+        let err = traces[0]
+            .error
+            .as_deref()
+            .expect("McpCall without manager must record an error");
+        assert!(
+            err.contains("MCP manager"),
+            "unexpected error message: {}",
+            err
+        );
         Ok(())
     }
 

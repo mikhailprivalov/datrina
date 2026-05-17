@@ -1342,6 +1342,43 @@ Parallelism:
   no-key path and, when available, one streaming-capable provider with a
   tool-calling Build Chat scenario.
 
+## Dedicated Product Workstreams After W15
+
+The product-readiness backlog after W15 is tracked as one dedicated
+`docs/W<N>_*.md` file per workstream. Agents executing these streams must use
+the matching file as the task contract and preserve the same
+`Status / Context / Goal / Approach / Files / Validation / Out of scope /
+Related` shape for new tasks.
+
+Current dedicated workstream index:
+
+- `W16` - Proposal Validation Gate:
+  `docs/W16_PROPOSAL_VALIDATION_GATE.md`.
+- `W17` - Agent Memory And Local RAG:
+  `docs/W17_AGENT_MEMORY_RAG.md`.
+- `W18` - Plan / Execute / Reflect Agent Loop:
+  `docs/W18_PLAN_EXECUTE_REFLECT.md`.
+- `W19` - Dashboard Versions And Undo:
+  `docs/W19_DASHBOARD_VERSIONS_UNDO.md`.
+- `W20` - Data Playground And Templates:
+  `docs/W20_DATA_PLAYGROUND_TEMPLATES.md`.
+- `W21` - Alerts And Autonomous Triggers:
+  `docs/W21_ALERTS_AUTONOMOUS_TRIGGERS.md`.
+- `W22` - Token And Cost Tracking:
+  `docs/W22_TOKEN_COST_TRACKING.md`.
+- `W23` - Pipeline Debug View:
+  `docs/W23_PIPELINE_DEBUG_VIEW.md`.
+- `W24` - Agent Eval Suite:
+  `docs/W24_AGENT_EVAL_SUITE.md`.
+- `W25` - Dashboard Parameters:
+  `docs/W25_DASHBOARD_PARAMETERS.md`.
+- `W26` - CAO Autopilot E2E:
+  `docs/W26_CAO_AUTOPILOT_E2E.md`.
+- `W27` - Cyberpunk UI Redesign:
+  `docs/W27_CYBERPUNK_REDESIGN.md`.
+- `W28` - Chat UX Hardening And Regression Pass:
+  `docs/W28_CHAT_UX_HARDENING.md`.
+
 ## Parallelization Model
 
 Recommended agent queue:
@@ -1370,6 +1407,17 @@ Recommended agent queue:
 12. Run W15 as the chat runtime replacement stream: replace the custom chat
     state machine with typed message parts and a production UI/runtime adapter
     while preserving the Rust-owned provider/tool/MCP boundary.
+13. Run W16-W26 from their dedicated `docs/W<N>_*.md` records when product
+    readiness work resumes after W15.
+14. Run W27 as a bounded frontend-only redesign stream after W26: refresh the
+    app's visual language into a cyberpunk operations console while preserving
+    Rust/API contracts, chat runtime semantics, dashboard runtime behavior, and
+    local-first validation boundaries.
+15. Run W28 as a chat UX lifecycle hardening pass after W27: make Build Chat
+    entrypoints deterministic, keep seeded prompts out of stale sessions, clean
+    up copy/edit/regenerate affordances, add visible cancellation/error/retry
+    states, preserve drafts/scroll behavior, and only cross into backend/API
+    scope for explicitly accepted durable lifecycle fixes.
 
 Do not give two agents simultaneous ownership of `src/lib/api.ts`, `src-tauri/src/models/*`, or command request/response shapes. Contract drift is already the main risk.
 

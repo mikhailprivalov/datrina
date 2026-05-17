@@ -1,11 +1,17 @@
 use tauri::State;
 use tracing::info;
 
-use crate::models::mcp::{CallToolRequest, MCPServer, MCPTool};
+use crate::models::mcp::{CallToolRequest, MCPServer, MCPTool, MCPTransport};
 use crate::models::ApiResult;
 use crate::AppState;
 
 fn mask_env(mut server: MCPServer) -> MCPServer {
+    // HTTP MCP servers carry no env/args — nothing to mask. (Bearer tokens
+    // for HTTP transports should be provided via Authorization headers on
+    // a future per-server config; today we don't store them.)
+    if matches!(server.transport, MCPTransport::Http) {
+        return server;
+    }
     if let Some(env) = server.env.as_mut() {
         for value in env.values_mut() {
             *value = "********".to_string();

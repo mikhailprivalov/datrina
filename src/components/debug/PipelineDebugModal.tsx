@@ -131,11 +131,12 @@ export function PipelineDebugModal({
   }, [activeTrace]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
-      <div className="flex max-h-[90vh] w-[min(95vw,64rem)] flex-col rounded-xl border border-border bg-card shadow-xl">
-        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-[min(95vw,64rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/20">
           <div className="min-w-0 flex-1">
-            <p className="text-sm font-medium truncate">Debug pipeline — {widgetTitle}</p>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// debug pipeline</p>
+            <p className="mt-0.5 text-sm font-semibold tracking-tight truncate">{widgetTitle}</p>
             <p className="text-[11px] text-muted-foreground truncate">
               {lastTraceAgo ? `Last trace ${lastTraceAgo} ago` : 'No trace yet'}
               {' · '}
@@ -154,7 +155,7 @@ export function PipelineDebugModal({
             <button
               onClick={() => runTrace(false)}
               disabled={running}
-              className="rounded-md border border-border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-50"
+              className="rounded-md border border-border bg-card px-2.5 py-1 text-xs mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 disabled:opacity-50 transition-colors"
               title="Run a one-off traced refresh now"
             >
               {running ? 'Running…' : 'Run with trace'}
@@ -182,7 +183,7 @@ export function PipelineDebugModal({
             <div className="flex flex-col gap-3 p-4">
               <SourceHeader summary={activeTrace.source_summary} />
               {emptyAtStep !== null && (
-                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 dark:text-amber-400">
+                <div className="rounded-md border border-neon-amber/40 bg-neon-amber/10 px-3 py-2 text-[12px] text-neon-amber">
                   ⚠ Data became empty at step {emptyAtStep + 1}. Inspect that step's input
                   vs. its config — the upstream shape likely doesn't match the path or filter.
                 </div>
@@ -253,14 +254,14 @@ function StepRow({ step }: { step: PipelineStepTrace }) {
   const tone = failed
     ? 'border-destructive/50 bg-destructive/5'
     : outputEmpty
-      ? 'border-amber-500/40 bg-amber-500/5'
+      ? 'border-neon-amber/40 bg-neon-amber/5'
       : 'border-border';
   const status = failed ? '✗' : '✓';
   const statusColor = failed
     ? 'text-destructive'
     : outputEmpty
-      ? 'text-amber-600 dark:text-amber-400'
-      : 'text-emerald-600 dark:text-emerald-400';
+      ? 'text-neon-amber'
+      : 'text-neon-lime';
 
   return (
     <div className={`rounded-md border ${tone}`}>
@@ -317,7 +318,7 @@ function SamplePane({
         <span>· {sample.kind}</span>
         {sample.size_hint.items !== undefined && <span>· {sample.size_hint.items} items</span>}
         {sample.size_hint.bytes !== undefined && <span>· {sample.size_hint.bytes} bytes</span>}
-        {emptyHint && <span className="text-amber-600 dark:text-amber-400">· empty</span>}
+        {emptyHint && <span className="text-neon-amber">· empty</span>}
       </div>
       <pre className="max-h-40 overflow-auto rounded bg-background/70 p-2 text-[10px]">
         {previewJson(sample.preview)}

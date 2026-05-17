@@ -54,21 +54,31 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
     setCtxMenu({ x: e.clientX, y: e.clientY, id });
   };
 
+  const navButton = (active: boolean, extra = '') =>
+    `w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors border-l-2 ${
+      active
+        ? 'route-active border-l-primary'
+        : 'border-l-transparent text-muted-foreground hover:text-foreground hover:bg-muted/40'
+    } ${extra}`;
+
   return (
-    <aside className={`flex flex-col bg-card border-r border-border transition-all duration-200 ${isCollapsed ? 'w-14' : 'w-64'}`}>
+    <aside className={`flex flex-col bg-card/95 backdrop-blur-sm border-r border-border transition-all duration-200 ${isCollapsed ? 'w-14' : 'w-60'}`}>
       {/* Header */}
       <div className="flex items-center justify-between h-14 px-3 border-b border-border">
         {!isCollapsed && (
           <div className="flex items-center gap-2 min-w-0">
-            <div className="w-7 h-7 rounded-lg bg-primary flex items-center justify-center flex-shrink-0">
+            <div className="w-7 h-7 rounded-md bg-gradient-to-br from-primary to-accent flex items-center justify-center flex-shrink-0 glow-primary">
               <svg className="w-4 h-4 text-primary-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
               </svg>
             </div>
-            <span className="font-semibold text-sm truncate">Datrina</span>
+            <div className="flex flex-col min-w-0">
+              <span className="font-semibold text-sm leading-none tracking-tight">DATRINA</span>
+              <span className="text-[9px] mono uppercase tracking-[0.18em] text-muted-foreground leading-none mt-1">local console</span>
+            </div>
           </div>
         )}
-        <button onClick={onToggleCollapse} className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0">
+        <button onClick={onToggleCollapse} className="p-1.5 rounded-md hover:bg-muted/60 transition-colors flex-shrink-0" title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
           <svg className={`w-4 h-4 text-muted-foreground transition-transform ${isCollapsed ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 17l-5-5m0 0l5-5m-5 5h12" />
           </svg>
@@ -78,8 +88,8 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
       {/* Dashboard list */}
       <div className="flex-1 overflow-y-auto py-2 scrollbar-thin">
         {!isCollapsed && (
-          <div className="px-3 mb-2">
-            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Dashboards</span>
+          <div className="px-3 mb-1 mt-1">
+            <span className="text-[10px] mono font-semibold text-muted-foreground uppercase tracking-[0.16em]">// Dashboards</span>
           </div>
         )}
         {dashboards.map(d => (
@@ -87,11 +97,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
             key={d.id}
             onClick={() => onSelect(d.id)}
             onContextMenu={(e) => handleContextMenu(e, d.id)}
-            className={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors ${
-              activeId === d.id
-                ? 'bg-primary/10 text-primary border-r-2 border-primary'
-                : 'text-foreground/80 hover:bg-muted/50'
-            } ${isCollapsed ? 'justify-center' : ''}`}
+            className={`${navButton(activeId === d.id)} ${isCollapsed ? 'justify-center' : ''}`}
             title={d.name}
           >
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -101,17 +107,17 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
           </button>
         ))}
 
-        <button onClick={onCreate} className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors mt-1 ${isCollapsed ? 'justify-center' : ''}`}>
+        <button onClick={onCreate} className={`${navButton(false, 'mt-1')} ${isCollapsed ? 'justify-center' : ''}`} title="New dashboard">
           <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
           </svg>
-          {!isCollapsed && <span>New Dashboard</span>}
+          {!isCollapsed && <span>New dashboard</span>}
         </button>
         {onCreateFromTemplate && (
           <button
             onClick={onCreateFromTemplate}
             title="New from template"
-            className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors ${isCollapsed ? 'justify-center' : ''}`}
+            className={`${navButton(false)} ${isCollapsed ? 'justify-center' : ''}`}
           >
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zm10 1.5h6m-3-3v6" />
@@ -119,31 +125,32 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
             {!isCollapsed && <span>From template…</span>}
           </button>
         )}
+
+        {!isCollapsed && (
+          <div className="px-3 mt-4 mb-1">
+            <span className="text-[10px] mono font-semibold text-muted-foreground uppercase tracking-[0.16em]">// Tools</span>
+          </div>
+        )}
+        {!isCollapsed && isCollapsed === false && (
+          <div className="my-2 mx-3 h-px bg-border/60" />
+        )}
         {onOpenPlayground && (
           <button
             onClick={onOpenPlayground}
-            title="Open Data Playground"
-            className={`w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors ${
-              isPlaygroundActive
-                ? 'bg-primary/10 text-primary border-r-2 border-primary'
-                : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-            } ${isCollapsed ? 'justify-center' : ''}`}
+            title="Data Playground"
+            className={`${navButton(!!isPlaygroundActive)} ${isCollapsed ? 'justify-center' : ''}`}
           >
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
             </svg>
-            {!isCollapsed && <span>Explore (Playground)</span>}
+            {!isCollapsed && <span>Playground</span>}
           </button>
         )}
         {onOpenAlerts && (
           <button
             onClick={onOpenAlerts}
             title="Alerts"
-            className={`relative w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors ${
-              isAlertsActive
-                ? 'bg-primary/10 text-primary border-r-2 border-primary'
-                : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-            } ${isCollapsed ? 'justify-center' : ''}`}
+            className={`relative ${navButton(!!isAlertsActive)} ${isCollapsed ? 'justify-center' : ''}`}
           >
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
@@ -152,12 +159,12 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
               <span className="flex-1 text-left">Alerts</span>
             )}
             {unacknowledgedAlertCount > 0 && !isCollapsed && (
-              <span className="min-w-[1.25rem] rounded-full bg-destructive px-1.5 text-center text-[10px] font-medium text-destructive-foreground">
+              <span className="min-w-[1.25rem] rounded-full bg-destructive px-1.5 text-center text-[10px] mono font-semibold text-destructive-foreground glow-destructive">
                 {unacknowledgedAlertCount > 99 ? '99+' : unacknowledgedAlertCount}
               </span>
             )}
             {unacknowledgedAlertCount > 0 && isCollapsed && (
-              <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-destructive" aria-hidden />
+              <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-destructive glow-destructive" aria-hidden />
             )}
           </button>
         )}
@@ -167,10 +174,10 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
       {ctxMenu && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setCtxMenu(null)} />
-          <div className="fixed z-50 bg-card border border-border rounded-lg shadow-lg py-1 min-w-[140px]" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+          <div className="fixed z-50 panel shadow-xl py-1 min-w-[140px]" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
             <button
               onClick={() => { onDelete(ctxMenu.id); setCtxMenu(null); }}
-              className="w-full text-left px-3 py-1.5 text-sm text-destructive hover:bg-muted transition-colors flex items-center gap-2"
+              className="w-full text-left px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 transition-colors flex items-center gap-2"
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -182,11 +189,11 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
       )}
 
       {/* Footer */}
-      <div className="border-t border-border p-2 space-y-1">
+      <div className="border-t border-border p-2 space-y-0.5">
         <button
           onClick={onToggleTheme}
           title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-          className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}
+          className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/40 rounded-md transition-colors ${isCollapsed ? 'justify-center' : ''}`}
         >
           {theme === 'dark' ? (
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -200,7 +207,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
           {!isCollapsed && <span>{theme === 'dark' ? 'Light theme' : 'Dark theme'}</span>}
         </button>
         {onOpenMcpSettings && (
-          <button onClick={onOpenMcpSettings} className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}>
+          <button onClick={onOpenMcpSettings} className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/40 rounded-md transition-colors ${isCollapsed ? 'justify-center' : ''}`} title="MCP servers">
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
@@ -211,7 +218,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
           <button
             onClick={onOpenMemorySettings}
             title="Agent memory"
-            className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}
+            className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/40 rounded-md transition-colors ${isCollapsed ? 'justify-center' : ''}`}
           >
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
@@ -223,7 +230,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
           <button
             onClick={onOpenCostsView}
             title="Provider costs"
-            className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}
+            className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/40 rounded-md transition-colors ${isCollapsed ? 'justify-center' : ''}`}
           >
             <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -231,7 +238,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
             {!isCollapsed && <span>Costs</span>}
           </button>
         )}
-        <button onClick={onOpenSettings} className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-lg transition-colors ${isCollapsed ? 'justify-center' : ''}`}>
+        <button onClick={onOpenSettings} className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/40 rounded-md transition-colors ${isCollapsed ? 'justify-center' : ''}`} title="Providers">
           <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />

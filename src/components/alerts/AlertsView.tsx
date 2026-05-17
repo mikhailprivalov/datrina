@@ -17,8 +17,8 @@ const SEVERITY_RANK: Record<AlertSeverity, number> = {
 
 const SEVERITY_TONE: Record<AlertSeverity, string> = {
   critical: 'bg-destructive/15 text-destructive border-destructive/30',
-  warning: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30',
-  info: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/30',
+  warning: 'bg-neon-amber/15 text-neon-amber border-neon-amber/30',
+  info: 'bg-primary/15 text-primary border-primary/30',
 };
 
 export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
@@ -74,9 +74,10 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <div className="flex items-center justify-between border-b border-border px-4 py-3">
+      <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/20">
         <div>
-          <h2 className="text-sm font-semibold">Alerts</h2>
+          <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// alerts</p>
+          <h2 className="mt-0.5 text-sm font-semibold tracking-tight">Alerts</h2>
           <p className="text-xs text-muted-foreground">
             {showAll ? 'All recent events' : 'Unacknowledged events only'}
           </p>
@@ -84,13 +85,13 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowAll(v => !v)}
-            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted"
+            className="rounded-md border border-border bg-card px-3 py-1.5 text-xs mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
           >
-            {showAll ? 'Show unacknowledged' : 'Show all'}
+            {showAll ? 'Show unack' : 'Show all'}
           </button>
           <button
             onClick={onClose}
-            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted"
+            className="rounded-md border border-border bg-card px-3 py-1.5 text-xs mono uppercase tracking-wider hover:bg-muted transition-colors"
           >
             Close
           </button>
@@ -111,9 +112,9 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
             {grouped.map(group => (
               <li
                 key={group.widgetId}
-                className="rounded-lg border border-border bg-card"
+                className="rounded-md border border-border bg-card"
               >
-                <div className="flex items-center justify-between border-b border-border/60 px-3 py-2">
+                <div className="flex items-center justify-between border-b border-border/60 px-3 py-2 bg-muted/20">
                   <div className="min-w-0">
                     <p className="text-sm font-medium truncate">
                       {widgetTitle(group.dashboardId, group.widgetId)}
@@ -124,9 +125,9 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
                   </div>
                   <button
                     onClick={() => onJumpToWidget(group.dashboardId, group.widgetId)}
-                    className="rounded-md border border-border px-2 py-1 text-[11px] hover:bg-muted"
+                    className="rounded-md border border-border bg-card px-2 py-1 text-[11px] mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
                   >
-                    Jump to widget
+                    Jump
                   </button>
                 </div>
                 <ul className="divide-y divide-border/60">
@@ -138,7 +139,7 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2 text-[11px]">
                           <span
-                            className={`rounded border px-1.5 py-0.5 uppercase tracking-wide ${SEVERITY_TONE[event.severity]}`}
+                            className={`rounded-sm border px-1.5 py-0.5 mono text-[10px] font-semibold uppercase tracking-wider ${SEVERITY_TONE[event.severity]}`}
                           >
                             {event.severity}
                           </span>
@@ -146,7 +147,7 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
                             {new Date(event.fired_at).toLocaleString()}
                           </span>
                           {event.triggered_session_id && (
-                            <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                            <span className="rounded-sm border border-border bg-muted/60 px-1.5 py-0.5 text-[9px] mono font-semibold uppercase tracking-wider text-muted-foreground">
                               agent run
                             </span>
                           )}
@@ -156,9 +157,9 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
                       {!event.acknowledged_at && (
                         <button
                           onClick={() => handleAck(event.id)}
-                          className="shrink-0 rounded-md border border-border px-2 py-1 text-[11px] hover:bg-muted"
+                          className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
                         >
-                          Acknowledge
+                          Ack
                         </button>
                       )}
                     </li>

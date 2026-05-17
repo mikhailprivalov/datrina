@@ -28,19 +28,19 @@ export function StatWidget({ config, data }: Props) {
     >
       <div className="flex flex-1 flex-col justify-center">
         <div
-          className="text-3xl font-semibold tabular-nums leading-none"
-          style={{ color: valueColor }}
+          className="text-3xl font-semibold tabular leading-none tracking-tight"
+          style={{ color: valueColor ?? 'hsl(var(--foreground))' }}
         >
           {displayValue}
         </div>
         {(data.label || deltaInfo) && (
-          <div className="mt-1.5 flex items-center gap-2 text-xs text-muted-foreground">
+          <div className="mt-1.5 flex items-center gap-2 text-[11px] mono uppercase tracking-wider text-muted-foreground">
             {deltaInfo && (
-              <span className={deltaInfo.direction === 'up' ? 'text-emerald-600' : deltaInfo.direction === 'down' ? 'text-destructive' : 'text-muted-foreground'}>
+              <span className={deltaInfo.direction === 'up' ? 'text-neon-lime' : deltaInfo.direction === 'down' ? 'text-destructive' : 'text-muted-foreground'}>
                 {deltaInfo.direction === 'up' ? '↑' : deltaInfo.direction === 'down' ? '↓' : '·'} {deltaInfo.label}
               </span>
             )}
-            {data.label && <span className="truncate">{data.label}</span>}
+            {data.label && <span className="truncate normal-case tracking-normal">{data.label}</span>}
           </div>
         )}
       </div>
@@ -66,8 +66,8 @@ export function StatWidget({ config, data }: Props) {
 
 function EmptyStat() {
   return (
-    <div className="flex h-full items-center justify-center text-center text-xs text-muted-foreground">
-      No data
+    <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
+      <span className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60">// no data</span>
     </div>
   );
 }

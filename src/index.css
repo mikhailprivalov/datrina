@@ -23,49 +23,90 @@
 }
 
 @layer base {
+  /*
+   * Cyberpunk operator console palette. Dark-first; the light theme keeps the
+   * same hues but lowers neon intensity so contrast stays in WCAG AA range.
+   * Extra `--neon-*` and `--chart-*` tokens are exposed for charts and ad-hoc
+   * accents so component-local hex values stop drifting from the theme.
+   */
   :root {
-    --background: 30 20% 98%;
-    --foreground: 30 10% 15%;
-    --card: 30 15% 99%;
-    --card-foreground: 30 10% 15%;
-    --popover: 30 10% 99%;
-    --popover-foreground: 30 10% 15%;
-    --primary: 25 45% 45%;
-    --primary-foreground: 30 20% 99%;
-    --secondary: 30 15% 92%;
-    --secondary-foreground: 30 10% 20%;
-    --muted: 30 10% 92%;
-    --muted-foreground: 30 5% 45%;
-    --accent: 180 30% 40%;
-    --accent-foreground: 30 20% 99%;
-    --destructive: 0 60% 50%;
+    /* Light theme is the secondary surface; still uses cool slate undertones. */
+    --background: 220 26% 97%;
+    --foreground: 225 28% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 225 28% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 225 28% 12%;
+    --primary: 188 75% 34%;
+    --primary-foreground: 220 30% 99%;
+    --secondary: 220 18% 92%;
+    --secondary-foreground: 225 28% 18%;
+    --muted: 220 18% 93%;
+    --muted-foreground: 225 10% 42%;
+    --accent: 320 70% 42%;
+    --accent-foreground: 220 30% 99%;
+    --destructive: 350 80% 48%;
     --destructive-foreground: 0 0% 99%;
-    --border: 30 15% 88%;
-    --input: 30 15% 88%;
-    --ring: 25 45% 45%;
-    --radius: 0.625rem;
+    --border: 220 16% 86%;
+    --input: 220 16% 86%;
+    --ring: 188 75% 40%;
+    --radius: 0.5rem;
+
+    --neon-cyan: 188 75% 40%;
+    --neon-magenta: 320 70% 48%;
+    --neon-lime: 150 65% 36%;
+    --neon-amber: 35 90% 48%;
+    --neon-violet: 268 65% 50%;
+    --neon-rose: 350 80% 52%;
+
+    --chart-1: 188 75% 40%;
+    --chart-2: 320 70% 48%;
+    --chart-3: 150 65% 36%;
+    --chart-4: 35 90% 48%;
+    --chart-5: 268 65% 50%;
+    --chart-6: 350 80% 52%;
+
+    --grid-line: 220 18% 88%;
+    --scanline: 220 18% 95%;
   }
 
   .dark {
-    --background: 30 10% 8%;
-    --foreground: 30 10% 92%;
-    --card: 30 10% 11%;
-    --card-foreground: 30 10% 92%;
-    --popover: 30 10% 12%;
-    --popover-foreground: 30 10% 92%;
-    --primary: 25 50% 58%;
-    --primary-foreground: 30 20% 10%;
-    --secondary: 30 8% 18%;
-    --secondary-foreground: 30 10% 88%;
-    --muted: 30 8% 18%;
-    --muted-foreground: 30 5% 60%;
-    --accent: 180 35% 50%;
-    --accent-foreground: 30 20% 10%;
-    --destructive: 0 60% 55%;
-    --destructive-foreground: 0 0% 99%;
-    --border: 30 8% 22%;
-    --input: 30 8% 22%;
-    --ring: 25 50% 58%;
+    --background: 228 22% 6%;
+    --foreground: 200 20% 94%;
+    --card: 228 20% 9%;
+    --card-foreground: 200 20% 94%;
+    --popover: 228 22% 10%;
+    --popover-foreground: 200 20% 94%;
+    --primary: 188 95% 58%;
+    --primary-foreground: 228 30% 8%;
+    --secondary: 228 16% 16%;
+    --secondary-foreground: 200 18% 90%;
+    --muted: 228 16% 14%;
+    --muted-foreground: 220 12% 64%;
+    --accent: 320 90% 64%;
+    --accent-foreground: 228 30% 8%;
+    --destructive: 350 90% 62%;
+    --destructive-foreground: 228 30% 8%;
+    --border: 228 18% 18%;
+    --input: 228 18% 18%;
+    --ring: 188 95% 58%;
+
+    --neon-cyan: 188 95% 58%;
+    --neon-magenta: 320 90% 64%;
+    --neon-lime: 150 85% 56%;
+    --neon-amber: 38 95% 60%;
+    --neon-violet: 268 85% 68%;
+    --neon-rose: 350 90% 64%;
+
+    --chart-1: 188 95% 58%;
+    --chart-2: 320 90% 64%;
+    --chart-3: 150 85% 56%;
+    --chart-4: 38 95% 60%;
+    --chart-5: 268 85% 68%;
+    --chart-6: 350 90% 64%;
+
+    --grid-line: 228 18% 16%;
+    --scanline: 228 20% 11%;
   }
 
   * {
@@ -78,6 +119,31 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     overflow: hidden;
+  }
+
+  .dark body {
+    background-image:
+      radial-gradient(circle at 12% 8%, hsl(var(--neon-cyan) / 0.06), transparent 45%),
+      radial-gradient(circle at 88% 92%, hsl(var(--neon-magenta) / 0.05), transparent 50%),
+      linear-gradient(180deg, hsl(228 24% 5%) 0%, hsl(228 22% 7%) 100%);
+  }
+
+  /* Focus: visible neon ring for keyboard navigation, never on mouse. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+  button:focus-visible,
+  a:focus-visible {
+    box-shadow: 0 0 0 2px hsl(var(--background)), 0 0 0 4px hsl(var(--ring) / 0.55);
+    outline: none;
+  }
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: none;
+    border-color: hsl(var(--ring));
+    box-shadow: 0 0 0 1px hsl(var(--ring) / 0.6);
   }
 }
 
@@ -97,4 +163,105 @@
     background-color: hsl(var(--muted-foreground) / 0.3);
     border-radius: 3px;
   }
+
+  /* Console-grade panel surfaces. Slightly tighter borders than vanilla card. */
+  .panel {
+    background-color: hsl(var(--card));
+    border: 1px solid hsl(var(--border));
+    border-radius: var(--radius);
+  }
+
+  .panel-inset {
+    background-color: hsl(var(--muted) / 0.55);
+    border: 1px solid hsl(var(--border) / 0.7);
+    border-radius: calc(var(--radius) - 2px);
+  }
+
+  /* Neon glow used sparingly: active route signal, primary CTAs, alerts. */
+  .glow-primary {
+    box-shadow: 0 0 0 1px hsl(var(--primary) / 0.55), 0 0 18px -4px hsl(var(--primary) / 0.55);
+  }
+  .glow-accent {
+    box-shadow: 0 0 0 1px hsl(var(--accent) / 0.55), 0 0 18px -4px hsl(var(--accent) / 0.55);
+  }
+  .glow-destructive {
+    box-shadow: 0 0 0 1px hsl(var(--destructive) / 0.55), 0 0 18px -4px hsl(var(--destructive) / 0.55);
+  }
+
+  /* Active route signal: vertical neon bar on the left edge of a button. */
+  .route-active {
+    background-color: hsl(var(--primary) / 0.12);
+    color: hsl(var(--primary));
+    box-shadow: inset 2px 0 0 0 hsl(var(--primary));
+  }
+
+  /* Pulsing neon dot for live state indicators (busy, streaming, …). */
+  .neon-pulse::before {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: 9999px;
+    background: hsl(var(--primary) / 0.45);
+    filter: blur(6px);
+    animation: neonPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes neonPulse {
+    0%, 100% { opacity: 0.4; transform: scale(0.9); }
+    50% { opacity: 0.85; transform: scale(1.1); }
+  }
+
+  /* Tabular numerics for telemetry-style values. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+
+  /* Monospace label for IDs, paths, traces. */
+  .mono {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  /* Subtle grid backdrop for empty dashboard / playground panels. */
+  .grid-backdrop {
+    background-image:
+      linear-gradient(hsl(var(--grid-line) / 0.5) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--grid-line) / 0.5) 1px, transparent 1px);
+    background-size: 24px 24px;
+    background-position: -1px -1px;
+  }
+}
+
+/* react-grid-layout overrides so drag/resize visuals follow the theme. */
+.react-grid-item.react-grid-placeholder {
+  background: hsl(var(--primary) / 0.18) !important;
+  border: 1px dashed hsl(var(--primary) / 0.55);
+  border-radius: var(--radius);
+  opacity: 1 !important;
+  transition-duration: 100ms !important;
+}
+.react-grid-item.resizing,
+.react-grid-item.react-draggable-dragging {
+  z-index: 5;
+  box-shadow: 0 12px 32px -8px hsl(var(--primary) / 0.35), 0 0 0 1px hsl(var(--primary) / 0.45);
+}
+.react-grid-item > .react-resizable-handle {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.react-grid-item:hover > .react-resizable-handle {
+  opacity: 0.6;
+}
+.react-grid-item > .react-resizable-handle::after {
+  border-right-color: hsl(var(--primary) / 0.7) !important;
+  border-bottom-color: hsl(var(--primary) / 0.7) !important;
+}
+
+/* Reduced-motion: kill non-essential animation. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .neon-pulse::before { animation: none; opacity: 0.5; }
 }

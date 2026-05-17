@@ -149,6 +149,7 @@ pub(crate) async fn trace_widget_pipeline_inner(
         &steps,
         Some(state.ai_engine.as_ref()),
         provider.as_ref(),
+        Some(state.mcp_manager.as_ref()),
     )
     .await;
 

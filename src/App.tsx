@@ -643,12 +643,13 @@ function App() {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-background">
         <div className="text-center space-y-4">
-          <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center mx-auto animate-pulse">
-            <svg className="w-6 h-6 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="relative w-14 h-14 rounded-lg bg-gradient-to-br from-primary/20 to-accent/20 flex items-center justify-center mx-auto border border-primary/30">
+            <span className="neon-pulse" aria-hidden />
+            <svg className="w-7 h-7 text-primary relative" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
           </div>
-          <p className="text-muted-foreground text-sm">Loading Datrina...</p>
+          <p className="text-muted-foreground text-xs mono uppercase tracking-[0.2em]">Booting Datrina…</p>
         </div>
       </div>
     );
@@ -688,10 +689,13 @@ function App() {
           onOpenSettings={() => setIsProviderSettingsOpen(true)}
         />
 
-        <main className={`flex-1 min-h-0 overflow-hidden ${route === 'playground' ? '' : 'overflow-auto p-4 scrollbar-thin'}`}>
+        <main className={`flex-1 min-h-0 ${route === 'playground' ? 'overflow-hidden' : 'overflow-auto p-4 scrollbar-thin'}`}>
           {error && route === 'dashboards' && (
-            <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-              {error}
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M4.93 19h14.14a2 2 0 001.73-3l-7.07-12a2 2 0 00-3.46 0l-7.07 12a2 2 0 001.73 3z" />
+              </svg>
+              <span className="flex-1">{error}</span>
             </div>
           )}
           {route === 'playground' ? (
@@ -819,17 +823,18 @@ function App() {
       )}
 
       {undoToast && (
-        <div className="pointer-events-auto fixed bottom-6 right-6 z-[60] flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-2 text-sm shadow-lg">
-          <span className="text-foreground">Applied: {undoToast.label}</span>
+        <div className="pointer-events-auto fixed bottom-6 right-6 z-[60] flex items-center gap-3 rounded-md border border-primary/40 bg-card/95 backdrop-blur px-4 py-2 text-sm shadow-xl glow-primary">
+          <span className="mono text-[10px] uppercase tracking-wider text-primary">Applied</span>
+          <span className="text-foreground truncate max-w-xs">{undoToast.label}</span>
           <button
             onClick={() => handleRestoreVersion(undoToast.versionId)}
-            className="rounded-md border border-border px-2 py-1 text-xs font-medium hover:bg-muted"
+            className="rounded-md border border-border px-2 py-1 text-xs font-medium hover:bg-muted hover:border-primary/40 transition-colors"
           >
             ↩ Undo
           </button>
           <button
             onClick={() => setUndoToast(null)}
-            className="rounded p-1 text-muted-foreground hover:bg-muted"
+            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
             aria-label="Dismiss"
           >
             <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">

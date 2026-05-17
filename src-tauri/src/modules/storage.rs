@@ -2169,8 +2169,8 @@ mod tests {
         let now = chrono::Utc::now().timestamp_millis();
         let shape = ToolShape {
             id: "shape-1".into(),
-            server_id: "yandex".into(),
-            tool_name: "get_releases".into(),
+            server_id: "test_server".into(),
+            tool_name: "test_tool".into(),
             args_fingerprint: "fp1".into(),
             shape_summary: "object with data.items[*].{id,name}".into(),
             shape_full: "{}".into(),
@@ -2181,7 +2181,7 @@ mod tests {
         storage.upsert_tool_shape(&shape).await?;
         storage.upsert_tool_shape(&shape).await?;
         let stored = storage
-            .lookup_tool_shape("yandex", "get_releases", "fp1")
+            .lookup_tool_shape("test_server", "test_tool", "fp1")
             .await?
             .expect("shape stored");
         assert_eq!(stored.observation_count, 2);

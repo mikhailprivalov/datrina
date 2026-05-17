@@ -28,11 +28,11 @@ function kindTone(kind: MemoryKind): string {
     case 'lesson':
       return 'text-purple-600 dark:text-purple-400 bg-purple-500/15';
     case 'preference':
-      return 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/15';
+      return 'text-neon-lime bg-neon-lime/15';
     case 'tool_shape':
-      return 'text-blue-700 dark:text-blue-400 bg-blue-500/15';
+      return 'text-primary bg-primary/15';
     default:
-      return 'text-amber-700 dark:text-amber-400 bg-amber-500/15';
+      return 'text-neon-amber bg-neon-amber/15';
   }
 }
 
@@ -92,11 +92,12 @@ export function MemorySettings({ onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
-      <div className="flex max-h-[85vh] w-[min(92vw,56rem)] flex-col rounded-xl border border-border bg-card shadow-xl">
-        <div className="flex items-center justify-between border-b border-border px-5 py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="flex max-h-[85vh] w-[min(92vw,56rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-5 py-3 bg-muted/20">
           <div>
-            <h2 className="text-sm font-semibold text-foreground">Agent memory</h2>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// memory</p>
+            <h2 className="mt-0.5 text-sm font-semibold text-foreground tracking-tight">Agent memory</h2>
             <p className="text-[11px] text-muted-foreground">
               Facts, preferences, lessons, and MCP tool shapes the agent has learned across sessions.
             </p>
@@ -135,7 +136,7 @@ export function MemorySettings({ onClose }: Props) {
         </div>
 
         {(status || error) && (
-          <div className={`border-b border-border px-5 py-2 text-xs ${error ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400'}`}>
+          <div className={`border-b border-border px-5 py-2 text-xs ${error ? 'text-destructive' : 'text-neon-lime'}`}>
             {error ?? status}
           </div>
         )}

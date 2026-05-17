@@ -6,21 +6,27 @@ interface Props {
   onClose: () => void;
 }
 
+type DraftTransport = 'stdio' | 'http';
+
 interface DraftServer {
   id: string;
   name: string;
+  transport: DraftTransport;
   command: string;
   argsText: string;
   envText: string;
+  url: string;
   is_enabled: boolean;
 }
 
 const EMPTY_DRAFT: DraftServer = {
   id: '',
   name: '',
+  transport: 'stdio',
   command: '',
   argsText: '',
   envText: '',
+  url: '',
   is_enabled: true,
 };
 
@@ -60,36 +66,61 @@ export function McpSettings({ onClose }: Props) {
   const startEdit = (server: MCPServer) => setDraft({
     id: server.id,
     name: server.name,
+    transport: server.transport,
     command: server.command ?? '',
     argsText: (server.args ?? []).join('\n'),
     envText: Object.entries(server.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n'),
+    url: server.url ?? '',
     is_enabled: server.is_enabled,
   });
 
   const handleSave = async () => {
     if (!draft) return;
     const name = draft.name.trim();
-    const command = draft.command.trim();
-    if (!name || !command) {
-      setError('Name and command are required.');
+    if (!name) {
+      setError('Server name is required.');
       return;
     }
-    const args = parseLines(draft.argsText);
-    const env = parseEnv(draft.envText);
-    if (env === null) {
-      setError('Env lines must be KEY=VALUE.');
-      return;
+    let payload: MCPServer;
+    if (draft.transport === 'stdio') {
+      const command = draft.command.trim();
+      if (!command) {
+        setError('Command is required for stdio MCP servers.');
+        return;
+      }
+      const args = parseLines(draft.argsText);
+      const env = parseEnv(draft.envText);
+      if (env === null) {
+        setError('Env lines must be KEY=VALUE.');
+        return;
+      }
+      payload = {
+        id: draft.id || suggestId(),
+        name,
+        transport: 'stdio',
+        is_enabled: draft.is_enabled,
+        command,
+        args: args.length ? args : undefined,
+        env: Object.keys(env).length ? env : undefined,
+        url: undefined,
+      };
+    } else {
+      const url = draft.url.trim();
+      if (!/^https?:\/\//i.test(url)) {
+        setError('URL must start with http:// or https://.');
+        return;
+      }
+      payload = {
+        id: draft.id || suggestId(),
+        name,
+        transport: 'http',
+        is_enabled: draft.is_enabled,
+        command: undefined,
+        args: undefined,
+        env: undefined,
+        url,
+      };
     }
-    const payload: MCPServer = {
-      id: draft.id || suggestId(),
-      name,
-      transport: 'stdio',
-      is_enabled: draft.is_enabled,
-      command,
-      args: args.length ? args : undefined,
-      env: Object.keys(env).length ? env : undefined,
-      url: undefined,
-    };
     setBusyId(payload.id);
     setError(null);
     try {
@@ -171,23 +202,24 @@ export function McpSettings({ onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
-      <div className="flex max-h-[85vh] w-[min(92vw,56rem)] flex-col rounded-xl border border-border bg-card shadow-xl">
-        <div className="flex items-center justify-between border-b border-border px-5 py-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="flex max-h-[85vh] w-[min(92vw,56rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
+        <div className="flex items-center justify-between border-b border-border px-5 py-3 bg-muted/20">
           <div>
-            <h2 className="text-sm font-semibold text-foreground">MCP servers</h2>
-            <p className="text-[11px] text-muted-foreground">Configure stdio MCP servers reachable from chat and workflows.</p>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// mcp</p>
+            <h2 className="mt-0.5 text-sm font-semibold text-foreground tracking-tight">MCP servers</h2>
+            <p className="text-[11px] text-muted-foreground">Configure MCP servers (stdio or HTTP) reachable from chat and workflows.</p>
           </div>
           <div className="flex items-center gap-2">
             <button
               onClick={handleReconnect}
               disabled={busyId === '__all'}
-              className="rounded-md border border-border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-50"
+              className="rounded-md border border-border bg-card px-2.5 py-1 text-xs mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 disabled:opacity-50 transition-colors"
             >
-              {busyId === '__all' ? 'Reconnecting...' : 'Reconnect enabled'}
+              {busyId === '__all' ? 'Reconnecting…' : 'Reconnect enabled'}
             </button>
-            <button onClick={startCreate} className="rounded-md bg-primary px-3 py-1 text-xs text-primary-foreground hover:bg-primary/90">
-              Add server
+            <button onClick={startCreate} className="rounded-md bg-primary border border-primary px-3 py-1 text-xs mono uppercase tracking-wider font-semibold text-primary-foreground hover:glow-primary transition-all">
+              + Add server
             </button>
             <button onClick={onClose} className="p-1 rounded hover:bg-muted text-muted-foreground">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -198,7 +230,7 @@ export function McpSettings({ onClose }: Props) {
         </div>
 
         {(status || error) && (
-          <div className={`border-b border-border px-5 py-2 text-xs ${error ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400'}`}>
+          <div className={`border-b border-border px-5 py-2 text-xs ${error ? 'text-destructive' : 'text-neon-lime'}`}>
             {error ?? status}
           </div>
         )}
@@ -215,7 +247,7 @@ export function McpSettings({ onClose }: Props) {
           )}
           {servers.length === 0 && !draft && (
             <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-              No MCP servers yet. Click <span className="font-medium">Add server</span> to register a stdio command.
+              No MCP servers yet. Click <span className="font-medium">Add server</span> to register a stdio command or HTTP endpoint.
             </div>
           )}
           {servers.map(server => (
@@ -257,8 +289,8 @@ function ServerCard({
   const connected = tools.length > 0;
   const status = !server.is_enabled ? 'disabled' : connected ? 'connected' : 'idle';
   const statusTone = {
-    connected: 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/15',
-    idle: 'text-blue-700 dark:text-blue-400 bg-blue-500/15',
+    connected: 'text-neon-lime bg-neon-lime/15',
+    idle: 'text-primary bg-primary/15',
     disabled: 'text-muted-foreground bg-muted',
   }[status];
   return (
@@ -271,7 +303,9 @@ function ServerCard({
             <span className="text-[10px] text-muted-foreground">{server.transport}</span>
           </div>
           <p className="mt-0.5 truncate text-[11px] text-muted-foreground font-mono">
-            {server.command} {(server.args ?? []).join(' ')}
+            {server.transport === 'http'
+              ? (server.url ?? '')
+              : `${server.command ?? ''} ${(server.args ?? []).join(' ')}`.trim()}
           </p>
           <p className="mt-0.5 text-[10px] text-muted-foreground">id: {server.id} · {tools.length} tool(s)</p>
         </div>
@@ -340,6 +374,7 @@ function DraftCard({
   onSave: () => void;
   busy: boolean;
 }) {
+  const isHttp = draft.transport === 'http';
   return (
     <div className="rounded-lg border border-primary/40 bg-primary/5 p-4 space-y-3">
       <div className="grid grid-cols-2 gap-3">
@@ -347,7 +382,7 @@ function DraftCard({
           <input
             value={draft.name}
             onChange={e => onChange({ ...draft, name: e.target.value })}
-            placeholder="Yandex MCP store proxy"
+            placeholder="Local MCP server"
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary/40"
           />
         </Field>
@@ -355,37 +390,71 @@ function DraftCard({
           <input
             value={draft.id}
             onChange={e => onChange({ ...draft, id: e.target.value })}
-            placeholder="prompt-yandex-mcp-store-proxy"
+            placeholder="local-mcp-server"
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
           />
         </Field>
       </div>
-      <Field label="Command (executable path)">
-        <input
-          value={draft.command}
-          onChange={e => onChange({ ...draft, command: e.target.value })}
-          placeholder="/Users/me/.wizard/yandex-mcp-store-proxy"
-          className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
-        />
+      <Field label="Transport">
+        <div className="flex gap-1">
+          {(['stdio', 'http'] as const).map(option => {
+            const active = draft.transport === option;
+            return (
+              <button
+                key={option}
+                type="button"
+                onClick={() => onChange({ ...draft, transport: option })}
+                className={`rounded-md border px-3 py-1.5 text-xs mono uppercase tracking-wider transition-colors ${
+                  active
+                    ? 'border-primary bg-primary/15 text-primary'
+                    : 'border-border bg-background hover:bg-muted'
+                }`}
+              >
+                {option}
+              </button>
+            );
+          })}
+        </div>
       </Field>
-      <Field label="Arguments (one per line)">
-        <textarea
-          value={draft.argsText}
-          onChange={e => onChange({ ...draft, argsText: e.target.value })}
-          placeholder={'-O\ny1__token\n--endpoint\nmcp.example.net/ws'}
-          rows={4}
-          className="w-full resize-none rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
-        />
-      </Field>
-      <Field label="Environment (KEY=VALUE per line)">
-        <textarea
-          value={draft.envText}
-          onChange={e => onChange({ ...draft, envText: e.target.value })}
-          placeholder="LOG_LEVEL=debug"
-          rows={2}
-          className="w-full resize-none rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
-        />
-      </Field>
+      {isHttp ? (
+        <Field label="URL (Streamable HTTP endpoint)">
+          <input
+            value={draft.url}
+            onChange={e => onChange({ ...draft, url: e.target.value })}
+            placeholder="https://mcp.example.com/v1"
+            className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
+          />
+        </Field>
+      ) : (
+        <>
+          <Field label="Command (executable path)">
+            <input
+              value={draft.command}
+              onChange={e => onChange({ ...draft, command: e.target.value })}
+              placeholder="/Users/me/.local/bin/mcp-server"
+              className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
+            />
+          </Field>
+          <Field label="Arguments (one per line)">
+            <textarea
+              value={draft.argsText}
+              onChange={e => onChange({ ...draft, argsText: e.target.value })}
+              placeholder={'--token\nyour-token\n--endpoint\nmcp.example.net/ws'}
+              rows={4}
+              className="w-full resize-none rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
+            />
+          </Field>
+          <Field label="Environment (KEY=VALUE per line)">
+            <textarea
+              value={draft.envText}
+              onChange={e => onChange({ ...draft, envText: e.target.value })}
+              placeholder="LOG_LEVEL=debug"
+              rows={2}
+              className="w-full resize-none rounded-md border border-border bg-background px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
+            />
+          </Field>
+        </>
+      )}
       <div className="flex items-center justify-between">
         <label className="flex items-center gap-2 text-xs text-muted-foreground">
           <input

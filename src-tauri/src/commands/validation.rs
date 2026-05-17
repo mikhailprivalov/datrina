@@ -475,8 +475,8 @@ mod tests {
     fn unknown_parameter_reference_flagged() {
         let plan = BuildDatasourcePlan {
             kind: BuildDatasourcePlanKind::McpTool,
-            tool_name: Some("get_releases".into()),
-            server_id: Some("yandex".into()),
+            tool_name: Some("test_tool".into()),
+            server_id: Some("test_server".into()),
             arguments: Some(json!({"project": "$project"})),
             prompt: None,
             output_path: None,
@@ -495,8 +495,8 @@ mod tests {
     fn declared_parameter_resolves_without_issue() {
         let plan = BuildDatasourcePlan {
             kind: BuildDatasourcePlanKind::McpTool,
-            tool_name: Some("get_releases".into()),
-            server_id: Some("yandex".into()),
+            tool_name: Some("test_tool".into()),
+            server_id: Some("test_server".into()),
             arguments: Some(json!({"project": "$project"})),
             prompt: None,
             output_path: None,

@@ -61,7 +61,7 @@ export function VersionDiffView({ fromVersionId, toVersionId }: Props) {
         />
       )}
       {diff.layout_changed && (
-        <p className="text-amber-600 dark:text-amber-400">Layout positions changed.</p>
+        <p className="text-neon-amber">Layout positions changed.</p>
       )}
 
       {diff.added_widgets.length > 0 && (
@@ -113,7 +113,7 @@ export function VersionDiffView({ fromVersionId, toVersionId }: Props) {
                     <li key={`${change.path}-${idx}`} className="break-all">
                       <span className="text-muted-foreground">{change.path}:</span>{' '}
                       <span className="text-destructive">{summarize(change.before)}</span>{' '}
-                      → <span className="text-emerald-700 dark:text-emerald-400">{summarize(change.after)}</span>
+                      → <span className="text-neon-lime">{summarize(change.after)}</span>
                     </li>
                   ))}
                   {w.config_changes.length > 8 && (
@@ -142,13 +142,13 @@ function DiffSection({
 }) {
   const heading =
     tone === 'add'
-      ? 'text-emerald-700 dark:text-emerald-400'
+      ? 'text-neon-lime'
       : tone === 'remove'
         ? 'text-destructive'
-        : 'text-amber-700 dark:text-amber-400';
+        : 'text-neon-amber';
   return (
     <div>
-      <p className={`mb-1 text-[11px] font-medium uppercase tracking-wide ${heading}`}>{title}</p>
+      <p className={`mb-1 mono text-[10px] font-semibold uppercase tracking-[0.18em] ${heading}`}>// {title}</p>
       <ul className="space-y-1">{children}</ul>
     </div>
   );
@@ -157,10 +157,10 @@ function DiffSection({
 function DiffRow({ label, before, after }: { label: string; before: string; after: string }) {
   return (
     <div>
-      <p className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</p>
-      <p className="break-all font-mono">
+      <p className="mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">// {label}</p>
+      <p className="break-all mono">
         <span className="text-destructive line-through">{before}</span>{' '}
-        → <span className="text-emerald-700 dark:text-emerald-400">{after}</span>
+        → <span className="text-neon-lime">{after}</span>
       </p>
     </div>
   );

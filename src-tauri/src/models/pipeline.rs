@@ -88,6 +88,17 @@ pub enum PipelineStep {
         #[serde(default)]
         expect: LlmExpect,
     },
+    /// Call any MCP tool mid-pipeline. The tool result becomes the new
+    /// pipeline value. Arguments may reference the current value via `"$_"`
+    /// (whole value, type-preserving) or `"$_.field.path"` (pluck a field).
+    /// Useful for list-then-fetch-each flows where the first step lists ids
+    /// and a follow-up step enriches each entry.
+    McpCall {
+        server_id: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<serde_json::Value>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

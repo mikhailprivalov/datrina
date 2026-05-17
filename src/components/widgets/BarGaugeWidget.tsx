@@ -5,11 +5,15 @@ interface Props {
   data?: BarGaugeWidgetRuntimeData;
 }
 
-const DEFAULT_PALETTE = ['#10b981', '#f59e0b', '#ef4444'];
+const DEFAULT_BAR_COLOR = 'hsl(var(--primary))';
 
 export function BarGaugeWidget({ config, data }: Props) {
   if (!data || data.rows.length === 0) {
-    return <div className="flex h-full items-center justify-center text-xs text-muted-foreground">No data</div>;
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
+        <span className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60">// no data</span>
+      </div>
+    );
   }
 
   const orientation = config.orientation ?? 'horizontal';
@@ -29,15 +33,15 @@ export function BarGaugeWidget({ config, data }: Props) {
           return (
             <div key={row.name} className="flex flex-1 min-w-0 flex-col items-center justify-end gap-1">
               {config.show_value !== false && (
-                <span className="text-[10px] text-foreground tabular-nums">{formatValue(row.value)}{valueSuffix}</span>
+                <span className="text-[10px] mono tabular text-foreground">{formatValue(row.value)}{valueSuffix}</span>
               )}
-              <div className="w-full flex-1 rounded-md bg-muted overflow-hidden flex items-end">
+              <div className="w-full flex-1 rounded-sm bg-muted/50 border border-border/60 overflow-hidden flex items-end">
                 <div
                   className="w-full transition-all"
-                  style={{ height: `${ratio * 100}%`, backgroundColor: color }}
+                  style={{ height: `${ratio * 100}%`, backgroundColor: color, boxShadow: `0 0 8px ${color}55` }}
                 />
               </div>
-              <span className="block w-full truncate text-center text-[10px] text-muted-foreground">{row.name}</span>
+              <span className="block w-full truncate text-center text-[10px] mono uppercase tracking-wider text-muted-foreground">{row.name}</span>
             </div>
           );
         })}
@@ -53,14 +57,14 @@ export function BarGaugeWidget({ config, data }: Props) {
         const color = pickColor(row.value, thresholds);
         return (
           <div key={row.name} className="flex items-center gap-2">
-            <span className="w-1/3 min-w-0 truncate text-[11px] text-muted-foreground">{row.name}</span>
-            <div className="relative flex-1 h-5 rounded-md bg-muted overflow-hidden">
+            <span className="w-1/3 min-w-0 truncate text-[11px] mono text-muted-foreground">{row.name}</span>
+            <div className="relative flex-1 h-5 rounded-sm bg-muted/50 border border-border/60 overflow-hidden">
               <div
                 className="absolute inset-y-0 left-0 transition-all"
-                style={{ width: `${ratio * 100}%`, backgroundColor: color }}
+                style={{ width: `${ratio * 100}%`, backgroundColor: color, boxShadow: `inset 0 0 8px ${color}66` }}
               />
               {config.show_value !== false && (
-                <span className="absolute inset-0 flex items-center justify-end pr-1.5 text-[10px] font-medium tabular-nums text-foreground">
+                <span className="absolute inset-0 flex items-center justify-end pr-1.5 text-[10px] mono font-medium tabular text-foreground">
                   {formatValue(row.value)}{valueSuffix}
                 </span>
               )}
@@ -73,7 +77,7 @@ export function BarGaugeWidget({ config, data }: Props) {
 }
 
 function pickColor(value: number, thresholds?: GaugeThreshold[]): string {
-  if (!thresholds || thresholds.length === 0) return DEFAULT_PALETTE[0];
+  if (!thresholds || thresholds.length === 0) return DEFAULT_BAR_COLOR;
   const sorted = [...thresholds].sort((a, b) => a.value - b.value);
   let color = sorted[0].color;
   for (const t of sorted) {

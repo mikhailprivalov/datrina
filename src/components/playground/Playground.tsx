@@ -280,19 +280,20 @@ export function Playground({ onUseAsWidget, onClose }: Props) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-12 items-center justify-between border-b border-border bg-card px-4">
-        <div className="flex items-center gap-2">
+      <div className="flex h-12 items-center justify-between border-b border-border bg-card/95 backdrop-blur-sm px-4">
+        <div className="flex items-center gap-3">
           <svg className="h-5 w-5 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
           </svg>
-          <h1 className="text-sm font-semibold">Data Playground</h1>
-          <span className="text-xs text-muted-foreground">{statusMessage}</span>
+          <span className="hidden sm:inline-flex h-5 items-center rounded-sm bg-primary/15 px-1.5 text-[10px] mono font-semibold uppercase tracking-wider text-primary">play</span>
+          <h1 className="text-sm font-semibold tracking-tight">Data Playground</h1>
+          <span className="text-xs mono text-muted-foreground">{statusMessage}</span>
         </div>
         <button
           onClick={onClose}
-          className="rounded-md border border-border px-2 py-1 text-xs hover:bg-muted"
+          className="rounded-md border border-border bg-card px-2.5 py-1 text-xs mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
         >
-          Back to dashboards
+          ← Dashboards
         </button>
       </div>
       <div className="grid flex-1 min-h-0 grid-cols-[260px_minmax(0,1fr)_minmax(0,1.2fr)] divide-x divide-border">
@@ -390,7 +391,7 @@ function SourcePane({
               <div key={server.id} className="rounded-md border border-border">
                 <div className="flex items-center justify-between px-2 py-1 text-[11px] text-muted-foreground">
                   <span className="truncate">{server.name}</span>
-                  <span className={server.is_enabled ? 'text-emerald-600' : 'text-muted-foreground'}>
+                  <span className={server.is_enabled ? 'text-neon-lime' : 'text-muted-foreground'}>
                     {server.is_enabled ? 'on' : 'off'}
                   </span>
                 </div>

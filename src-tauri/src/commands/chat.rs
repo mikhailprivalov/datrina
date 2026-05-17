@@ -2940,7 +2940,8 @@ async fn grounded_messages(
     let mut messages = Vec::new();
     match session.mode {
         ChatMode::Build => {
-            messages.push(system_message(build_chat_system_prompt()));
+            let mcp_tools = state.mcp_manager.list_tools().await;
+            messages.push(system_message(build_chat_system_prompt(&mcp_tools)));
             if let Some(dashboard_id) = session.dashboard_id.as_deref() {
                 if let Some(dashboard) = state.storage.get_dashboard(dashboard_id).await? {
                     let widgets_summary = dashboard
@@ -3145,9 +3146,26 @@ fn system_message(content: String) -> ChatMessage {
     }
 }
 
-fn build_chat_system_prompt() -> String {
+/// Pick a representative (server_id, tool_name) to seed the system prompt
+/// examples. If at least one MCP server is connected, the agent sees a real
+/// tool it can actually call; otherwise it sees abstract placeholders so it
+/// asks the user to configure one rather than hallucinating names.
+fn mcp_prompt_example(tools: &[crate::models::mcp::MCPTool]) -> (String, String) {
+    let mut sorted: Vec<&crate::models::mcp::MCPTool> = tools.iter().collect();
+    sorted.sort_by(|a, b| a.server_id.cmp(&b.server_id).then(a.name.cmp(&b.name)));
+    match sorted.first() {
+        Some(tool) => (tool.server_id.clone(), tool.name.clone()),
+        None => (
+            "<your_server_id>".to_string(),
+            "<tool_from_tools_list>".to_string(),
+        ),
+    }
+}
+
+fn build_chat_system_prompt(tools: &[crate::models::mcp::MCPTool]) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-    format!(
+    let (example_server, example_tool) = mcp_prompt_example(tools);
+    let body = format!(
         r#"You are the Datrina Build Chat agent. Datrina is a local-first desktop tool — think of it as a Grafana-style dashboard builder with provider-driven proposals. Dashboards are made of widgets, each backed by a real datasource (HTTP request, stdio MCP tool, or provider prompt).
 
 How to work
@@ -3309,8 +3327,8 @@ widgets: [{{
   widget_type: "stat",
   datasource_plan: {{
     kind: "mcp_tool",
-    server_id: "yandex",
-    tool_name: "get_releases",
+    server_id: "<<MCP_EXAMPLE_SERVER>>",
+    tool_name: "<<MCP_EXAMPLE_TOOL>>",
     arguments: {{"project": "$project"}},
     pipeline: [{{kind: "length"}}]
   }}
@@ -3330,20 +3348,20 @@ How to use:
 2. In each consumer widget, set `datasource_plan` to `{{kind: "shared", source_key: "<the key>", pipeline: [<per-widget tail>], output_path?: "<optional pre-tail pick>"}}`. The widget's own pipeline runs AFTER the shared pipeline, scoped to its tail.
 3. `refresh_cron` lives on the shared entry, not on consumers. One cron tick = all consumers refresh.
 
-Example: 5 stat widgets all about "active releases":
+Example: 3 widgets reading from the same source:
 ```
 shared_datasources: [{{
-  key: "active_releases",
+  key: "shared_items",
   kind: "mcp_tool",
-  server_id: "yandex",
-  tool_name: "get_recent_active_releases",
-  pipeline: [{{kind: "pick", path: "data.releases"}}],
+  server_id: "<<MCP_EXAMPLE_SERVER>>",
+  tool_name: "<<MCP_EXAMPLE_TOOL>>",
+  pipeline: [{{kind: "pick", path: "data.items"}}],
   refresh_cron: "0 */5 * * * *"
 }}]
 widgets: [
-  {{title: "Active count", widget_type: "stat", datasource_plan: {{kind: "shared", source_key: "active_releases", pipeline: [{{kind: "length"}}]}}}},
-  {{title: "Latest version", widget_type: "stat", datasource_plan: {{kind: "shared", source_key: "active_releases", pipeline: [{{kind: "sort", by: "created_at", order: "desc"}}, {{kind: "head"}}, {{kind: "pick", path: "version"}}]}}}},
-  {{title: "Releases table", widget_type: "table", datasource_plan: {{kind: "shared", source_key: "active_releases", pipeline: [{{kind: "limit", count: 20}}]}}}}
+  {{title: "Item count", widget_type: "stat", datasource_plan: {{kind: "shared", source_key: "shared_items", pipeline: [{{kind: "length"}}]}}}},
+  {{title: "Latest", widget_type: "stat", datasource_plan: {{kind: "shared", source_key: "shared_items", pipeline: [{{kind: "sort", by: "created_at", order: "desc"}}, {{kind: "head"}}, {{kind: "pick", path: "name"}}]}}}},
+  {{title: "Items table", widget_type: "table", datasource_plan: {{kind: "shared", source_key: "shared_items", pipeline: [{{kind: "limit", count: 20}}]}}}}
 ]
 ```
 
@@ -3386,6 +3404,7 @@ Available steps (each is a strict JSON object - no scripting):
 - {{"kind": "format", "template": "v{{version}} (build {{launch}})"}} - render a string template using `{{field}}` placeholders from the current object. On arrays applies per item.
 - {{"kind": "coerce", "to": "number"}} / "integer" / "string" / "array" - force the type. Useful right before a stat/gauge widget.
 - {{"kind": "llm_postprocess", "prompt": "...", "expect": "text" | "json"}} - LAST RESORT. Calls the active provider on every refresh; spends tokens. Use only when shape cannot be derived deterministically (free-form summarization, content rewriting). Output replaces the pipeline result.
+- {{"kind": "mcp_call", "server_id": "<<MCP_EXAMPLE_SERVER>>", "tool_name": "<<MCP_EXAMPLE_TOOL>>", "arguments": {{"id": "$_.id"}}}} - call any MCP tool mid-pipeline. The tool result REPLACES the current pipeline value. Use `"$_"` to pass the current value as-is, or `"$_.field.path"` to pluck a field (type-preserving in whole-string tokens; `"prefix-$_.id"` interpolates as text). Useful for list-then-fetch-each: first step lists ids, then `mcp_call` enriches the chosen one. Costs one extra MCP call per refresh, so prefer plain `pick`/`filter` when local transforms suffice.
 
 Common pipeline recipes (copy these patterns)
 - "Number of active releases" (stat):
@@ -3458,7 +3477,10 @@ Rules
 - Honesty: if a tool fails or the data is missing, say so in `summary` and produce the best partial proposal you can, or no proposal at all.
 
 Current time: {now}."#
-    )
+    );
+    body
+        .replace("<<MCP_EXAMPLE_SERVER>>", &example_server)
+        .replace("<<MCP_EXAMPLE_TOOL>>", &example_tool)
 }
 
 fn context_chat_system_prompt() -> String {
