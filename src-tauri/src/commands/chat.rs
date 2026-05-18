@@ -18,7 +18,9 @@ use crate::models::chat::{
 use crate::models::dashboard::BuildProposal;
 use crate::models::mcp::{MCPServer, MCPTransport};
 use crate::models::memory::{MemoryHit, Scope};
-use crate::models::pricing::{pricing_for, ModelPricing, ModelPricingOverride, UsageReport};
+use crate::models::pricing::{
+    pricing_for, CostSource, ModelPricing, ModelPricingOverride, TurnCost, UsageReport,
+};
 use crate::models::validation::ValidationIssue;
 use crate::models::ApiResult;
 use crate::modules::ai::{AIStreamEvent, AIToolSpec};
@@ -87,7 +89,9 @@ pub async fn create_session(
         total_output_tokens: 0,
         total_reasoning_tokens: 0,
         total_cost_usd: 0.0,
+        cost_unknown_turns: 0,
         max_cost_usd: None,
+        language_override: None,
         created_at: now,
         updated_at: now,
     };
@@ -118,11 +122,21 @@ pub async fn send_message(
         }
     };
 
+    let user_mentions =
+        resolve_widget_mentions(&req.widget_mentions, session.dashboard_id.as_deref());
+    let user_source_mentions =
+        dedupe_source_mentions(&req.source_mentions, session.dashboard_id.as_deref());
+    let resolved_source_mentions = resolve_source_mentions(
+        state.inner(),
+        &user_source_mentions,
+        session.dashboard_id.as_deref(),
+    )
+    .await;
     let user_msg = ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::User,
         content: req.content.clone(),
-        parts: text_parts(&req.content),
+        parts: user_message_parts(&req.content, &user_mentions, &user_source_mentions),
         mode: session.mode.clone(),
         tool_calls: None,
         tool_results: None,
@@ -136,33 +150,10 @@ pub async fn send_message(
         return Ok(ApiResult::err(e.to_string()));
     }
 
-    let providers = match state.storage.list_providers().await {
-        Ok(providers) => providers,
+    let provider = match crate::resolve_active_provider(state.storage.as_ref()).await {
+        Ok(Ok(provider)) => provider,
+        Ok(Err(setup_error)) => return Ok(ApiResult::err(setup_error.to_string())),
         Err(e) => return Ok(ApiResult::err(e.to_string())),
-    };
-
-    let active_provider_id = match state.storage.get_config("active_provider_id").await {
-        Ok(value) => value.filter(|id| !id.trim().is_empty()),
-        Err(e) => return Ok(ApiResult::err(e.to_string())),
-    };
-
-    let provider = match active_provider_id
-        .as_deref()
-        .and_then(|id| {
-            providers
-                .iter()
-                .find(|provider| provider.id == id && provider.is_enabled)
-        })
-        .or_else(|| providers.iter().find(|provider| provider.is_enabled))
-        .cloned()
-    {
-        Some(provider) => provider,
-        None => {
-            return Ok(ApiResult::err(
-                "AI chat unavailable: configure an enabled provider or local_mock dev/test provider first"
-                    .to_string(),
-            ));
-        }
     };
 
     let prompt_mcp_server = match extract_prompt_mcp_server(&req.content) {
@@ -190,6 +181,13 @@ pub async fn send_message(
     };
     if let Some(server) = prompt_mcp_server.as_ref() {
         provider_messages.push(system_message(prompt_mcp_system_message(server)));
+    }
+    // W48: brief the agent on the user's @source mentions BEFORE the
+    // budget check so the prompt cost is counted accurately.
+    if matches!(session.mode, ChatMode::Build) {
+        if let Some(prompt) = build_source_mentions_prompt(&resolved_source_mentions) {
+            provider_messages.push(system_message(prompt));
+        }
     }
 
     let pricing = pricing_for_provider(state.inner(), &provider).await;
@@ -245,17 +243,20 @@ pub async fn send_message(
             mode: session.mode.clone(),
             tool_calls: Some(ai_response.tool_calls.clone()),
             tool_results: None,
-            metadata: Some(MessageMetadata {
-                model: Some(ai_response.model.clone()),
-                provider: Some(ai_response.provider_id.clone()),
-                tokens: ai_response.tokens.clone(),
-                latency_ms: Some(ai_response.latency_ms),
-                build_proposal: None,
-                reasoning: ai_response.reasoning.clone(),
-                cost_usd: ai_response.tokens.as_ref().and_then(|tokens| {
-                    pricing.map(|p| p.cost_for(&usage_report_from_tokens(tokens)))
-                }),
-            }),
+            metadata: {
+                let (cost_usd, cost_source) =
+                    metadata_cost_fields(ai_response.tokens.as_ref(), pricing);
+                Some(MessageMetadata {
+                    model: Some(ai_response.model.clone()),
+                    provider: Some(ai_response.provider_id.clone()),
+                    tokens: ai_response.tokens.clone(),
+                    latency_ms: Some(ai_response.latency_ms),
+                    build_proposal: None,
+                    reasoning: ai_response.reasoning.clone(),
+                    cost_usd,
+                    cost_source,
+                })
+            },
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         // Accumulate the tool-call-only assistant turn into session totals
@@ -307,18 +308,62 @@ pub async fn send_message(
         }
     }
 
-    let build_proposal = if matches!(session.mode, ChatMode::Build) {
+    let mut build_proposal = if matches!(session.mode, ChatMode::Build) {
         parse_build_proposal(&final_content)
     } else {
         None
     };
+
+    // W29: non-streaming path goes through the same validator gate as
+    // the streaming send. A proposal with unresolved issues never makes
+    // it onto the assistant message as a `BuildProposal` part — the
+    // chat UI surfaces a typed diagnostic block instead, and the
+    // backend `apply_build_proposal` command also refuses to apply.
+    if matches!(session.mode, ChatMode::Build) {
+        if let Some(proposal_ref) = build_proposal.as_ref() {
+            let dashboard_for_validation = match session.dashboard_id.as_deref() {
+                Some(dashboard_id) => state
+                    .storage
+                    .get_dashboard(dashboard_id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let target_widget_ids = target_widget_ids_from(&user_mentions);
+            let mentioned_sources = mentioned_sources_for_validation(&resolved_source_mentions);
+            let mentioned_sources_slice = if mentioned_sources.is_empty() {
+                None
+            } else {
+                Some(mentioned_sources.as_slice())
+            };
+            let issues = crate::commands::validation::validate_build_proposal_full(
+                proposal_ref,
+                dashboard_for_validation.as_ref(),
+                &session.messages,
+                if target_widget_ids.is_empty() {
+                    None
+                } else {
+                    Some(target_widget_ids.as_slice())
+                },
+                mentioned_sources_slice,
+            );
+            if !issues.is_empty() {
+                tracing::warn!(
+                    "non-streaming build proposal suppressed: {} validation issue(s)",
+                    issues.len()
+                );
+                build_proposal = None;
+            }
+        }
+    }
 
     let assistant_content = build_proposal
         .as_ref()
         .and_then(|proposal| proposal.summary.clone())
         .filter(|summary| !summary.trim().is_empty())
         .unwrap_or(final_content);
-    let cost_usd = accumulate_session_usage(&mut session, final_tokens.as_ref(), pricing);
+    let turn_cost = accumulate_session_usage(&mut session, final_tokens.as_ref(), pricing);
     let assistant_msg = ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::Assistant,
@@ -348,7 +393,8 @@ pub async fn send_message(
             latency_ms: Some(final_latency_ms),
             build_proposal,
             reasoning: final_reasoning,
-            cost_usd,
+            cost_usd: turn_cost.and_then(|t| t.amount_usd),
+            cost_source: turn_cost.map(|t| t.source),
         }),
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
@@ -378,11 +424,15 @@ pub async fn send_message_stream(
         Err(e) => return Ok(ApiResult::err(e.to_string())),
     };
 
+    let user_mentions =
+        resolve_widget_mentions(&req.widget_mentions, session.dashboard_id.as_deref());
+    let user_source_mentions =
+        dedupe_source_mentions(&req.source_mentions, session.dashboard_id.as_deref());
     let user_msg = ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
         role: MessageRole::User,
         content: req.content.clone(),
-        parts: text_parts(&req.content),
+        parts: user_message_parts(&req.content, &user_mentions, &user_source_mentions),
         mode: session.mode.clone(),
         tool_calls: None,
         tool_results: None,
@@ -396,33 +446,10 @@ pub async fn send_message_stream(
         return Ok(ApiResult::err(e.to_string()));
     }
 
-    let providers = match state.storage.list_providers().await {
-        Ok(providers) => providers,
+    let provider = match crate::resolve_active_provider(state.storage.as_ref()).await {
+        Ok(Ok(provider)) => provider,
+        Ok(Err(setup_error)) => return Ok(ApiResult::err(setup_error.to_string())),
         Err(e) => return Ok(ApiResult::err(e.to_string())),
-    };
-
-    let active_provider_id = match state.storage.get_config("active_provider_id").await {
-        Ok(value) => value.filter(|id| !id.trim().is_empty()),
-        Err(e) => return Ok(ApiResult::err(e.to_string())),
-    };
-
-    let provider = match active_provider_id
-        .as_deref()
-        .and_then(|id| {
-            providers
-                .iter()
-                .find(|provider| provider.id == id && provider.is_enabled)
-        })
-        .or_else(|| providers.iter().find(|provider| provider.is_enabled))
-        .cloned()
-    {
-        Some(provider) => provider,
-        None => {
-            return Ok(ApiResult::err(
-                "AI chat unavailable: configure an enabled provider or local_mock dev/test provider first"
-                    .to_string(),
-            ));
-        }
     };
 
     let assistant_message_id = uuid::Uuid::new_v4().to_string();
@@ -476,6 +503,7 @@ pub async fn send_message_stream(
             build_proposal: None,
             reasoning: None,
             cost_usd: None,
+            cost_source: None,
         }),
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
@@ -601,9 +629,52 @@ async fn send_message_stream_inner(
         None => None,
     };
 
+    // W38: derive the active target set from the request mentions so we
+    // can scope both prompt construction and proposal validation to the
+    // widgets the user named this turn. `Empty` = unscoped (legacy).
+    let target_mentions =
+        resolve_widget_mentions(&req.widget_mentions, session.dashboard_id.as_deref());
+    let target_widget_ids = target_widget_ids_from(&target_mentions);
+    // W48: same shape for source mentions — resolve once so the prompt
+    // and the validator agree on which sources are real.
+    let target_source_mentions =
+        dedupe_source_mentions(&req.source_mentions, session.dashboard_id.as_deref());
+    let resolved_source_mentions = resolve_source_mentions(
+        state,
+        &target_source_mentions,
+        session.dashboard_id.as_deref(),
+    )
+    .await;
+    let mentioned_sources = mentioned_sources_for_validation(&resolved_source_mentions);
+    let mentioned_sources_slice: Option<&[crate::commands::validation::MentionedSource]> =
+        if mentioned_sources.is_empty() {
+            None
+        } else {
+            Some(mentioned_sources.as_slice())
+        };
+
     let mut provider_messages = grounded_messages(state, session).await?;
     if let Some(server) = prompt_mcp_server.as_ref() {
         provider_messages.push(system_message(prompt_mcp_system_message(server)));
+    }
+
+    // W48: brief the agent on the user's @source mentions. Always
+    // emitted in Build mode so the model gets the typed source identity
+    // even when only one source was named.
+    if matches!(session.mode, ChatMode::Build) {
+        if let Some(prompt) = build_source_mentions_prompt(&resolved_source_mentions) {
+            provider_messages.push(system_message(prompt));
+        }
+    }
+
+    // W38: when the user mentioned specific widgets, give the agent a
+    // typed bundle for each target plus the targeted-edit policy. The
+    // validator enforces the rule; the prompt steers the model toward
+    // success on the first try so we don't burn the single retry.
+    if matches!(session.mode, ChatMode::Build) && !target_mentions.is_empty() {
+        if let Some(prompt) = build_targeted_edit_prompt(state, session, &target_mentions).await {
+            provider_messages.push(system_message(prompt));
+        }
     }
 
     // W18: Build sessions get a planning preamble. If a plan already
@@ -847,6 +918,7 @@ async fn send_message_stream_inner(
                 latency_ms: provider_request_started.elapsed().as_millis() as u64,
                 tool_calls: Vec::new(),
                 reasoning: non_empty(reasoning_seen.clone()),
+                strict_mode: crate::models::provider::StructuredOutputCapability::PlainText,
             }
         }
         Err(e) => {
@@ -947,6 +1019,11 @@ async fn send_message_stream_inner(
         .as_ref()
         .is_some_and(|response| !response.tool_calls.is_empty())
     {
+        // Honour the user's Stop click between tool rounds so we don't keep
+        // looping after the abort flag was raised mid-tool-execution.
+        if abort_flag.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("chat_stream_cancelled"));
+        }
         let response_with_tools = pending_tool_response
             .take()
             .expect("pending response was checked above");
@@ -963,12 +1040,8 @@ async fn send_message_stream_inner(
         } else {
             response_with_tools.content.clone()
         };
-        let turn_cost = pricing.and_then(|p| {
-            response_with_tools
-                .tokens
-                .as_ref()
-                .map(|tokens| p.cost_for(&usage_report_from_tokens(tokens)))
-        });
+        let (turn_cost_usd, turn_cost_source) =
+            metadata_cost_fields(response_with_tools.tokens.as_ref(), pricing);
         let assistant_tool_msg = ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: MessageRole::Assistant,
@@ -990,7 +1063,8 @@ async fn send_message_stream_inner(
                 latency_ms: Some(response_with_tools.latency_ms),
                 build_proposal: None,
                 reasoning: response_with_tools.reasoning.clone(),
-                cost_usd: turn_cost,
+                cost_usd: turn_cost_usd,
+                cost_source: turn_cost_source,
             }),
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
@@ -1052,6 +1126,7 @@ async fn send_message_stream_inner(
                         "plan_required: call submit_plan first to outline your steps before any other tool"
                             .to_string(),
                     ),
+                    compression: None,
                 };
                 emit_tool_call_event(
                     app,
@@ -1117,6 +1192,7 @@ async fn send_message_stream_inner(
                                 "step_count": plan.steps.len(),
                             }),
                             error: None,
+                            compression: None,
                         }
                     }
                     Err(error) => ToolResult {
@@ -1124,6 +1200,7 @@ async fn send_message_stream_inner(
                         name: call.name.clone(),
                         result: serde_json::json!({ "status": "error" }),
                         error: Some(error.to_string()),
+                        compression: None,
                     },
                 };
                 let final_status = if result_tool.error.is_some() {
@@ -1238,6 +1315,7 @@ async fn send_message_stream_inner(
                         call.name,
                         recent_repeats + 1
                     )),
+                    compression: None,
                 }
             } else {
                 info!(
@@ -1297,6 +1375,9 @@ async fn send_message_stream_inner(
         };
         session.messages.push(tool_msg);
 
+        if abort_flag.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("chat_stream_cancelled"));
+        }
         let resumed_messages = grounded_messages(state, session).await?;
         info!(
             "chat stream resume started: session={} message={} iteration={} total_tool_results={}",
@@ -1533,6 +1614,7 @@ async fn send_message_stream_inner(
     // result to the user.
     let mut residual_validation_issues: Vec<ValidationIssue> = Vec::new();
     let mut validation_retried = false;
+    let mut validation_outcome: Option<(AgentPhaseStatus, Vec<ValidationIssue>, bool)> = None;
 
     if matches!(session.mode, ChatMode::Build) {
         if let Some(initial_proposal) = build_proposal.as_ref() {
@@ -1546,10 +1628,17 @@ async fn send_message_stream_inner(
                 None => None,
             };
 
-            let initial_issues = crate::commands::validation::validate_build_proposal(
+            let target_slice: Option<&[String]> = if target_widget_ids.is_empty() {
+                None
+            } else {
+                Some(target_widget_ids.as_slice())
+            };
+            let initial_issues = crate::commands::validation::validate_build_proposal_full(
                 initial_proposal,
                 dashboard_for_validation.as_ref(),
                 &session.messages,
+                target_slice,
+                mentioned_sources_slice,
             );
 
             if initial_issues.is_empty() {
@@ -1564,6 +1653,7 @@ async fn send_message_stream_inner(
                     false,
                     synthetic_stream,
                 );
+                validation_outcome = Some((AgentPhaseStatus::Completed, Vec::new(), false));
             } else {
                 tracing::warn!(
                     "proposal validation found {} issue(s); attempting retry",
@@ -1629,6 +1719,13 @@ async fn send_message_stream_inner(
                         break;
                     }
 
+                    tracing::info!(
+                        provider = %retry_response.provider_id,
+                        model = %retry_response.model,
+                        strict_mode = ?retry_response.strict_mode,
+                        "W33 validation retry: structured_output mode resolved"
+                    );
+
                     final_content = retry_response.content;
                     final_model = retry_response.model;
                     final_provider_id = retry_response.provider_id;
@@ -1640,10 +1737,12 @@ async fn send_message_stream_inner(
 
                     build_proposal = parse_build_proposal(&final_content);
                     current_issues = match build_proposal.as_ref() {
-                        Some(updated) => crate::commands::validation::validate_build_proposal(
+                        Some(updated) => crate::commands::validation::validate_build_proposal_full(
                             updated,
                             dashboard_for_validation.as_ref(),
                             &session.messages,
+                            target_slice,
+                            mentioned_sources_slice,
                         ),
                         None => current_issues,
                     };
@@ -1660,14 +1759,36 @@ async fn send_message_stream_inner(
                     assistant_message_id,
                     sequence,
                     provider,
-                    final_status,
+                    final_status.clone(),
                     current_issues.clone(),
                     validation_retried,
                     synthetic_stream,
                 );
+                validation_outcome = Some((
+                    final_status,
+                    current_issues.clone(),
+                    validation_retried,
+                ));
                 residual_validation_issues = current_issues;
             }
         }
+    }
+
+    // W29: gate `BuildProposalParsed` emission on the validator. If
+    // issues survived the retry budget, the proposal is non-applyable
+    // and must NOT travel as a `BuildProposal` part / message metadata
+    // — the typed `ProposalValidation::Failed` envelope already carries
+    // the structured issues and the UI renders that as a diagnostic.
+    let proposal_blocked_by_validation = !residual_validation_issues.is_empty();
+    if proposal_blocked_by_validation {
+        if let Some(rejected) = build_proposal.as_ref() {
+            tracing::warn!(
+                "build proposal '{}' suppressed: validator left {} unresolved issue(s) after retry",
+                rejected.title,
+                residual_validation_issues.len()
+            );
+        }
+        build_proposal = None;
     }
 
     if let Some(proposal) = build_proposal.clone() {
@@ -1696,8 +1817,6 @@ async fn send_message_stream_inner(
             },
         );
     }
-
-    let _ = residual_validation_issues; // surfaced via the typed validation event
 
     // W18: clean up the session plan now that the assistant turn is
     // about to end. Any step still `Running` flips to `Done` so the UI
@@ -1756,6 +1875,18 @@ async fn send_message_stream_inner(
             widget_ids: reflection.widget_ids.clone(),
         });
     }
+    // Persist the validator outcome so reloading the session preserves
+    // the diagnostic tile that explains *why* a proposal was (or wasn't)
+    // applied. Without this the assistant turn ends up as raw JSON text
+    // with no context after a page refresh.
+    if let Some((status, issues, retried)) = validation_outcome {
+        final_parts.push(ChatMessagePart::ProposalValidation {
+            status,
+            issues,
+            retried,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+        });
+    }
 
     let assistant_msg = ChatMessage {
         id: assistant_message_id.to_string(),
@@ -1780,11 +1911,14 @@ async fn send_message_stream_inner(
             latency_ms: Some(final_latency_ms),
             build_proposal,
             reasoning: final_reasoning,
-            cost_usd: pricing.and_then(|p| {
-                final_tokens
-                    .as_ref()
-                    .map(|tokens| p.cost_for(&usage_report_from_tokens(tokens)))
-            }),
+            cost_usd: {
+                let (cost_usd, _) = metadata_cost_fields(final_tokens.as_ref(), pricing);
+                cost_usd
+            },
+            cost_source: {
+                let (_, source) = metadata_cost_fields(final_tokens.as_ref(), pricing);
+                source
+            },
         }),
         timestamp: chrono::Utc::now().timestamp_millis(),
     };
@@ -2066,6 +2200,83 @@ fn plan_system_message(
     }
 }
 
+/// W38: render a compact "targeted edit" system prompt for the mentioned
+/// widgets. Pulls current widget config + datasource + tail pipeline +
+/// freshness from storage so the agent has enough typed context to
+/// produce a focused proposal without re-reading the dashboard or asking
+/// the user. Returns `None` when nothing useful resolves (e.g. all
+/// mentioned ids are stale).
+async fn build_targeted_edit_prompt(
+    state: &AppState,
+    session: &ChatSession,
+    mentions: &[crate::models::chat::WidgetMention],
+) -> Option<String> {
+    let dashboard_id = session.dashboard_id.as_deref()?;
+    let dashboard = state
+        .storage
+        .get_dashboard(dashboard_id)
+        .await
+        .ok()
+        .flatten()?;
+    use crate::commands::dashboard::WidgetDatasource;
+    let mut targets: Vec<serde_json::Value> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    for mention in mentions {
+        match dashboard
+            .layout
+            .iter()
+            .find(|w| w.id() == mention.widget_id)
+        {
+            Some(widget) => {
+                let mut entry = serde_json::json!({
+                    "widget_id": widget.id(),
+                    "label": mention.label,
+                    "title": widget.title(),
+                    "kind": widget_type_label(widget),
+                });
+                if let Some(ds) = widget.datasource() {
+                    entry["datasource"] = serde_json::json!({
+                        "workflow_id": ds.workflow_id,
+                        "output_key": ds.output_key,
+                        "datasource_definition_id": ds.datasource_definition_id,
+                        "binding_source": ds.binding_source,
+                        "tail_pipeline_steps": ds.tail_pipeline.len(),
+                        "capture_traces": ds.capture_traces,
+                    });
+                }
+                targets.push(entry);
+            }
+            None => stale.push(mention.widget_id.clone()),
+        }
+    }
+    if targets.is_empty() && stale.is_empty() {
+        return None;
+    }
+    let targets_json = serde_json::to_string_pretty(&targets).unwrap_or_else(|_| "[]".to_string());
+    let mut body = String::from(
+        "## Targeted Build edit (W38)\nThe user mentioned specific widgets in their message. \
+        Treat these as the EXCLUSIVE edit target set for this turn unless the user explicitly asks \
+        for broader cleanup (\"also delete the old chart\", \"add a new widget too\").\n\n\
+        Rules:\n\
+        - To CHANGE / REPLACE a mentioned widget, emit it inside `widgets` with `replace_widget_id: \"<id>\"`.\n\
+        - To REMOVE mentioned widgets, list their ids in `proposal.remove_widget_ids`.\n\
+        - To EXPLAIN or DEBUG a mentioned widget without changing it, answer in prose; do NOT emit a proposal.\n\
+        - Do NOT touch (replace, remove, or duplicate) widgets that are not in this target set. \
+          The validator blocks any proposal that mutates unmentioned widgets.\n\
+        - Adding net-new widgets is allowed only when the user explicitly asks for additions, \
+          or when the requested change literally cannot be expressed as an edit to a mentioned widget.\n\n\
+        Targets:\n",
+    );
+    body.push_str(&targets_json);
+    if !stale.is_empty() {
+        body.push_str("\n\nStale mention ids (no matching widget on the dashboard — ignore):\n");
+        for id in stale {
+            body.push_str(&format!("- {}\n", id));
+        }
+    }
+    Some(body)
+}
+
 fn kind_label(kind: PlanStepKind) -> &'static str {
     match kind {
         PlanStepKind::Explore => "explore",
@@ -2115,21 +2326,10 @@ async fn run_reflection_turn(
         return Ok(());
     }
 
-    let providers = state.storage.list_providers().await?;
-    let active_provider_id = state
-        .storage
-        .get_config("active_provider_id")
-        .await?
-        .filter(|id| !id.trim().is_empty());
-    let provider = match active_provider_id
-        .as_deref()
-        .and_then(|id| providers.iter().find(|p| p.id == id && p.is_enabled))
-        .or_else(|| providers.iter().find(|p| p.is_enabled))
-        .cloned()
-    {
-        Some(p) => p,
-        None => {
-            tracing::info!("reflection skipped: no enabled provider");
+    let provider = match crate::resolve_active_provider(state.storage.as_ref()).await? {
+        Ok(p) => p,
+        Err(setup_error) => {
+            tracing::info!("reflection skipped: {}", setup_error.message());
             return Ok(());
         }
     };
@@ -2141,16 +2341,73 @@ async fn run_reflection_turn(
     } else {
         "added"
     };
+    // W32: include compact replay diagnostics from the most recent
+    // captured trace, when capture is on and a trace exists. The
+    // summary names the first empty/failed step so the agent can
+    // anchor its critique on a concrete step index instead of
+    // re-guessing the pipeline shape from `preview_text`.
+    let trace_summary = match state.storage.list_widget_traces(&pending.widget_id).await {
+        Ok(rows) => rows.first().and_then(|(_captured_at, trace_json)| {
+            serde_json::from_str::<crate::models::pipeline::PipelineTrace>(trace_json)
+                .ok()
+                .map(|trace| crate::commands::debug::trace_summary_for_reflection(&trace))
+        }),
+        Err(_) => None,
+    };
+    let trace_block = trace_summary
+        .map(|s| format!("\n- recent pipeline trace:\n{}", s))
+        .unwrap_or_default();
+    // W41: paste the typed provenance summary so the agent knows whether
+    // the widget is deterministic-only, provider-backed, or post-processed
+    // by an LLM step, plus the concrete tool/server/model that produced
+    // the value. Built from the same path the inspector renders, so the
+    // critique reads the same data the user is staring at.
+    let provenance_block = match crate::commands::provenance::build_widget_provenance(
+        state.storage.as_ref(),
+        Some(&provider),
+        None,
+        &pending.dashboard_id,
+        &pending.widget_id,
+    )
+    .await
+    {
+        Ok(prov) => {
+            let summary = crate::commands::provenance::provenance_summary_for_reflection(&prov);
+            if summary.is_empty() {
+                String::new()
+            } else {
+                format!("\n- widget provenance:\n{}", summary)
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "reflection provenance unavailable for widget {}: {}",
+                pending.widget_id,
+                error
+            );
+            String::new()
+        }
+    };
     let content = format!(
-        "[reflection] Widget you just {action} just rendered live data after applying the proposal.\n- widget_id: {}\n- title: \"{}\"\n- kind: {}\n- runtime preview: {}\n\nCritique your own output. If the value looks broken (null / empty / zero / wrong shape / off-domain), emit a fix-up BuildProposal as a DELTA with `replace_widget_id: \"{}\"` and an updated pipeline. If the value looks correct for the user's intent, reply with one short line acknowledging it — DO NOT emit JSON.",
-        pending.widget_id, pending.widget_title, pending.widget_kind, preview_text, pending.widget_id
+        "[reflection] Widget you just {action} just rendered live data after applying the proposal.\n- widget_id: {}\n- title: \"{}\"\n- kind: {}\n- runtime preview: {}{}{}\n\nCritique your own output. If the value looks broken (null / empty / zero / wrong shape / off-domain), emit a fix-up BuildProposal as a DELTA with `replace_widget_id: \"{}\"` and an updated pipeline. If the value looks correct for the user's intent, reply with one short line acknowledging it — DO NOT emit JSON.",
+        pending.widget_id,
+        pending.widget_title,
+        pending.widget_kind,
+        preview_text,
+        provenance_block,
+        trace_block,
+        pending.widget_id
     );
     spawn_chat_streaming_turn(
         app.clone(),
         state.clone(),
         session,
         provider,
-        SendMessageRequest { content },
+        SendMessageRequest {
+            content,
+            widget_mentions: Vec::new(),
+            source_mentions: Vec::new(),
+        },
         Some(ReflectionContext {
             widget_ids: vec![pending.widget_id.clone()],
         }),
@@ -2172,18 +2429,9 @@ pub async fn spawn_autonomous_alert_turn(
     prompt: String,
     max_cost_usd: Option<f64>,
 ) -> anyhow::Result<String> {
-    let providers = state.storage.list_providers().await?;
-    let active_provider_id = state
-        .storage
-        .get_config("active_provider_id")
+    let provider = crate::resolve_active_provider(state.storage.as_ref())
         .await?
-        .filter(|id| !id.trim().is_empty());
-    let provider = active_provider_id
-        .as_deref()
-        .and_then(|id| providers.iter().find(|p| p.id == id && p.is_enabled))
-        .or_else(|| providers.iter().find(|p| p.is_enabled))
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no enabled LLM provider to run autonomous alert"))?;
+        .map_err(|e| anyhow::anyhow!("no enabled LLM provider to run autonomous alert: {}", e))?;
 
     let now = chrono::Utc::now().timestamp_millis();
     let session = ChatSession {
@@ -2199,7 +2447,9 @@ pub async fn spawn_autonomous_alert_turn(
         total_output_tokens: 0,
         total_reasoning_tokens: 0,
         total_cost_usd: 0.0,
+        cost_unknown_turns: 0,
         max_cost_usd,
+        language_override: None,
         created_at: now,
         updated_at: now,
     };
@@ -2211,7 +2461,11 @@ pub async fn spawn_autonomous_alert_turn(
         state,
         session,
         provider,
-        SendMessageRequest { content: prompt },
+        SendMessageRequest {
+            content: prompt,
+            widget_mentions: Vec::new(),
+            source_mentions: Vec::new(),
+        },
         None,
     )
     .await?;
@@ -2547,6 +2801,7 @@ fn emit_tool_result_event(
                 status: status.clone(),
                 result_preview: result_preview.clone(),
                 error: result.error.clone(),
+                compression: result.compression.clone(),
             }),
             provider_id: Some(provider.id.clone()),
             model: Some(provider.default_model.clone()),
@@ -2560,6 +2815,7 @@ fn emit_tool_result_event(
                 status,
                 result_preview,
                 error: result.error.clone(),
+                compression: result.compression.clone(),
             }),
             build_proposal: None,
             final_message: None,
@@ -2674,14 +2930,37 @@ pub fn enforce_session_budget(
     Ok(())
 }
 
+/// W49: price a single turn's usage. Provider-reported total cost wins
+/// over the local pricing table; pricing-table cost is the next
+/// fallback; if neither is available the turn surfaces as
+/// `UnknownPricing` so the UI can render `unknown cost` instead of
+/// silently treating it as a free call.
+fn price_turn(tokens: &TokenUsage, pricing: Option<ModelPricing>) -> TurnCost {
+    if let Some(cost) = tokens
+        .provider_cost_usd
+        .filter(|c| c.is_finite() && *c >= 0.0)
+    {
+        return TurnCost::provider_total(cost);
+    }
+    if let Some(pricing) = pricing {
+        return TurnCost::pricing_table(pricing.cost_for(&usage_report_from_tokens(tokens)));
+    }
+    TurnCost::unknown()
+}
+
 /// Apply a single assistant turn's usage to the session's running
-/// totals. Returns the computed `cost_usd` for the turn (so callers can
-/// stamp it onto `MessageMetadata`).
+/// totals. Returns the computed `TurnCost` for the turn (so callers can
+/// stamp `cost_usd` + `cost_source` onto `MessageMetadata`). Tokens are
+/// accumulated unconditionally — the unknown-pricing path still
+/// increments the running token counters, and bumps
+/// `cost_unknown_turns` so the UI can label the session total as a
+/// lower bound rather than the literal truth. `None` is returned only
+/// when no `tokens` block was parsed at all (rare; mid-stream failure).
 fn accumulate_session_usage(
     session: &mut ChatSession,
     tokens: Option<&TokenUsage>,
     pricing: Option<ModelPricing>,
-) -> Option<f64> {
+) -> Option<TurnCost> {
     let tokens = tokens?;
     session.total_input_tokens = session
         .total_input_tokens
@@ -2694,11 +2973,30 @@ fn accumulate_session_usage(
             .total_reasoning_tokens
             .saturating_add(reasoning as u64);
     }
-    let pricing = pricing?;
-    let usage = usage_report_from_tokens(tokens);
-    let cost = pricing.cost_for(&usage);
-    session.total_cost_usd += cost;
-    Some(cost)
+    let turn = price_turn(tokens, pricing);
+    match turn.amount_usd {
+        Some(amount) if amount.is_finite() && amount >= 0.0 => {
+            session.total_cost_usd += amount;
+        }
+        _ => {
+            session.cost_unknown_turns = session.cost_unknown_turns.saturating_add(1);
+        }
+    }
+    Some(turn)
+}
+
+/// W49: helper for the metadata stamp on tool-call rounds where we
+/// re-price the same `tokens` block we just folded into the session
+/// totals. Always reflects what `accumulate_session_usage` would have
+/// recorded for the same input.
+fn metadata_cost_fields(
+    tokens: Option<&TokenUsage>,
+    pricing: Option<ModelPricing>,
+) -> (Option<f64>, Option<CostSource>) {
+    match tokens.map(|t| price_turn(t, pricing)) {
+        Some(turn) => (turn.amount_usd, Some(turn.source)),
+        None => (None, None),
+    }
 }
 
 /// W16: deterministic serialisation for tool-call argument comparison.
@@ -2769,6 +3067,400 @@ fn text_parts(content: &str) -> Vec<ChatMessagePart> {
     }
 }
 
+/// W48: resolver output for a user-mentioned source. Carries the
+/// stable identity (definition id when available, else workflow id),
+/// the kind for prompt clarity, a freshness/health snapshot, and a
+/// pruned sample preview suitable for embedding in the system prompt
+/// without bloating the provider request.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedSourceMention {
+    pub label: String,
+    pub kind: crate::models::chat::SourceMentionKind,
+    pub datasource_definition_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub widget_id: Option<String>,
+    pub dashboard_id: Option<String>,
+    pub input_alias: Option<String>,
+    pub description: Option<String>,
+    pub source_kind_label: Option<String>,
+    pub tool_name: Option<String>,
+    pub server_id: Option<String>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub last_run_at: Option<i64>,
+    pub last_duration_ms: Option<u32>,
+    pub consumer_count: Option<u32>,
+    pub sample_preview: Option<serde_json::Value>,
+    pub arguments_preview: Option<serde_json::Value>,
+}
+
+/// W48: derive the validator's compact view from the resolved mention
+/// list. Mentions that did not resolve to any identity are skipped so
+/// the validator does not punish the agent for ghost references.
+pub(crate) fn mentioned_sources_for_validation(
+    resolved: &[ResolvedSourceMention],
+) -> Vec<crate::commands::validation::MentionedSource> {
+    resolved
+        .iter()
+        .filter(|r| r.datasource_definition_id.is_some() || r.workflow_id.is_some())
+        .map(|r| crate::commands::validation::MentionedSource {
+            label: r.label.clone(),
+            datasource_definition_id: r.datasource_definition_id.clone(),
+            workflow_id: r.workflow_id.clone(),
+        })
+        .collect()
+}
+
+/// W48: dedupe + sanity-trim incoming source mentions, stamp the active
+/// dashboard id when the frontend omitted it for `kind == Widget`. We
+/// never trust the wire to identify what is or isn't a valid source —
+/// `resolve_source_mentions` does the real lookup; this just normalises
+/// the incoming bundle so duplicates and blanks fall out early.
+fn dedupe_source_mentions(
+    mentions: &[crate::models::chat::SourceMention],
+    active_dashboard_id: Option<&str>,
+) -> Vec<crate::models::chat::SourceMention> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for mention in mentions {
+        let kind = mention.kind;
+        let key_id = mention
+            .datasource_definition_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| mention.workflow_id.clone().filter(|s| !s.trim().is_empty()))
+            .or_else(|| mention.widget_id.clone().filter(|s| !s.trim().is_empty()));
+        let Some(key_id) = key_id else { continue };
+        let kind_key = format!("{:?}", kind);
+        if !seen.insert((kind_key, key_id.clone())) {
+            continue;
+        }
+        let mut next = mention.clone();
+        if matches!(kind, crate::models::chat::SourceMentionKind::Widget)
+            && next.dashboard_id.is_none()
+        {
+            next.dashboard_id = active_dashboard_id.map(|s| s.to_string());
+        }
+        out.push(next);
+    }
+    out
+}
+
+/// W48: walk every mention and produce a [`ResolvedSourceMention`].
+/// Unknown identifiers still yield a row — with the label intact — so
+/// the UI chip can render but the validator filter discards them.
+pub(crate) async fn resolve_source_mentions(
+    state: &AppState,
+    mentions: &[crate::models::chat::SourceMention],
+    active_dashboard_id: Option<&str>,
+) -> Vec<ResolvedSourceMention> {
+    let mut resolved = Vec::new();
+    for mention in mentions {
+        match mention.kind {
+            crate::models::chat::SourceMentionKind::Datasource => {
+                let mut row = ResolvedSourceMention::from_mention(mention);
+                if let Some(def_id) = mention.datasource_definition_id.as_deref() {
+                    if let Ok(Some(def)) = state.storage.get_datasource_definition(def_id).await {
+                        row.fill_from_definition(&def);
+                    }
+                }
+                resolved.push(row);
+            }
+            crate::models::chat::SourceMentionKind::Workflow => {
+                let mut row = ResolvedSourceMention::from_mention(mention);
+                if let Some(wf_id) = mention.workflow_id.as_deref() {
+                    if let Ok(Some(def)) = state.storage.get_datasource_by_workflow_id(wf_id).await
+                    {
+                        row.fill_from_definition(&def);
+                    } else if let Ok(Some(wf)) = state.storage.get_workflow(wf_id).await {
+                        row.source_kind_label = Some("workflow".to_string());
+                        row.workflow_id = Some(wf.id);
+                        if row.label.trim().is_empty() {
+                            row.label = wf.name;
+                        }
+                    }
+                }
+                resolved.push(row);
+            }
+            crate::models::chat::SourceMentionKind::Widget => {
+                let mut row = ResolvedSourceMention::from_mention(mention);
+                let dashboard_id = mention.dashboard_id.as_deref().or(active_dashboard_id);
+                if let (Some(dashboard_id), Some(widget_id)) =
+                    (dashboard_id, mention.widget_id.as_deref())
+                {
+                    if let Ok(Some(dashboard)) = state.storage.get_dashboard(dashboard_id).await {
+                        if let Some(widget) = dashboard.layout.iter().find(|w| w.id() == widget_id)
+                        {
+                            if let Some(config) =
+                                crate::commands::datasource::widget_datasource(widget)
+                            {
+                                row.workflow_id = Some(config.workflow_id.clone());
+                                row.datasource_definition_id =
+                                    config.datasource_definition_id.clone();
+                                row.source_kind_label = Some("widget".to_string());
+                                if let Some(def_id) = config.datasource_definition_id.as_deref() {
+                                    if let Ok(Some(def)) =
+                                        state.storage.get_datasource_definition(def_id).await
+                                    {
+                                        row.fill_from_definition(&def);
+                                    }
+                                } else if let Ok(Some(def)) = state
+                                    .storage
+                                    .get_datasource_by_workflow_id(&config.workflow_id)
+                                    .await
+                                {
+                                    row.fill_from_definition(&def);
+                                }
+                            }
+                            row.widget_id = Some(widget.id().to_string());
+                            row.dashboard_id = Some(dashboard.id.clone());
+                            if row.label.trim().is_empty() {
+                                row.label = widget.title().to_string();
+                            }
+                        }
+                    }
+                }
+                resolved.push(row);
+            }
+        }
+    }
+    resolved
+}
+
+impl ResolvedSourceMention {
+    fn from_mention(mention: &crate::models::chat::SourceMention) -> Self {
+        Self {
+            label: mention.label.clone(),
+            kind: mention.kind,
+            datasource_definition_id: mention.datasource_definition_id.clone(),
+            workflow_id: mention.workflow_id.clone(),
+            widget_id: mention.widget_id.clone(),
+            dashboard_id: mention.dashboard_id.clone(),
+            input_alias: mention.input_alias.clone(),
+            description: None,
+            source_kind_label: None,
+            tool_name: None,
+            server_id: None,
+            last_status: None,
+            last_error: None,
+            last_run_at: None,
+            last_duration_ms: None,
+            consumer_count: None,
+            sample_preview: None,
+            arguments_preview: None,
+        }
+    }
+
+    fn fill_from_definition(&mut self, def: &crate::models::datasource::DatasourceDefinition) {
+        use crate::models::dashboard::BuildDatasourcePlanKind;
+        self.datasource_definition_id = Some(def.id.clone());
+        self.workflow_id = Some(def.workflow_id.clone());
+        self.description = def.description.clone();
+        self.source_kind_label = Some(
+            match def.kind {
+                BuildDatasourcePlanKind::BuiltinTool => "builtin_tool",
+                BuildDatasourcePlanKind::McpTool => "mcp_tool",
+                BuildDatasourcePlanKind::ProviderPrompt => "provider_prompt",
+                BuildDatasourcePlanKind::Shared => "shared",
+                BuildDatasourcePlanKind::Compose => "compose",
+            }
+            .to_string(),
+        );
+        self.tool_name = def.tool_name.clone();
+        self.server_id = def.server_id.clone();
+        if let Some(args) = def.arguments.as_ref() {
+            self.arguments_preview = Some(preview_json(args));
+        }
+        if let Some(health) = def.health.as_ref() {
+            self.last_status = Some(
+                match health.last_status {
+                    crate::models::datasource::DatasourceHealthStatus::Ok => "ok",
+                    crate::models::datasource::DatasourceHealthStatus::Error => "error",
+                }
+                .to_string(),
+            );
+            self.last_error = health.last_error.clone();
+            self.last_run_at = Some(health.last_run_at);
+            self.last_duration_ms = Some(health.last_duration_ms);
+            self.consumer_count = Some(health.consumer_count);
+            if let Some(preview) = health.sample_preview.as_ref() {
+                self.sample_preview = Some(preview_json(preview));
+            }
+        }
+        if self.label.trim().is_empty() {
+            self.label = def.name.clone();
+        }
+    }
+
+    fn to_prompt_json(&self) -> serde_json::Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "label".into(),
+            serde_json::Value::String(self.label.clone()),
+        );
+        entry.insert(
+            "mention_kind".into(),
+            serde_json::Value::String(format!("{:?}", self.kind).to_lowercase()),
+        );
+        if let Some(id) = &self.datasource_definition_id {
+            entry.insert(
+                "datasource_definition_id".into(),
+                serde_json::Value::String(id.clone()),
+            );
+        }
+        if let Some(id) = &self.workflow_id {
+            entry.insert("workflow_id".into(), serde_json::Value::String(id.clone()));
+        }
+        if let Some(id) = &self.widget_id {
+            entry.insert("widget_id".into(), serde_json::Value::String(id.clone()));
+        }
+        if let Some(alias) = &self.input_alias {
+            entry.insert(
+                "input_alias".into(),
+                serde_json::Value::String(alias.clone()),
+            );
+        }
+        if let Some(s) = &self.source_kind_label {
+            entry.insert("source_kind".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(s) = &self.tool_name {
+            entry.insert("tool_name".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(s) = &self.server_id {
+            entry.insert("server_id".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(s) = &self.description {
+            entry.insert("description".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(s) = &self.last_status {
+            entry.insert("last_status".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(s) = &self.last_error {
+            entry.insert("last_error".into(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(n) = self.last_duration_ms {
+            entry.insert("last_duration_ms".into(), serde_json::json!(n));
+        }
+        if let Some(n) = self.consumer_count {
+            entry.insert("consumer_count".into(), serde_json::json!(n));
+        }
+        if let Some(preview) = &self.sample_preview {
+            entry.insert("sample_preview".into(), preview.clone());
+        }
+        if let Some(args) = &self.arguments_preview {
+            entry.insert("arguments_preview".into(), args.clone());
+        }
+        serde_json::Value::Object(entry)
+    }
+}
+
+/// W48: assemble the system message that briefs the agent on the
+/// sources the user named. Returns `None` for empty / fully unresolved
+/// mention lists so we don't bloat the provider context with a noop
+/// block.
+pub(crate) fn build_source_mentions_prompt(resolved: &[ResolvedSourceMention]) -> Option<String> {
+    if resolved.is_empty() {
+        return None;
+    }
+    let usable: Vec<&ResolvedSourceMention> = resolved
+        .iter()
+        .filter(|r| r.datasource_definition_id.is_some() || r.workflow_id.is_some())
+        .collect();
+    let unresolved: Vec<&ResolvedSourceMention> = resolved
+        .iter()
+        .filter(|r| r.datasource_definition_id.is_none() && r.workflow_id.is_none())
+        .collect();
+    if usable.is_empty() && unresolved.is_empty() {
+        return None;
+    }
+    let mut prompt = String::from(
+        "## Source mentions (W48)\nThe user explicitly named the following EXISTING source(s) this turn. \
+        Each entry below is a real, runnable source — DO NOT invent a new tool call to reproduce it. \
+        Reuse the listed identifiers in your `datasource_plan`:\n\n\
+        Rules:\n\
+        - SINGLE source mention → emit one widget whose `datasource_plan.arguments.datasource_definition_id` is the listed id (or `workflow_id` for legacy entries).\n\
+        - MULTIPLE source mentions → emit a widget with `kind: \"compose\"`. Put every mentioned source under `inputs`, keyed by the provided `input_alias` (or a clear snake_case slug). Each inner plan must reference the existing `datasource_definition_id` / `workflow_id` so we don't fan out duplicate tool calls.\n\
+        - The outer compose `pipeline` should produce the final widget value (text widgets: a markdown narrative combining the named inputs; tables/charts: rows/series joined on a shared key).\n\
+        - Text widgets must summarise every mentioned source in prose; the validator will reject a proposal that drops a mentioned source on the floor.\n\
+        - Do NOT paste the raw `sample_preview` into the widget — it is for your reference only.\n\n",
+    );
+    if !usable.is_empty() {
+        let usable_json: Vec<serde_json::Value> =
+            usable.iter().map(|r| r.to_prompt_json()).collect();
+        prompt.push_str("Sources:\n");
+        prompt.push_str(
+            &serde_json::to_string_pretty(&usable_json).unwrap_or_else(|_| "[]".to_string()),
+        );
+        prompt.push('\n');
+    }
+    if !unresolved.is_empty() {
+        prompt.push_str(
+            "\nThese mentions did not resolve to a saved datasource — treat them as stale and ignore:\n",
+        );
+        for entry in unresolved {
+            prompt.push_str(&format!("- {}\n", entry.label));
+        }
+    }
+    Some(prompt)
+}
+
+/// W38: drop empty/blank mentions, dedupe by `widget_id`, and stamp the
+/// active dashboard id when the caller forgot. The frontend should already
+/// scope mentions to the active dashboard, but we never trust the wire.
+fn resolve_widget_mentions(
+    mentions: &[crate::models::chat::WidgetMention],
+    active_dashboard_id: Option<&str>,
+) -> Vec<crate::models::chat::WidgetMention> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for mention in mentions {
+        let trimmed_id = mention.widget_id.trim();
+        if trimmed_id.is_empty() {
+            continue;
+        }
+        if !seen.insert(trimmed_id.to_string()) {
+            continue;
+        }
+        let mut next = mention.clone();
+        next.widget_id = trimmed_id.to_string();
+        if next.dashboard_id.is_none() {
+            next.dashboard_id = active_dashboard_id.map(|s| s.to_string());
+        }
+        out.push(next);
+    }
+    out
+}
+
+/// Build the user message's parts, attaching a typed mention bundle when
+/// the user named one or more existing widgets this turn. W48 extends
+/// this with a parallel `SourceMentions` part for `@source` chips.
+fn user_message_parts(
+    content: &str,
+    mentions: &[crate::models::chat::WidgetMention],
+    source_mentions: &[crate::models::chat::SourceMention],
+) -> Vec<ChatMessagePart> {
+    let mut parts = text_parts(content);
+    if !mentions.is_empty() {
+        parts.push(ChatMessagePart::WidgetMentions {
+            mentions: mentions.to_vec(),
+        });
+    }
+    if !source_mentions.is_empty() {
+        parts.push(ChatMessagePart::SourceMentions {
+            mentions: source_mentions.to_vec(),
+        });
+    }
+    parts
+}
+
+/// Extract a slice of widget ids from a mention list, suitable for the
+/// validator's `target_widget_ids` argument.
+fn target_widget_ids_from(mentions: &[crate::models::chat::WidgetMention]) -> Vec<String> {
+    mentions.iter().map(|m| m.widget_id.clone()).collect()
+}
+
 fn assistant_parts(
     content: &str,
     reasoning: Option<&String>,
@@ -2824,6 +3516,7 @@ fn tool_result_parts(tool_results: &[ToolResult]) -> Vec<ChatMessagePart> {
             },
             result_preview: Some(preview_json(&result.result)),
             error: result.error.clone(),
+            compression: result.compression.clone(),
         })
         .collect()
 }
@@ -2933,11 +3626,98 @@ fn looks_like_secret(value: &str) -> bool {
 const MEMORY_INJECTION_CHARS: usize = 6000;
 const MEMORY_INJECTION_TOP_N: usize = 8;
 
+/// W30: Build a compact catalog of saved DatasourceDefinitions for the
+/// Build agent. The aim is reuse: when the agent emits a
+/// `shared_datasources` entry that mirrors a saved definition's
+/// (kind, server_id, tool_name) signature, the apply path can bind the
+/// resulting widgets to the saved definition instead of duplicating it.
+/// Returns `None` when nothing is saved so the prompt stays uncluttered.
+async fn build_datasource_catalog_prompt(state: &AppState) -> anyhow::Result<Option<String>> {
+    let definitions = state.storage.list_datasource_definitions().await?;
+    if definitions.is_empty() {
+        return Ok(None);
+    }
+    let entries: Vec<serde_json::Value> = definitions
+        .iter()
+        .take(20)
+        .map(|def| {
+            let kind = serde_json::to_value(&def.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let mut entry = serde_json::json!({
+                "id": def.id,
+                "name": def.name,
+                "kind": kind,
+                "pipeline_steps": def.pipeline.len(),
+                "consumer_count": def.health.as_ref().map(|h| h.consumer_count).unwrap_or(0),
+            });
+            if let Some(server_id) = &def.server_id {
+                entry["server_id"] = serde_json::Value::String(server_id.clone());
+            }
+            if let Some(tool_name) = &def.tool_name {
+                entry["tool_name"] = serde_json::Value::String(tool_name.clone());
+            }
+            if let Some(description) = &def.description {
+                entry["description"] = serde_json::Value::String(description.clone());
+            }
+            if let Some(health) = &def.health {
+                entry["last_status"] =
+                    serde_json::to_value(health.last_status).unwrap_or(serde_json::Value::Null);
+                if let Some(sample) = &health.sample_preview {
+                    let truncated = serde_json::to_string(sample)
+                        .map(|s| {
+                            if s.len() > 240 {
+                                format!("{}…", &s[..240])
+                            } else {
+                                s
+                            }
+                        })
+                        .unwrap_or_default();
+                    entry["sample_preview"] = serde_json::Value::String(truncated);
+                }
+            }
+            entry
+        })
+        .collect();
+    let payload = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+    Ok(Some(format!(
+        r#"Saved datasources (W30 Workbench catalog) — prefer reusing one of these before inventing a new shared_datasource:
+{}
+
+Reuse guidance:
+- If your proposal needs a source whose `(kind, server_id, tool_name)` matches an entry above, emit a `shared_datasources` entry with the same fields and reference it from your widget via `datasource_plan: {{ kind: "shared", source_key: "<your key>" }}`.
+- Don't paraphrase a saved datasource into a near-duplicate; it ships as a separate workflow and breaks the Workbench's consumer view.
+- Saved pipelines are deterministic; if the saved datasource already produces the shape you need, leave the widget pipeline empty."#,
+        payload
+    )))
+}
+
 async fn grounded_messages(
     state: &AppState,
     session: &ChatSession,
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
+
+    // W47: prepend the resolved language directive so it lands at the
+    // top of the system stack — providers respect early instructions
+    // more reliably than ones buried under context blocks. Resolve
+    // failures are swallowed: a missing language is "auto", not an
+    // outage. The session lookup uses storage rather than the in-memory
+    // `session` so per-session overrides written via
+    // `set_session_language_policy` are picked up before the next turn.
+    if let Ok(resolved) = crate::commands::language::resolve_effective_language(
+        state.storage.as_ref(),
+        session.dashboard_id.as_deref(),
+        Some(session.id.as_str()),
+    )
+    .await
+    {
+        if let Some(directive) = resolved.system_directive() {
+            messages.push(system_message(directive));
+        }
+    }
+
     match session.mode {
         ChatMode::Build => {
             let mcp_tools = state.mcp_manager.list_tools().await;
@@ -2984,6 +3764,12 @@ Existing dashboard (read these widget ids before deciding what to replace/remove
                     "There is no active dashboard. Your proposal will CREATE a new dashboard."
                         .to_string(),
                 ));
+            }
+            // W30: surface the saved Datasource catalog so the Build agent
+            // can reuse existing sources instead of inventing duplicate
+            // shared_datasources entries.
+            if let Some(catalog) = build_datasource_catalog_prompt(state).await? {
+                messages.push(system_message(catalog));
             }
         }
         ChatMode::Context => {
@@ -3040,7 +3826,41 @@ Existing dashboard (read these widget ids before deciding what to replace/remove
     }
 
     messages.extend(session.messages.clone());
-    Ok(messages)
+    // W49: run every provider-facing message list through the
+    // context-economy compactor. Large tool results become compact
+    // status+shape summaries, oldest non-system turns get dropped with
+    // an explicit `[context_truncated]` marker when we'd otherwise
+    // ship hundreds of thousands of tokens to the provider. The local
+    // session.messages is unchanged.
+    let budget = crate::modules::context_budget::ContextBudget::default();
+    let compacted = crate::modules::context_budget::compact_for_provider(messages, budget);
+    if compacted.was_truncated() {
+        tracing::info!(
+            "chat context compacted: session={} original_chars={} final_chars={} tool_summaries={} dropped_turns={}",
+            session.id,
+            compacted.original_chars,
+            compacted.final_chars,
+            compacted.tool_summaries_applied,
+            compacted.dropped_messages
+        );
+    }
+    // W49: hard ceiling fail-closed. Even after dropping oldest turns
+    // and pruning tool results, if the recent-N tail + system stack
+    // would push the request 60% past the soft budget we refuse to
+    // open the provider stream — better a typed `context_overflow`
+    // error than a silent provider 4xx after the round-trip cost is
+    // already burned.
+    let hard_ceiling = budget.max_total_chars.saturating_mul(8) / 5;
+    if compacted.final_chars > hard_ceiling {
+        return Err(anyhow::anyhow!(
+            "context_overflow: even after compaction the next provider request would be {} chars (~{} tokens), past the hard ceiling of {} chars (~{} tokens). Start a new session or drop large recent attachments.",
+            compacted.final_chars,
+            crate::modules::context_budget::estimate_tokens(compacted.final_chars),
+            hard_ceiling,
+            crate::modules::context_budget::estimate_tokens(hard_ceiling)
+        ));
+    }
+    Ok(compacted.messages)
 }
 
 /// Pull the user's most recent message as the retrieval query, then pack
@@ -3129,6 +3949,7 @@ fn widget_type_label(widget: &crate::models::widget::Widget) -> &'static str {
         Widget::BarGauge { .. } => "bar_gauge",
         Widget::StatusGrid { .. } => "status_grid",
         Widget::Heatmap { .. } => "heatmap",
+        Widget::Gallery { .. } => "gallery",
     }
 }
 
@@ -3222,7 +4043,9 @@ Map the user's intent to one of these patterns, then pick the widget(s):
 
 10. Explanations, runbook links, instructions - `text` with `config.format='markdown'`. Heading + bullets are rendered.
 
-11. Screenshot, generated chart image, status badge URL - `image`.
+11. Screenshot, generated chart image, status badge URL - `image`. The runtime image is clickable for fullscreen.
+
+12. Collection of images from a datasource (RSS enclosures, image-search results, media MCP tool, GitHub release assets) - `gallery`. Runtime data is an array of items with `src` (URL or path) and optional `title`, `caption`, `alt`, `source`, `link`. The pipeline MUST produce the items - never hardcode a `data` array of image URLs (the validator rejects it). Use `kind: gallery` and shape the pipeline so each item has at least `{{src}}`. Useful for image lookup ("show me cat photos"), media feeds, release screenshots.
 
 Don't repeat the same widget for the same data; combine views (KPI row + table + chart) for a complete dashboard.
 
@@ -3235,22 +4058,26 @@ Proposal JSON shape:
   "dashboard_description": "<optional>",
   "widgets": [
     {{
-      "widget_type": "stat" | "gauge" | "chart" | "table" | "text" | "image" | "logs" | "bar_gauge" | "status_grid" | "heatmap",
+      "widget_type": "stat" | "gauge" | "chart" | "table" | "text" | "image" | "logs" | "bar_gauge" | "status_grid" | "heatmap" | "gallery",
       "title": "<widget title>",
       "replace_widget_id": "<optional - existing widget id to REPLACE; omit to ADD a new one>",
       "data": <small preview sample matching the runtime shape; see below; OPTIONAL>,
       "datasource_plan": {{
-        "kind": "builtin_tool" | "mcp_tool" | "provider_prompt",
+        "kind": "builtin_tool" | "mcp_tool" | "provider_prompt" | "shared" | "compose",
         "tool_name": "<http_request OR exact MCP tool name>",
         "server_id": "<required for mcp_tool>",
         "arguments": {{ }},
         "prompt": "<required for provider_prompt>",
         "output_path": "<optional dotted path inside the result to pick as widget data>",
         "refresh_cron": "<optional 6-field cron with seconds, e.g. '0 */15 * * * *' for every 15 minutes; omit for manual-only>",
-        "pipeline": [ /* optional ordered deterministic transform steps - see Pipeline section below */ ]
+        "pipeline": [ /* optional ordered deterministic transform steps - see Pipeline section below */ ],
+        "source_key": "<required for kind='shared'; the matching shared_datasources key>",
+        "inputs": {{ /* required for kind='compose': {{ <name>: <inner BuildDatasourcePlan>, ... }} - see Compose section */ }}
       }},
       "config": {{ ...see below... }},
-      "x": <int 0..23>, "y": <int>, "w": <int 1..24>, "h": <int 1..20>
+      "size_preset": "kpi" | "half_width" | "wide_chart" | "full_width" | "table" | "text_panel" | "gallery",
+      "layout_pattern": "kpi_row" | "trend_chart_row" | "operations_table" | "datasource_overview" | "media_board" | "text_panel"
+      /* DO NOT set "x" or "y" on new widgets. Raw "w"/"h" only when no size_preset fits. */
     }}
   ],
   "remove_widget_ids": ["<optional ids of existing widgets to REMOVE>"]
@@ -3304,11 +4131,16 @@ All sizes assume a **12-col** grid. Typical sizes per widget kind:
   runtime: either `{{ cells: [{{x, y, value}}] }}` or a 2D array `[[v00, v01, ...], [v10, ...]]`.
   config: `{{ color_scheme?: 'viridis'|'magma'|'cool'|'warm'|'green_red', x_label?, y_label?, unit?, show_legend?, log_scale? }}`.
 
+- `gallery` (size w 6-12, h 5-8)
+  runtime: `{{ items: [{{src, title?, caption?, alt?, source?, link?}}] }}` produced by the pipeline. `src` may be a remote URL (image-search result, RSS enclosure, GitHub asset). Items are clickable to open the lightbox with keyboard navigation.
+  config: `{{ layout?: 'grid'|'row'|'masonry', thumbnail_aspect?: 'square'|'landscape'|'portrait'|'original', max_visible_items?: int, show_caption?: bool, show_source?: bool, fullscreen_enabled?: bool, fit?: 'cover'|'contain'|'fill', border_radius?: int }}`.
+  Pipeline pattern (image search → gallery): `[{{kind:"pick", path:"hits[*]"}}, {{kind:"map", fields:["url","title","source"], rename:{{"url":"src"}}}}, {{kind:"limit", count:24}}]`. Never bake a literal `data` array of image URLs - the validator rejects it; the pipeline must produce the items.
+
 Dashboard parameters (Grafana-style template variables)
 When the user's request implies switching between several values (project names, environments, time ranges, services, regions), declare a `parameters` entry on the proposal root and reference it as `$name` or `${{name}}` inside widget `datasource_plan.arguments` / pipeline step configs instead of hardcoding the value.
 
 How to use:
-1. Add `parameters: [{{id, name, label, kind, default?, ...}}]` to the proposal root. `name` is what the widget refs as `$name`. `kind` is one of: `static_list` (fixed dropdown), `text_input`, `time_range`, `interval`, `constant`, `mcp_query`, `http_query`.
+1. Add `parameters: [{{id, name, label, kind, default?, ...}}]` to the proposal root. `name` is what the widget refs as `$name`. `kind` is one of: `static_list` (fixed dropdown), `text_input`, `time_range`, `interval`, `constant`, `mcp_query` (live MCP tool call returns options), `http_query` (live HTTP request returns options), `datasource_query` (saved DatasourceDefinition produces options). Query-backed kinds run a pipeline tail that must shape output into `[{{label, value}}]` (or a plain array of scalars, which gets auto-doubled). Use `depends_on: ["other_param"]` to make a query parameter cascade — `$other_param` tokens inside `arguments`/`url`/`body` substitute at resolve time so "env → service" / "project → release" selectors work.
 2. Reference the parameter inside widget arguments: `"arguments": {{"project": "$project"}}`. Whole-string tokens (`"$project"`) preserve type; mixed strings (`"/api/$project/list"`) interpolate as text.
 3. Call `dry_run_widget` with `parameters` AND `parameter_values` so the dry-run substitutes a concrete value.
 
@@ -3369,6 +4201,50 @@ When to use shared vs standalone:
 - Use SHARED when 2+ widgets read from the SAME tool with the SAME arguments. Even if their per-widget pipelines diverge, the source is identical.
 - Use STANDALONE when each widget's datasource is genuinely independent (different MCP tools, different HTTP endpoints, or same tool with very different arguments).
 - Don't pre-aggregate in the shared pipeline - keep it close to the raw API shape so each consumer can navigate freely. Apply expensive base trims (e.g. `pick "data.items"`) in shared, leave specific filters/sorts/limits to consumers.
+
+Compose datasources (one widget reads from N sources)
+When the user asks for a SINGLE widget that combines data from two or more distinct sources (e.g. "show weather AND air quality together", "summarize commits plus incidents", "table of cities with temperature, AQI, and population"), use `kind: "compose"` on that widget. The widget runs each inner input independently, then the merged object `{{ name1: <output1>, name2: <output2>, ... }}` is fed to the widget's own `pipeline` and `output_path`.
+
+How to use:
+1. Set the widget's `datasource_plan` to `{{kind: "compose", inputs: {{ name1: <plan>, name2: <plan>, ... }}, pipeline?: [...], output_path?: "..." }}`.
+2. Each inner `<plan>` is a regular `BuildDatasourcePlan` — `mcp_tool`, `builtin_tool`, `provider_prompt`, or `shared` (referencing `proposal.shared_datasources`). Inner inputs CANNOT themselves be `compose` (one level only).
+3. The widget's outer `pipeline` operates on the merged object. Use `pick "name1"` / `pick "name2"` to navigate, `format "{{...}}"` or `llm_postprocess` for human-readable summaries, etc. Stat/Gauge widgets still need a final number; Table widgets still need an array of objects.
+4. Refresh cron lives on the OUTER compose plan, not on inner inputs.
+5. If inputs read sources also used by OTHER widgets, declare those sources as `shared_datasources` and have each compose input use `{{kind:"shared", source_key:"<key>"}}` so the fetch isn't duplicated.
+
+Example: a single widget that combines two independent sources into one summary
+```
+shared_datasources: [
+  {{key: "primary_metric", kind: "builtin_tool", tool_name: "http_request",
+    arguments: {{method: "GET", url: "https://api.example.com/primary"}}}},
+  {{key: "secondary_metric", kind: "builtin_tool", tool_name: "http_request",
+    arguments: {{method: "GET", url: "https://api.example.com/secondary"}}}}
+]
+widgets: [
+  // ... per-source widgets reading shared keys directly ...
+  {{
+    title: "Combined summary",
+    widget_type: "text",
+    datasource_plan: {{
+      kind: "compose",
+      inputs: {{
+        primary: {{kind: "shared", source_key: "primary_metric", pipeline: [{{kind: "pick", path: "current.value"}}]}},
+        secondary: {{kind: "shared", source_key: "secondary_metric", pipeline: [{{kind: "pick", path: "current.value"}}]}}
+      }},
+      pipeline: [
+        {{kind: "format", template: "Primary **{{primary}}**, secondary **{{secondary}}**."}}
+      ]
+    }}
+  }}
+]
+```
+
+Example: a table joining rows from two sources by a shared key (e.g. id, name, region). Outer pipeline picks each input out of the merged object and emits the row array via `llm_postprocess` (or a deterministic `set`+`format` recipe) so each row carries fields from both sources.
+
+When to use compose vs standalone widgets:
+- Use COMPOSE when ONE widget must show values derived from 2+ sources together (a combined summary, a stat showing X/Y, a table joined by key).
+- Use SEPARATE widgets when the values are independent and the user is fine seeing them side-by-side. Don't reach for compose just to "tidy up" the dashboard.
+- The compose dry_run runs every inner fetch, so it costs as many HTTP/MCP calls as it has inputs. Keep inputs minimal.
 
 Self-testing widgets with `dry_run_widget`
 - Before emitting the final proposal JSON, CALL `dry_run_widget` once per non-trivial widget. The tool builds the workflow, runs the datasource_plan + pipeline once with no persistence, and returns the actual widget runtime data or an error.
@@ -3432,29 +4308,30 @@ Pipeline rules
 - For bar_gauge top-N: pick -> sort desc -> limit N -> map to {{name, value}}.
 - Don't put `llm_postprocess` inside cron-refreshed widgets unless the user explicitly accepts the cost. Default to fully deterministic.
 
-Layout grid
-- The grid is **12 columns** wide. Y grows downward.
-- **DO NOT set `x` or `y` on widgets.** The apply pipeline ALWAYS auto-packs new widgets row-first (left-to-right, top-to-bottom) on the 12-col grid using just `w` and `h`. Any `x`/`y` you supply is ignored. This is intentional: model-supplied positions consistently leave gaps.
-- The widgets appear on the dashboard in the order you list them in `proposal.widgets`. Put related KPIs adjacent in the array and the auto-packer will keep them in the same row.
-- Pick `w` so that several widgets together fill the row to 12:
-    * 4 small stats per row -> w: 3 each (3+3+3+3 = 12).
-    * 3 medium stats -> w: 4 each (4+4+4 = 12).
-    * 2 stats + half chart -> w: 3,3,6.
-    * 1 chart full width -> w: 12.
-    * 1 chart + 1 bar_gauge -> w: 7,5 or 8,4.
-    * Wide table -> w: 12.
-- Pick `h` so the widget has room to render:
-    * stat: 2.
-    * gauge: 4.
-    * chart: 5-7.
-    * table: 6-10.
-    * status_grid / bar_gauge: 4-5.
-    * logs / heatmap: 6-8.
-- Typical Grafana-style layout (each row sums to 12):
-    * Row 1: 4 stats at w=3, h=2 each (KPI strip).
-    * Row 2: chart w=8, status_grid w=4, h=5.
-    * Row 3: full-width table w=12, h=8.
-    * Optional: logs or heatmap full-width below.
+Layout grid (W45)
+- The grid is **12 columns** wide. Y grows downward. Auto-pack packs new widgets row-first using just `w`/`h`; order in `proposal.widgets` defines the row.
+- **DO NOT set `x` or `y` on widgets.** The validator now FAILS the proposal with `proposed_explicit_coordinates` if you do.
+- Prefer a **named `size_preset`** over raw `w`/`h`. Setting both fails the validator with `conflicting_layout_fields`. Pick ONE per new widget:
+    * `kpi` — small KPI card (stat: 3x2, gauge: 3x3, bar_gauge: 4x3). 4 per row.
+    * `half_width` — half-row panel (~6 cols wide, 4-6 high). Use for chart-next-to-status, side-by-side comparisons.
+    * `wide_chart` — chart or bar_gauge spanning 8 cols. Pair with a 4-col `kpi`/`half_width` neighbor to fill the row.
+    * `full_width` — full 12-col panel, modest height (chart/heatmap/bar_gauge/gallery).
+    * `table` — wide tabular block (table: 12x8, logs: 12x7). Use for scannable rows.
+    * `text_panel` — markdown panel (6x4).
+    * `gallery` — image gallery / image card (8x6).
+- Also pick a `layout_pattern` to signal intent (does not change packing, but helps future tooling):
+    * `kpi_row` — 3-6 stat widgets across the top.
+    * `trend_chart_row` — wide chart leading a row.
+    * `operations_table` — full-width table row.
+    * `datasource_overview` — status_grid + supporting stats.
+    * `media_board` — gallery + image cards.
+    * `text_panel` — markdown panel with supporting metrics.
+- Raw `w`/`h` is still accepted when no preset fits, but `size_preset` is the preferred default.
+- Typical layouts (each row sums to 12 via presets):
+    * Executive: row 1 = 4x `kpi` stat; row 2 = `wide_chart` (8) + `kpi` gauge x2 (3+3 not 4 — use `half_width` chart + 2x kpi gauges instead); row 3 = `table`.
+    * Operations: row 1 = `kpi` strip; row 2 = `wide_chart` + `half_width` status_grid; row 3 = `table` logs.
+    * Media: row 1 = `kpi`; row 2 = `full_width` gallery; row 3 = `text_panel` summary.
+- Replacement widgets (`replace_widget_id` set): the layout gate is skipped; the new widget inherits the old slot's position. You may still set `size_preset` to resize the replacement.
 
 Text widget content (READ THIS BEFORE WRITING A `text` WIDGET)
 - `text` widget runtime data is a STRING that goes through the markdown renderer. NEVER put a JSON object/array as the widget data - it will render as raw `{{...}}` text and look like a bug.
@@ -3478,8 +4355,7 @@ Rules
 
 Current time: {now}."#
     );
-    body
-        .replace("<<MCP_EXAMPLE_SERVER>>", &example_server)
+    body.replace("<<MCP_EXAMPLE_SERVER>>", &example_server)
         .replace("<<MCP_EXAMPLE_TOOL>>", &example_tool)
 }
 
@@ -3626,6 +4502,41 @@ async fn chat_tool_specs(
         }),
     });
 
+    // W51: bounded raw-artifact slice recovery. The compressor wraps
+    // bulky tool results into a compact summary plus a `raw_artifact_id`
+    // pointer; this tool lets the agent ask for a small JSON-pointer
+    // slice, row window, or byte slice of the raw payload when the
+    // compact summary intentionally hid the detail it needs.
+    specs.push(inspect_artifact_tool_spec());
+
+    // W37: enabled external sources (HN search, Wikipedia, CoinGecko,
+    // public GitHub repo metadata, etc.) appear as first-class typed
+    // tools so the LLM does not have to guess endpoints with raw
+    // http_request. Disabled / blocked / credential-missing sources are
+    // filtered out before this point and never reach the LLM.
+    match crate::commands::external_source::list_runnable_external_sources(state).await {
+        Ok(runnable) => {
+            for (source, descriptor) in runnable {
+                specs.push(AIToolSpec {
+                    name: descriptor.tool_name,
+                    description: format!(
+                        "{}{}",
+                        descriptor.description,
+                        source
+                            .attribution
+                            .as_deref()
+                            .map(|a| format!(" (Attribution: {})", a))
+                            .unwrap_or_default()
+                    ),
+                    parameters: descriptor.parameters_schema,
+                });
+            }
+        }
+        Err(error) => {
+            tracing::warn!("W37: skipping external source tool specs: {}", error);
+        }
+    }
+
     // Dry-run tool - lets the agent validate a single widget proposal by
     // building its workflow, executing it once with no persistence, and
     // returning the widget runtime data (or the error). Use BEFORE emitting
@@ -3634,7 +4545,7 @@ async fn chat_tool_specs(
     // aggregates, anything with `llm_postprocess`.
     specs.push(AIToolSpec {
         name: "dry_run_widget".to_string(),
-        description: "Test a single widget proposal end-to-end without persisting anything: builds the workflow, runs the datasource_plan + pipeline once, and returns the actual widget runtime data or the error. Use this BEFORE committing widgets to the final dashboard proposal so you can verify the pipeline produces the right shape (a number for stat/gauge, an array of objects for chart/table, etc.). Cheap to call. For widgets with datasource_plan.kind='shared', ALSO pass the matching `shared_datasources` entry so the dry run can inline the source + base pipeline. If the widget references `$param` tokens, pass `parameters` (declarations) and `parameter_values` (concrete values) so substitution happens at dry-run time.".to_string(),
+        description: "Test a single widget proposal end-to-end without persisting anything: builds the workflow, runs the datasource_plan + pipeline once, and returns the actual widget runtime data or the error. Use this BEFORE committing widgets to the final dashboard proposal so you can verify the pipeline produces the right shape (a number for stat/gauge, an array of objects for chart/table, etc.). Cheap to call.\n\nCALL SHAPE — wrap the widget under the `proposal` key, not at the top level:\n```\n{\n  \"proposal\": { \"widget_type\": \"stat\", \"title\": \"Tokyo · Temperature\", \"datasource_plan\": {...}, \"config\": {...}, \"size_preset\": \"kpi\" },\n  \"shared_datasources\": [ { \"key\": \"forecast\", \"kind\": \"builtin_tool\", \"tool_name\": \"http_request\", \"arguments\": {...}, \"pipeline\": [...] } ]\n}\n```\n\nVALIDATION BINDING — the final-proposal validator binds dry-run evidence to widget titles. `proposal.title` MUST equal the exact title of the widget you will emit (punctuation, casing, whitespace; the matcher is also punctuation-insensitive). If you plan to ship many near-identical widgets that share the SAME pipeline shape (e.g. one stat per city), do ONE dry-run for the representative and pass `titles_covered` listing every final title it stands in for — the validator treats each entry as if it had its own successful dry-run.\n\nFor widgets with datasource_plan.kind='shared', ALSO pass the matching `shared_datasources` entry so the dry-run can inline the source + base pipeline. If the widget references `$param` tokens, pass `parameters` (declarations) and `parameter_values` (concrete values) so substitution happens at dry-run time.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -3647,6 +4558,11 @@ async fn chat_tool_specs(
                     "type": "array",
                     "description": "Optional list of SharedDatasource entries the widget might reference via source_key. Required when proposal.datasource_plan.kind='shared'.",
                     "items": { "type": "object", "additionalProperties": true }
+                },
+                "titles_covered": {
+                    "type": "array",
+                    "description": "Optional list of additional widget titles this dry-run stands in for. Use when several final widgets share the SAME pipeline shape (e.g. one stat per city). Each title behaves as if it had its own successful dry-run for validator purposes.",
+                    "items": { "type": "string" }
                 },
                 "parameters": {
                     "type": "array",
@@ -3728,7 +4644,53 @@ async fn chat_tool_specs_silent(
             }),
         });
     }
+    // W51: mirror the streaming-path inspect_artifact registration so
+    // silent retries can recover bounded raw detail too.
+    specs.push(inspect_artifact_tool_spec());
+    // W37: same external source injection as the streaming path so
+    // silent retries (validation-failure retries, build re-prompts) see
+    // an identical tool surface.
+    if let Ok(runnable) =
+        crate::commands::external_source::list_runnable_external_sources(state).await
+    {
+        for (source, descriptor) in runnable {
+            specs.push(AIToolSpec {
+                name: descriptor.tool_name,
+                description: format!(
+                    "{}{}",
+                    descriptor.description,
+                    source
+                        .attribution
+                        .as_deref()
+                        .map(|a| format!(" (Attribution: {})", a))
+                        .unwrap_or_default()
+                ),
+                parameters: descriptor.parameters_schema,
+            });
+        }
+    }
     Ok(specs)
+}
+
+/// W51: shared `inspect_artifact` tool spec so both the streaming and
+/// silent tool catalogs use identical schemas.
+fn inspect_artifact_tool_spec() -> AIToolSpec {
+    AIToolSpec {
+        name: "inspect_artifact".to_string(),
+        description: "Request a bounded slice of a previous tool result's raw payload. Datrina compresses bulky tool results (HTTP, MCP, datasource, pipeline) and stores the redacted raw locally; the compact summary you saw includes a `raw_artifact_id` and `truncation` markers that name exactly which slice was hidden. Use this tool when the compact summary omitted a value you need. Returns the slice plus its byte/row metadata; never echoes secrets.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": { "type": "string", "description": "The `raw_artifact_id` value from a previous tool result's `_compression` block." },
+                "path": { "type": "string", "description": "Optional JSON pointer (`/foo/bar` or `$.foo.bar`) into the raw payload. Default: whole payload." },
+                "row_start": { "type": "integer", "minimum": 0, "description": "If the slice is an array, start index. Default 0." },
+                "row_limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "If the slice is an array, max rows to return. Default 20, hard cap 200." },
+                "byte_limit": { "type": "integer", "minimum": 256, "maximum": 32000, "description": "Hard cap on the returned slice serialisation. Default 8000, hard cap 32000." }
+            },
+            "required": ["artifact_id"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 async fn reconnect_enabled_mcp_servers_silent(
@@ -3854,25 +4816,29 @@ async fn execute_dry_run_widget(
         }
     }
 
-    let provider = {
-        let providers = state.storage.list_providers().await?;
-        let active_id = state
-            .storage
-            .get_config("active_provider_id")
-            .await?
-            .filter(|id| !id.trim().is_empty());
-        active_id
-            .as_deref()
-            .and_then(|id| providers.iter().find(|p| p.id == id && p.is_enabled))
-            .or_else(|| providers.iter().find(|p| p.is_enabled))
-            .cloned()
+    // W29: dry-run does not strictly require a provider — pipelines
+    // without an `llm_postprocess` step run fine. If the operator hasn't
+    // picked an active provider yet, fall through without one; the
+    // workflow engine reports a clear error if an LLM step is reached
+    // without a provider.
+    let provider = match crate::resolve_active_provider(state.storage.as_ref()).await? {
+        Ok(provider) => Some(provider),
+        Err(_setup_error) => None,
     };
+    // W47: chat-driven dry runs inherit the app default language;
+    // dashboard/session scope isn't surfaced from here.
+    let language_directive =
+        crate::commands::language::resolve_effective_language(state.storage.as_ref(), None, None)
+            .await
+            .ok()
+            .and_then(|resolved| resolved.system_directive());
     let engine = crate::modules::workflow_engine::WorkflowEngine::with_runtime(
         state.tool_engine.as_ref(),
         state.mcp_manager.as_ref(),
         state.ai_engine.as_ref(),
         provider,
-    );
+    )
+    .with_language(language_directive);
     let started = std::time::Instant::now();
     let execution = engine.execute(&workflow, None).await?;
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -3980,9 +4946,19 @@ async fn execute_chat_tool(
             mcp_result
         }
         "dry_run_widget" => {
-            let proposal_value = call.arguments.get("proposal").cloned().unwrap_or_else(|| {
-                serde_json::Value::Object(call.arguments.as_object().cloned().unwrap_or_default())
-            });
+            // Be forgiving about how the model wraps the proposal. Models
+            // alternate between {proposal: {...}}, {widget: {...}}, and
+            // flattened-fields shapes; all carry the same payload.
+            let proposal_value = call
+                .arguments
+                .get("proposal")
+                .or_else(|| call.arguments.get("widget"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    serde_json::Value::Object(
+                        call.arguments.as_object().cloned().unwrap_or_default(),
+                    )
+                });
             let shared_value = call.arguments.get("shared_datasources").cloned();
             let parameters_value = call.arguments.get("parameters").cloned();
             let parameter_values_value = call.arguments.get("parameter_values").cloned();
@@ -3996,26 +4972,273 @@ async fn execute_chat_tool(
             .await
         }
         "recall" => execute_recall_tool(state, session, &call.arguments).await,
-        _ => Err(anyhow::anyhow!(
-            "Tool '{}' is not exposed to chat tool calling",
-            call.name
-        )),
+        // W51: bounded raw artifact detail recovery. Lives inside the
+        // chat tool dispatcher so it inherits MAX_TOOL_ITERATIONS,
+        // loop-detection, cost budget, and the same policy boundary as
+        // every other tool. Never registered as a public Tauri command.
+        "inspect_artifact" => execute_inspect_artifact_tool(state, session, &call.arguments).await,
+        other => {
+            if let Some(source_id) =
+                crate::commands::external_source::parse_external_source_tool_name(other)
+            {
+                crate::commands::external_source::run_external_source_tool(
+                    state,
+                    source_id,
+                    &call.arguments,
+                )
+                .await
+            } else {
+                Err(anyhow::anyhow!(
+                    "Tool '{}' is not exposed to chat tool calling",
+                    call.name
+                ))
+            }
+        }
     };
 
     match outcome {
-        Ok(result) => ToolResult {
-            tool_call_id: call.id.clone(),
-            name: call.name.clone(),
-            result,
-            error: None,
-        },
+        Ok(result) => maybe_compress_tool_result(state, session, call, result).await,
         Err(error) => ToolResult {
             tool_call_id: call.id.clone(),
             name: call.name.clone(),
             result: serde_json::json!({ "status": "error" }),
             error: Some(error.to_string()),
+            compression: None,
         },
     }
+}
+
+/// W51: route every successful tool result through
+/// [`crate::modules::context_compressor`] before the provider sees it.
+/// The compact value replaces `ToolResult.result` so both the persisted
+/// session and the next provider turn carry the same compact shape.
+/// The redacted raw payload is retained locally in
+/// [`crate::modules::storage::Storage::raw_artifacts`] so chat trace,
+/// Pipeline Debug, and the model (via `inspect_artifact`) can request
+/// bounded detail later. The `inspect_artifact` tool itself is exempt
+/// from compression so the agent receives the literal slice it asked
+/// for.
+async fn maybe_compress_tool_result(
+    state: &AppState,
+    session: &ChatSession,
+    call: &crate::models::chat::ToolCall,
+    raw: serde_json::Value,
+) -> ToolResult {
+    use crate::modules::context_compressor::{compress, CompressionProfile};
+
+    if call.name == "inspect_artifact" {
+        return ToolResult {
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+            result: raw,
+            error: None,
+            compression: None,
+        };
+    }
+
+    let raw_size = serde_json::to_string(&raw).map(|s| s.len()).unwrap_or(0);
+    let profile = CompressionProfile::for_tool(&call.name);
+    let mut artifact = compress(profile, &raw);
+    // Only persist a raw artifact when we actually saved meaningful
+    // bytes — small results stay in `ToolResult.result` verbatim.
+    let should_retain = artifact.raw_bytes >= 2_000
+        && artifact.raw_bytes.saturating_sub(artifact.compact_bytes) > 512;
+    if should_retain {
+        let payload_json = serde_json::to_string(&raw).unwrap_or_default();
+        let checksum = format!("{:x}", md5_sum(&payload_json));
+        match state
+            .storage
+            .store_raw_artifact(
+                "chat_session",
+                &session.id,
+                profile.as_str(),
+                artifact.raw_bytes,
+                artifact.compact_bytes,
+                &checksum,
+                1,
+                "ephemeral",
+                &payload_json,
+            )
+            .await
+        {
+            Ok(id) => {
+                artifact = artifact.with_raw_artifact_ref(id.clone());
+                // Best-effort cap: keep the most recent 50 ephemeral
+                // artifacts per session so the table stays bounded.
+                if let Err(e) = state
+                    .storage
+                    .prune_raw_artifacts("chat_session", &session.id, 50)
+                    .await
+                {
+                    tracing::warn!("W51: prune_raw_artifacts failed: {}", e);
+                }
+                let _ = id;
+            }
+            Err(e) => {
+                tracing::warn!("W51: store_raw_artifact failed: {}", e);
+            }
+        }
+    }
+
+    let truncation_paths: Vec<String> = artifact
+        .truncation
+        .iter()
+        .map(|marker| marker.path.clone())
+        .collect();
+    let compression = crate::models::chat::ToolResultCompression {
+        profile: artifact.profile.as_str().to_string(),
+        raw_bytes: artifact.raw_bytes,
+        compact_bytes: artifact.compact_bytes,
+        estimated_tokens_saved: artifact.estimated_tokens_saved,
+        raw_artifact_id: artifact.raw_artifact_ref.clone(),
+        truncation_paths,
+    };
+    // Decide what `ToolResult.result` should carry: when the payload
+    // was small enough to skip retention, leave the raw value so the
+    // local session stays high-fidelity. Otherwise persist the compact
+    // value (with a `_artifact_id` pointer when one exists) so both
+    // the session and the provider see the same compressed shape.
+    let result_value = if should_retain {
+        let _ = raw_size;
+        artifact.compact.clone()
+    } else {
+        raw
+    };
+    ToolResult {
+        tool_call_id: call.id.clone(),
+        name: call.name.clone(),
+        result: result_value,
+        error: None,
+        compression: Some(compression),
+    }
+}
+
+/// Lightweight MD5 over the artifact bytes for the `raw_artifacts`
+/// checksum column. Not security-sensitive — used only to detect
+/// duplicate persists and verify integrity in debug surfaces.
+fn md5_sum(input: &str) -> u128 {
+    // Tiny FNV-1a fallback so we don't pull in another crate just for
+    // a debug checksum. Collision risk is acceptable for the dedup
+    // hint use case.
+    let mut hash: u128 = 0xcbf29ce484222325;
+    for byte in input.bytes() {
+        hash ^= byte as u128;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// W51: bounded raw-artifact slice the agent can request via the
+/// `inspect_artifact` tool. Returns the raw JSON pointer slice (or
+/// line range / row window) capped by `byte_limit`. Fails closed when
+/// the artifact id is unknown, expired, or unsafe to expose.
+async fn execute_inspect_artifact_tool(
+    state: &AppState,
+    session: &ChatSession,
+    arguments: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let artifact_id = arguments
+        .get("artifact_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("inspect_artifact: 'artifact_id' is required"))?;
+    let pointer = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let row_start = arguments
+        .get("row_start")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let row_limit = arguments
+        .get("row_limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(20)
+        .min(200) as usize;
+    let byte_limit = arguments
+        .get("byte_limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(8_000)
+        .min(32_000) as usize;
+
+    let record = state
+        .storage
+        .get_raw_artifact(&artifact_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "inspect_artifact: artifact '{}' not found (already pruned or never written)",
+                artifact_id
+            )
+        })?;
+
+    if record.owner_kind != "chat_session" || record.owner_id != session.id {
+        return Err(anyhow::anyhow!(
+            "inspect_artifact: artifact '{}' does not belong to this session",
+            artifact_id
+        ));
+    }
+
+    let raw: serde_json::Value = serde_json::from_str(&record.payload_json)
+        .map_err(|e| anyhow::anyhow!("inspect_artifact: raw payload is not valid JSON: {}", e))?;
+
+    let scoped = if let Some(ptr) = pointer.as_deref() {
+        let json_pointer = if ptr.starts_with('/') {
+            ptr.to_string()
+        } else {
+            format!(
+                "/{}",
+                ptr.trim_start_matches('$')
+                    .trim_start_matches('.')
+                    .replace('.', "/")
+            )
+        };
+        raw.pointer(&json_pointer).cloned().ok_or_else(|| {
+            anyhow::anyhow!("inspect_artifact: path '{}' not found in artifact", ptr)
+        })?
+    } else {
+        raw
+    };
+
+    let scoped = match scoped {
+        serde_json::Value::Array(items) => {
+            let end = (row_start + row_limit).min(items.len());
+            let slice: Vec<serde_json::Value> = items
+                .iter()
+                .skip(row_start)
+                .take(row_limit)
+                .cloned()
+                .collect();
+            serde_json::json!({
+                "kind": "array_slice",
+                "row_start": row_start,
+                "row_end": end,
+                "total_rows": items.len(),
+                "rows": slice,
+            })
+        }
+        other => other,
+    };
+
+    let encoded = serde_json::to_string(&scoped).unwrap_or_default();
+    let bounded = if encoded.len() > byte_limit {
+        serde_json::json!({
+            "kind": "byte_truncated",
+            "byte_limit": byte_limit,
+            "char_count": encoded.chars().count(),
+            "hint": "slice exceeded byte_limit; re-call inspect_artifact with a narrower path or row_window",
+        })
+    } else {
+        scoped
+    };
+
+    Ok(serde_json::json!({
+        "artifact_id": record.id,
+        "profile": record.profile,
+        "raw_size": record.raw_size,
+        "compact_size": record.compact_size,
+        "slice": bounded,
+    }))
 }
 
 async fn execute_recall_tool(
@@ -4638,7 +5861,9 @@ mod tests {
             total_output_tokens: 0,
             total_reasoning_tokens: 0,
             total_cost_usd: spent,
+            cost_unknown_turns: 0,
             max_cost_usd: cap,
+            language_override: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -4695,12 +5920,128 @@ mod tests {
             prompt: 1_000_000,
             completion: 1_000_000,
             reasoning: None,
+            provider_cost_usd: None,
         };
-        let cost = accumulate_session_usage(&mut session, Some(&tokens), Some(pricing));
+        let turn = accumulate_session_usage(&mut session, Some(&tokens), Some(pricing));
         assert_eq!(session.total_input_tokens, 1_000_000);
         assert_eq!(session.total_output_tokens, 1_000_000);
         assert!((session.total_cost_usd - 4.0).abs() < 1e-9);
-        assert!((cost.unwrap() - 4.0).abs() < 1e-9);
+        let turn = turn.expect("turn cost emitted");
+        assert!((turn.amount_usd.unwrap() - 4.0).abs() < 1e-9);
+        assert_eq!(
+            turn.source,
+            crate::models::pricing::CostSource::PricingTable
+        );
+        assert_eq!(session.cost_unknown_turns, 0);
+    }
+
+    #[test]
+    fn accumulate_session_prefers_provider_total_cost() {
+        // W49: when the provider already billed the turn (OpenRouter
+        // `usage.cost`), accounting uses that figure verbatim rather
+        // than re-deriving it from tokens × pricing-table.
+        let mut session = empty_session_with_cap(None, 0.0);
+        let pricing = ModelPricing {
+            input_usd_per_1m: 1.0,
+            output_usd_per_1m: 3.0,
+            reasoning_usd_per_1m: None,
+        };
+        let tokens = TokenUsage {
+            prompt: 1_000_000,
+            completion: 1_000_000,
+            reasoning: None,
+            provider_cost_usd: Some(0.42),
+        };
+        let turn = accumulate_session_usage(&mut session, Some(&tokens), Some(pricing))
+            .expect("turn cost emitted");
+        assert_eq!(
+            turn.source,
+            crate::models::pricing::CostSource::ProviderTotal
+        );
+        assert!((turn.amount_usd.unwrap() - 0.42).abs() < 1e-9);
+        assert!((session.total_cost_usd - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn accumulate_session_unknown_pricing_marks_turn_not_zero() {
+        // W49: tokens with no pricing entry must surface as
+        // `unknown_pricing`, never as a silent $0 contribution.
+        let mut session = empty_session_with_cap(None, 0.0);
+        let tokens = TokenUsage {
+            prompt: 1_000,
+            completion: 500,
+            reasoning: None,
+            provider_cost_usd: None,
+        };
+        let turn = accumulate_session_usage(&mut session, Some(&tokens), None)
+            .expect("turn emitted even without pricing");
+        assert!(turn.amount_usd.is_none());
+        assert_eq!(
+            turn.source,
+            crate::models::pricing::CostSource::UnknownPricing
+        );
+        assert_eq!(session.total_input_tokens, 1_000);
+        assert_eq!(session.total_output_tokens, 500);
+        assert_eq!(session.total_cost_usd, 0.0);
+        assert_eq!(session.cost_unknown_turns, 1);
+    }
+
+    #[test]
+    fn widget_mentions_roundtrip_via_send_request() {
+        // W38: SendMessageRequest must accept widget_mentions on the
+        // wire shape the frontend sends.
+        let wire = serde_json::json!({
+            "content": "fix this",
+            "widget_mentions": [
+                {"widget_id": "w_alpha", "label": "Alpha", "widget_kind": "stat"},
+                {"widget_id": "w_alpha", "label": "Alpha duplicate"},
+            ]
+        });
+        let req: crate::models::chat::SendMessageRequest =
+            serde_json::from_value(wire).expect("parses");
+        assert_eq!(req.widget_mentions.len(), 2);
+        let resolved = resolve_widget_mentions(&req.widget_mentions, Some("dash-1"));
+        // Duplicates dropped, dashboard id stamped onto each entry.
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].widget_id, "w_alpha");
+        assert_eq!(resolved[0].dashboard_id.as_deref(), Some("dash-1"));
+        // target_widget_ids_from yields the user's scope verbatim.
+        let ids = target_widget_ids_from(&resolved);
+        assert_eq!(ids, vec!["w_alpha".to_string()]);
+    }
+
+    #[test]
+    fn widget_mentions_dedupe_preserves_distinct_ids_for_duplicate_titles() {
+        // Two widgets with the same title but distinct ids — both must
+        // survive resolution since `widget_id` is the dedupe key.
+        let mentions = vec![
+            crate::models::chat::WidgetMention {
+                widget_id: "w_a".into(),
+                dashboard_id: None,
+                label: "Active users".into(),
+                widget_kind: Some("stat".into()),
+            },
+            crate::models::chat::WidgetMention {
+                widget_id: "w_b".into(),
+                dashboard_id: None,
+                label: "Active users".into(),
+                widget_kind: Some("stat".into()),
+            },
+        ];
+        let resolved = resolve_widget_mentions(&mentions, None);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].widget_id, "w_a");
+        assert_eq!(resolved[1].widget_id, "w_b");
+    }
+
+    #[test]
+    fn send_request_defaults_when_mentions_field_omitted() {
+        // Legacy frontends that don't yet send widget_mentions must
+        // still parse (default == empty list).
+        let wire = serde_json::json!({"content": "hi"});
+        let req: crate::models::chat::SendMessageRequest =
+            serde_json::from_value(wire).expect("parses without widget_mentions");
+        assert!(req.widget_mentions.is_empty());
     }
 
     #[test]
@@ -4710,12 +6051,19 @@ mod tests {
             prompt: 100,
             completion: 50,
             reasoning: Some(20),
+            provider_cost_usd: None,
         };
-        let cost = accumulate_session_usage(&mut session, Some(&tokens), None);
+        let turn =
+            accumulate_session_usage(&mut session, Some(&tokens), None).expect("turn emitted");
         assert_eq!(session.total_input_tokens, 100);
         assert_eq!(session.total_output_tokens, 50);
         assert_eq!(session.total_reasoning_tokens, 20);
         assert_eq!(session.total_cost_usd, 0.0);
-        assert!(cost.is_none());
+        assert_eq!(
+            turn.source,
+            crate::models::pricing::CostSource::UnknownPricing
+        );
+        assert!(turn.amount_usd.is_none());
+        assert_eq!(session.cost_unknown_turns, 1);
     }
 }

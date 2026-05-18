@@ -14,6 +14,53 @@ pub struct UsageReport {
     pub total_tokens: u32,
 }
 
+/// W49: provenance of a single turn's `cost_usd` value. Persisted so the
+/// UI can render `unknown cost` instead of `$0.000000` when pricing was
+/// missing, and so operators can tell at a glance whether the figure
+/// came from the provider's own billing field or from the local pricing
+/// table.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CostSource {
+    /// Provider returned `usage.cost` (OpenRouter, some upstream proxies).
+    ProviderTotal,
+    /// Local pricing table (seed or `pricing_overrides.json`).
+    PricingTable,
+    /// Tokens were known but no pricing entry matched — total is
+    /// undefined for this turn. UI renders this as `unknown cost`.
+    UnknownPricing,
+}
+
+/// W49: combined outcome of pricing a single assistant turn. `amount_usd
+/// = None` is the explicit unknown-cost case; callers must not silently
+/// coerce that to `0.0`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TurnCost {
+    pub amount_usd: Option<f64>,
+    pub source: CostSource,
+}
+
+impl TurnCost {
+    pub fn provider_total(amount: f64) -> Self {
+        Self {
+            amount_usd: Some(amount),
+            source: CostSource::ProviderTotal,
+        }
+    }
+    pub fn pricing_table(amount: f64) -> Self {
+        Self {
+            amount_usd: Some(amount),
+            source: CostSource::PricingTable,
+        }
+    }
+    pub fn unknown() -> Self {
+        Self {
+            amount_usd: None,
+            source: CostSource::UnknownPricing,
+        }
+    }
+}
+
 impl UsageReport {
     pub fn new(prompt: u32, completion: u32, reasoning: Option<u32>) -> Self {
         let total = prompt
@@ -244,10 +291,7 @@ pub fn pricing_for(
         }
     }
 
-    if matches!(
-        provider_kind,
-        ProviderKind::LocalMock | ProviderKind::Ollama
-    ) {
+    if matches!(provider_kind, ProviderKind::Ollama) {
         return None;
     }
 
@@ -282,8 +326,8 @@ mod tests {
     }
 
     #[test]
-    fn local_mock_has_no_price() {
-        assert!(pricing_for(ProviderKind::LocalMock, "anything", &[]).is_none());
+    fn ollama_has_no_price() {
+        assert!(pricing_for(ProviderKind::Ollama, "anything", &[]).is_none());
     }
 
     #[test]

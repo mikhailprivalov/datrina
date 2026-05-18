@@ -36,6 +36,7 @@ pub async fn add_provider(
         default_model: req.default_model,
         models: req.models.unwrap_or_default(),
         is_enabled: true,
+        is_unsupported: false,
     };
 
     if let Err(e) = crate::modules::ai::validate_provider(&provider) {
@@ -104,6 +105,14 @@ pub async fn update_provider(
         provider.is_enabled = is_enabled;
     }
 
+    // W29: editing a legacy `unsupported` row through the standard
+    // update path re-stamps it as a real product provider as long as
+    // the caller has switched it to a supported `kind` and it now
+    // validates. If they tried to leave it on the legacy kind, the
+    // typed update request can't even express that (the union doesn't
+    // include `local_mock`), so the field flip is implicit.
+    provider.is_unsupported = false;
+
     if let Err(e) = crate::modules::ai::validate_provider(&provider) {
         return Ok(ApiResult::err(e.to_string()));
     }
@@ -129,6 +138,11 @@ pub async fn set_provider_enabled(
         Err(e) => return Ok(ApiResult::err(e.to_string())),
     };
 
+    if is_enabled && provider.is_unsupported {
+        return Ok(ApiResult::err(
+            "provider_unsupported: this provider uses a legacy kind that is no longer supported. Edit it to a supported kind (OpenRouter, Ollama, or Custom) before enabling.".to_string(),
+        ));
+    }
     provider.is_enabled = is_enabled;
     if is_enabled {
         if let Err(e) = crate::modules::ai::validate_provider(&provider) {

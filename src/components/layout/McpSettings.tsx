@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { mcpApi } from '../../lib/api';
+import { mcpApi, toolApi } from '../../lib/api';
 import type { MCPServer, MCPTool } from '../../lib/api';
 
 interface Props {
@@ -234,6 +234,8 @@ export function McpSettings({ onClose }: Props) {
             {error ?? status}
           </div>
         )}
+
+        <HttpDefaultsRow onError={setError} onStatus={setStatus} />
 
         <div className="flex-1 overflow-auto p-5 space-y-3">
           {draft && (
@@ -472,6 +474,79 @@ function DraftCard({
             {busy ? 'Saving...' : 'Save server'}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function HttpDefaultsRow({
+  onStatus,
+  onError,
+}: {
+  onStatus: (msg: string | null) => void;
+  onError: (msg: string | null) => void;
+}) {
+  const [ua, setUa] = useState('');
+  const [original, setOriginal] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    toolApi
+      .getHttpUserAgent()
+      .then(value => {
+        if (cancelled) return;
+        setUa(value);
+        setOriginal(value);
+      })
+      .catch(err => onError(formatError(err)));
+    return () => {
+      cancelled = true;
+    };
+  }, [onError]);
+
+  const dirty = ua !== original;
+
+  const save = async () => {
+    setBusy(true);
+    onError(null);
+    try {
+      const resolved = await toolApi.setHttpUserAgent(ua);
+      setUa(resolved);
+      setOriginal(resolved);
+      onStatus(`HTTP User-Agent updated`);
+    } catch (err) {
+      onError(formatError(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border-b border-border px-5 py-3 bg-muted/10">
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+            // http User-Agent
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            Sent on every <code className="font-mono">http_request</code> from chat tools and widget pipelines. Leave blank to reset to the default.
+          </p>
+        </div>
+        <input
+          value={ua}
+          onChange={event => setUa(event.target.value)}
+          placeholder="Datrina/0.1.0 (+local)"
+          className="w-72 rounded-md border border-border bg-background px-2 py-1.5 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-primary/40"
+        />
+        <button
+          type="button"
+          onClick={save}
+          disabled={!dirty || busy}
+          className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[11px] mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 disabled:opacity-50 transition-colors"
+        >
+          {busy ? 'Saving…' : 'Save'}
+        </button>
       </div>
     </div>
   );

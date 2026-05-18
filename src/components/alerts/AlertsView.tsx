@@ -6,6 +6,10 @@ import { ALERT_EVENT_CHANNEL, alertApi } from '../../lib/api';
 interface Props {
   dashboards: Dashboard[];
   onJumpToWidget: (dashboardId: string, widgetId: string) => void;
+  /** W35: deep-link to the workflow run that produced the value this
+   * alert fired on. When undefined, the per-row "View run" button is
+   * hidden. */
+  onJumpToRun?: (runId: string) => void;
   onClose: () => void;
 }
 
@@ -21,7 +25,7 @@ const SEVERITY_TONE: Record<AlertSeverity, string> = {
   info: 'bg-primary/15 text-primary border-primary/30',
 };
 
-export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
+export function AlertsView({ dashboards, onJumpToWidget, onJumpToRun, onClose }: Props) {
   const [events, setEvents] = useState<AlertEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -154,14 +158,25 @@ export function AlertsView({ dashboards, onJumpToWidget, onClose }: Props) {
                         </div>
                         <p className="mt-1 text-sm">{event.message}</p>
                       </div>
-                      {!event.acknowledged_at && (
-                        <button
-                          onClick={() => handleAck(event.id)}
-                          className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
-                        >
-                          Ack
-                        </button>
-                      )}
+                      <div className="flex shrink-0 items-center gap-1">
+                        {onJumpToRun && event.workflow_run_id && (
+                          <button
+                            onClick={() => onJumpToRun(event.workflow_run_id!)}
+                            title="View workflow run in Operations"
+                            className="rounded-md border border-border bg-card px-2 py-1 text-[11px] mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
+                          >
+                            Run
+                          </button>
+                        )}
+                        {!event.acknowledged_at && (
+                          <button
+                            onClick={() => handleAck(event.id)}
+                            className="rounded-md border border-border bg-card px-2 py-1 text-[11px] mono uppercase tracking-wider hover:bg-muted hover:border-primary/40 transition-colors"
+                          >
+                            Ack
+                          </button>
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ul>

@@ -1,4 +1,4 @@
-# W25 Dashboard Parameters (Grafana-style Variables)
+# W25 Dashboard Parameters (Dashboard Variables)
 
 Status: shipped (v1)
 
@@ -38,7 +38,7 @@ Date: 2026-05-17
   v2.
 - `builtin` parameter source kind.
 - URL-hash sync for shareable parameter state across reloads.
-- Repeating widgets (Grafana `repeat`) — explicit out-of-scope below.
+- Repeating widgets — explicit out-of-scope below.
 
 ## Context
 
@@ -46,9 +46,9 @@ Today every dashboard is hard-coded. A typical Build chat ends with a
 proposal whose `datasource_plan.arguments` already contain a literal
 project / environment / region key. To look at a different value the
 user has to either ask the agent to rebuild the dashboard or hand-edit
-JSON. Real monitoring tools — Grafana, Datadog, Honeycomb — solve this
-with **dashboard variables**: a row of dropdowns / inputs / time pickers
-at the top of the dashboard that flow into every widget's query.
+JSON. Mature monitoring tools solve this with **dashboard variables**: a row
+of dropdowns / inputs / time pickers at the top of the dashboard that flow into
+every widget's query.
 
 Datrina has the pieces to support the same pattern (typed pipeline DSL,
 MCP/HTTP tool calls, shared datasources, reactive refresh through the
@@ -56,8 +56,7 @@ workflow engine), it just has no parameter layer.
 
 ## Goal
 
-- Dashboards own a typed list of **parameters** (Grafana's "template
-  variables").
+- Dashboards own a typed list of **parameters**.
 - Parameters appear as a controls row at the top of the dashboard:
   dropdowns, text inputs, time-range picker, interval picker.
 - Widget configs reference `$param` / `${param}` in
@@ -195,7 +194,8 @@ pub struct SubstituteOptions {
 - `Value::String("$foo")` exactly (the whole string is one token):
   preserves the original type. For example, a numeric param substituted
   into `arguments.count` stays a `Value::Number`, not a stringified
-  number. This is the same behavior Grafana exposes with `${var:raw}`.
+  number. This preserves typed variable substitution instead of coercing every
+  value to a string.
 - `Value::Array` / `Value::Object`: recursive descent.
 
 Cyclic-dependency detection: `resolve_all` does a topological pass over
@@ -356,8 +356,8 @@ parameter list.
 
 ## Out of scope
 
-- Repeating widgets: one widget instance per parameter value (Grafana
-  `repeat`). Useful but doubles the layout complexity; defer.
+- Repeating widgets: one widget instance per parameter value. Useful but doubles
+  the layout complexity; defer.
 - Cross-dashboard parameter linking / global parameters.
 - Per-user vs per-dashboard parameter scopes — single-user local-first,
   values are dashboard-scoped only.

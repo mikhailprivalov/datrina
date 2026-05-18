@@ -1,8 +1,23 @@
 # W22 Token And Cost Tracking
 
-Status: shipped
+Status: shipped (with W49 follow-up shipped 2026-05-18)
 
 Date: 2026-05-16
+
+## W49 follow-up (2026-05-18)
+
+W22 left two bugs visible in real Kimi/OpenRouter Build sessions: the
+session footer rendered `$0.000000` even when 500k+ provider-input
+tokens had been spent, and every assistant turn re-sent the full raw
+tool history. W49 repaired both: pricing has a typed `CostSource`
+(`provider_total` / `pricing_table` / `unknown_pricing`),
+OpenRouter's `usage.cost` is honoured when present, sessions count
+`cost_unknown_turns` so the footer can render `unknown cost` or
+`≥$X.XXXX (N unpriced)`, and a new `modules::context_budget`
+compactor rewrites large tool results into compact status+shape
+summaries before they go to the provider while the local transcript
+keeps the full payload. See
+`docs/W49_CHAT_CONTEXT_ECONOMY_AND_COST_ACCOUNTING_REPAIR.md`.
 
 ## Context
 

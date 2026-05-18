@@ -1,0 +1,47 @@
+id: w48_silent_drop_fails_validator
+description: |
+  W48 negative path. The user mentioned BOTH a forecast and an air-quality
+  datasource, but the agent only emitted a widget using the forecast source
+  and silently dropped the air-quality one. The W48 mention-coverage gate
+  must flag the missing reference so the agent retries instead of shipping
+  the regression.
+
+mentioned_sources:
+  - label: Open-Meteo forecast
+    datasource_definition_id: def-forecast
+  - label: Open-Meteo air quality
+    datasource_definition_id: def-air
+
+trace:
+  proposal:
+    id: prop-w48-silent-drop
+    title: Weather only (regression)
+    widgets:
+      - widget_type: text
+        title: Forecast only
+        data: ""
+        datasource_plan:
+          kind: builtin_tool
+          tool_name: http_request
+          arguments:
+            method: GET
+            url: "https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current=temperature_2m"
+            datasource_definition_id: def-forecast
+  tool_calls: []
+  plan:
+    summary: Skipped — agent silently dropped one mentioned source.
+    steps: []
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 900
+    completion: 250
+
+assertions:
+  - kind: source_mentions_missing
+    expect_missing:
+      - def-air
+  - kind: validator_fails_with
+    issue: unused_source_mention
+  - kind: cost_lt_usd
+    value: 0.05

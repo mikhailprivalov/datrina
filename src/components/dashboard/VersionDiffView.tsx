@@ -104,8 +104,18 @@ export function VersionDiffView({ fromVersionId, toVersionId }: Props) {
                   Kind: <code>{w.kind_changed[0]}</code> → <code>{w.kind_changed[1]}</code>
                 </p>
               )}
-              {w.datasource_plan_changed && (
+              {w.binding_changed && (
+                <p className="ml-3 text-neon-amber">
+                  Datasource binding changed (workflow / definition / output_key).
+                </p>
+              )}
+              {!w.binding_changed && w.datasource_plan_changed && (
                 <p className="ml-3 text-muted-foreground">Datasource plan changed.</p>
+              )}
+              {w.tail_changed && (
+                <p className="ml-3 text-muted-foreground">
+                  Per-widget tail (post-process / provenance) changed.
+                </p>
               )}
               {w.config_changes.length > 0 && (
                 <ul className="ml-3 space-y-0.5 font-mono text-[10px]">

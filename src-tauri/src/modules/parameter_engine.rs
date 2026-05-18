@@ -293,7 +293,9 @@ fn default_value_for_kind(kind: &DashboardParameterKind) -> Option<ParameterValu
                 to: now,
             }))
         }
-        DashboardParameterKind::McpQuery { .. } | DashboardParameterKind::HttpQuery { .. } => None,
+        DashboardParameterKind::McpQuery { .. }
+        | DashboardParameterKind::HttpQuery { .. }
+        | DashboardParameterKind::DatasourceQuery { .. } => None,
     }
 }
 

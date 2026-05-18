@@ -2,9 +2,16 @@ import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { listen } from '@tauri-apps/api/event';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { chatApi, costApi, dashboardApi } from '../../lib/api';
-import type { SessionCostSnapshot } from '../../lib/api';
+import { chatApi, costApi, dashboardApi, datasourceApi, debugApi, languageApi } from '../../lib/api';
+import type {
+  DatasourceDefinition,
+  RawArtifactPayload,
+  SessionCostSnapshot,
+  SourceMention,
+  ToolResultCompression,
+} from '../../lib/api';
 import { SessionBudgetModal } from '../chat/SessionBudgetModal';
+import { AssistantLanguagePicker } from '../settings/AssistantLanguagePicker';
 import {
   appendErrorRuntimeMessage,
   appendUserRuntimeMessage,
@@ -23,12 +30,16 @@ import type {
   ChatMessagePart,
   ChatSession,
   ChatSessionSummary,
+  Dashboard,
   LLMProvider,
   PlanArtifact,
   PlanStepKind,
   PlanStepStatus,
+  ProposalMaterializationPreview,
   ValidationIssue,
+  Widget,
   WidgetDryRunResult,
+  WidgetMention,
 } from '../../lib/api';
 
 interface Props {
@@ -41,12 +52,29 @@ interface Props {
    * a Template Gallery selection. Consumed exactly once per change. */
   initialPrompt?: string;
   onInitialPromptConsumed?: () => void;
+  /** W28: bumped by the host whenever a fresh Build chat must be opened
+   * (top-bar Build "start new", Playground "use as widget", template launch).
+   * Changing this value resets the active session to a local draft. */
+  freshSessionKey?: number;
   onClose: () => void;
   onModeChange: (mode: 'build' | 'context') => void;
   onApplyBuildProposal: (proposal: BuildProposal, sessionId?: string) => Promise<void>;
+  /** W28: open Provider Settings from chat empty/no-provider state. */
+  onOpenProviderSettings?: () => void;
+  /** W28: explicit honest path for Build retry/edit. Forks the prompt
+   * into a fresh Build chat instead of in-place truncating the current
+   * session (which would reuse plans, cost totals, and the same title).
+   * Available only for Build messages; Context can still do inline edit. */
+  onForkBuildChat?: (prompt: string) => void;
 }
 
-export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, canApplyToDashboard, initialPrompt, onInitialPromptConsumed, onClose, onModeChange, onApplyBuildProposal }: Props) {
+type SessionDraftKey = string;
+
+function draftKey(mode: 'build' | 'context', dashboardId: string | undefined, sessionId: string | null): SessionDraftKey {
+  return sessionId ? `s:${sessionId}` : `d:${mode}:${dashboardId ?? '-'}`;
+}
+
+export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, canApplyToDashboard, initialPrompt, onInitialPromptConsumed, freshSessionKey, onClose, onModeChange, onApplyBuildProposal, onOpenProviderSettings, onForkBuildChat }: Props) {
   const [runtime, setRuntime] = useState(createChatRuntimeState([]));
   const [input, setInput] = useState('');
   const [session, setSession] = useState<ChatSession | null>(null);
@@ -58,103 +86,208 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
   // W22: live cost snapshot for the footer (running session totals + today).
   const [costSnapshot, setCostSnapshot] = useState<SessionCostSnapshot | null>(null);
   const [isBudgetModalOpen, setIsBudgetModalOpen] = useState(false);
+  // W47: per-session assistant language override modal.
+  const [isLanguageModalOpen, setIsLanguageModalOpen] = useState(false);
+  const [languageModalError, setLanguageModalError] = useState<string | null>(null);
+  // W28: explicit cancellation transition distinct from `isLoading`.
+  const [isCancelling, setIsCancelling] = useState(false);
+  // W28: visible inline errors for session init / load / delete / send
+  // failures, instead of swallowing them into the console.
+  const [panelError, setPanelError] = useState<{ scope: 'init' | 'load' | 'delete' | 'send'; message: string } | null>(null);
+  const [isInitialising, setIsInitialising] = useState(true);
+  // W38: widget picker state for Build mode @-mentions.
+  const [dashboardWidgets, setDashboardWidgets] = useState<Widget[]>([]);
+  const [mentions, setMentions] = useState<WidgetMention[]>([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerQuery, setPickerQuery] = useState('');
+  // W48: source picker state for Build mode `&source` mentions. The
+  // `&` trigger is dedicated to sources so it can coexist with `@` for
+  // widgets without ambiguity in a single composer.
+  const [savedDatasources, setSavedDatasources] = useState<DatasourceDefinition[]>([]);
+  const [sourceMentions, setSourceMentions] = useState<SourceMention[]>([]);
+  const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
+  const [sourcePickerQuery, setSourcePickerQuery] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const sessionIdRef = useRef<string | null>(null);
   const modeRef = useRef(mode);
   const stickToBottomRef = useRef(true);
+  // W28: draft preservation across switch / new chat / mode toggle /
+  // dashboard switch. Keyed by sessionId, or by (mode, dashboardId) for
+  // not-yet-persisted drafts.
+  const draftsRef = useRef<Map<SessionDraftKey, string>>(new Map());
+  const draftKeyRef = useRef<SessionDraftKey>(draftKey(mode, dashboardId, null));
+  // W28: latest freshSessionKey we have already consumed. A change forces
+  // the panel back to a local draft instead of reloading the last session.
+  const lastFreshKeyRef = useRef<number | undefined>(freshSessionKey);
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
 
+  // W28: lazy session lifecycle.
+  // - On mount / mode change / dashboard change: try to load the latest
+  //   *non-empty* matching session. If none exists, fall back to a local
+  //   draft (session === null) instead of creating an empty backend row.
+  // - If the host bumped `freshSessionKey`, always start a fresh draft
+  //   regardless of whatever session is on disk.
+  // - Backend session is created lazily on the first send (see `handleSend`).
   useEffect(() => {
     let cancelled = false;
     const init = async () => {
+      setIsInitialising(true);
+      const wantsFresh = freshSessionKey !== undefined
+        && freshSessionKey !== lastFreshKeyRef.current;
       try {
         const all = await chatApi.listSessionSummaries();
         if (cancelled) return;
         const sorted = [...all].sort((a, b) => b.updated_at - a.updated_at);
         setSessions(sorted);
+        setPanelError(null);
+
+        if (wantsFresh) {
+          lastFreshKeyRef.current = freshSessionKey;
+          openDraftSessionInternal();
+          return;
+        }
+
         const candidate = sorted.find(s =>
-          s.mode === mode && (s.dashboard_id ?? null) === (dashboardId ?? null)
+          s.mode === mode
+            && (s.dashboard_id ?? null) === (dashboardId ?? null)
+            && s.message_count > 0
         );
         if (candidate) {
           const full = await chatApi.getSession(candidate.id);
           if (cancelled) return;
-          sessionIdRef.current = full.id;
-          setSession(full);
-          setRuntime(createChatRuntimeState(full.messages));
+          adoptSession(full);
           return;
         }
-        const created = await chatApi.createSession(mode, dashboardId);
-        if (cancelled) return;
-        sessionIdRef.current = created.id;
-        setSession(created);
-        setRuntime(createChatRuntimeState(created.messages));
-        setSessions(prev => [sessionToSummary(created), ...prev]);
+        openDraftSessionInternal();
       } catch (err) {
         if (cancelled) return;
+        const message = err instanceof Error ? err.message : String(err);
         console.error('Failed to init session:', err);
+        setPanelError({ scope: 'init', message });
+        openDraftSessionInternal();
+      } finally {
+        if (!cancelled) setIsInitialising(false);
       }
     };
     init();
     return () => {
       cancelled = true;
     };
-  }, [mode, dashboardId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, dashboardId, freshSessionKey]);
 
-  const refreshSessionsList = async () => {
+  // Save the current textarea into the draft map keyed by the active
+  // session/draft, then switch the key to the requested target. The
+  // caller is responsible for setting `session` and `runtime` after.
+  const swapDraftKey = useCallback((nextKey: SessionDraftKey) => {
+    const prevKey = draftKeyRef.current;
+    if (prevKey !== nextKey) {
+      if (input) draftsRef.current.set(prevKey, input);
+      else draftsRef.current.delete(prevKey);
+      draftKeyRef.current = nextKey;
+      setInput(draftsRef.current.get(nextKey) ?? '');
+    }
+  }, [input]);
+
+  const adoptSession = useCallback((full: ChatSession) => {
+    sessionIdRef.current = full.id;
+    setSession(full);
+    setRuntime(createChatRuntimeState(full.messages));
+    setEditingMessageId(null);
+    setEditingDraft('');
+    swapDraftKey(draftKey(full.mode, full.dashboard_id, full.id));
+  }, [swapDraftKey]);
+
+  const openDraftSessionInternal = useCallback(() => {
+    sessionIdRef.current = null;
+    setSession(null);
+    setRuntime(createChatRuntimeState([]));
+    setEditingMessageId(null);
+    setEditingDraft('');
+    swapDraftKey(draftKey(mode, dashboardId, null));
+  }, [mode, dashboardId, swapDraftKey]);
+
+  const refreshSessionsList = useCallback(async () => {
     try {
       const all = await chatApi.listSessionSummaries();
       setSessions([...all].sort((a, b) => b.updated_at - a.updated_at));
     } catch (err) {
       console.error('Failed to refresh sessions:', err);
+      // non-fatal: keep showing the cached list
     }
-  };
+  }, []);
+
+  // W28: explicit cancellation with a visible "cancelling…" transition.
+  // Resolves once the backend acknowledges, but the local UI already
+  // unlocks isLoading optimistically so the Stop button feels responsive.
+  const cancelActiveStream = useCallback(async (): Promise<boolean> => {
+    if (!session || (!runtime.isLoading && !isCancelling)) return true;
+    setIsCancelling(true);
+    setRuntime(prev => ({ ...prev, isLoading: false }));
+    try {
+      await chatApi.cancelResponse(session.id);
+      return true;
+    } catch (err) {
+      console.error('Failed to cancel chat response:', err);
+      setPanelError({
+        scope: 'send',
+        message: err instanceof Error ? err.message : 'Failed to cancel the in-flight response.',
+      });
+      return false;
+    } finally {
+      setIsCancelling(false);
+    }
+  }, [isCancelling, runtime.isLoading, session]);
+
+  const confirmDuringStream = useCallback((action: string): boolean => {
+    if (!runtime.isLoading) return true;
+    return window.confirm(`A response is streaming. ${action} will cancel it. Continue?`);
+  }, [runtime.isLoading]);
 
   const handleNewChat = async () => {
-    if (runtime.isLoading && session) {
-      try { await chatApi.cancelResponse(session.id); } catch {}
-    }
-    try {
-      const created = await chatApi.createSession(mode, dashboardId);
-      sessionIdRef.current = created.id;
-      setSession(created);
-      setRuntime(createChatRuntimeState(created.messages));
-      setSessions(prev => [sessionToSummary(created), ...prev]);
-    } catch (err) {
-      console.error('Failed to create chat:', err);
-    }
+    if (!confirmDuringStream('Starting a new chat')) return;
+    if (runtime.isLoading) await cancelActiveStream();
+    setPanelError(null);
+    openDraftSessionInternal();
+    requestAnimationFrame(() => inputRef.current?.focus());
   };
 
   const handleSwitchSession = async (id: string) => {
     if (id === session?.id) return;
-    if (runtime.isLoading && session) {
-      try { await chatApi.cancelResponse(session.id); } catch {}
-    }
+    if (!confirmDuringStream('Switching session')) return;
+    if (runtime.isLoading) await cancelActiveStream();
     try {
       const full = await chatApi.getSession(id);
-      sessionIdRef.current = full.id;
-      setSession(full);
-      setRuntime(createChatRuntimeState(full.messages));
+      adoptSession(full);
+      setPanelError(null);
     } catch (err) {
       console.error('Failed to load session:', err);
+      setPanelError({
+        scope: 'load',
+        message: err instanceof Error ? err.message : 'Failed to load that chat session.',
+      });
     }
   };
 
   const handleDeleteSession = async (id: string) => {
+    const isActive = session?.id === id;
+    if (isActive && !confirmDuringStream('Deleting this chat')) return;
+    if (isActive && runtime.isLoading) await cancelActiveStream();
     try {
       await chatApi.deleteSession(id);
       setSessions(prev => prev.filter(s => s.id !== id));
-      if (session?.id === id) {
-        sessionIdRef.current = null;
-        setSession(null);
-        setRuntime(createChatRuntimeState([]));
-      }
+      if (isActive) openDraftSessionInternal();
     } catch (err) {
       console.error('Failed to delete session:', err);
+      setPanelError({
+        scope: 'delete',
+        message: err instanceof Error ? err.message : 'Failed to delete that chat session.',
+      });
     }
   };
 
@@ -225,6 +358,79 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
     return () => window.clearInterval(handle);
   }, [refreshCostSnapshot, session?.id]);
 
+  // W38: keep the active dashboard's widget list cached so the @-picker
+  // resolves instantly. Refreshes when the dashboard id changes or a
+  // session adoption surfaces a different dashboard.
+  useEffect(() => {
+    let cancelled = false;
+    if (mode !== 'build' || !dashboardId) {
+      setDashboardWidgets([]);
+      setMentions([]);
+      setPickerOpen(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+    (async () => {
+      try {
+        const dashboard: Dashboard = await dashboardApi.get(dashboardId);
+        if (cancelled) return;
+        setDashboardWidgets(dashboard.layout ?? []);
+      } catch (err) {
+        if (cancelled) return;
+        console.error('Failed to load dashboard widgets for mention picker:', err);
+        setDashboardWidgets([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, dashboardId, session?.id]);
+
+  // W38: drop stale mentions if the user switches dashboards or sessions.
+  useEffect(() => {
+    setMentions([]);
+    setPickerOpen(false);
+    setPickerQuery('');
+  }, [session?.id, dashboardId, mode]);
+
+  // W48: keep the saved datasource catalog cached for the `&` source
+  // picker. We refresh whenever Build mode is entered or when the user
+  // returns to a session — datasource health/labels can change between
+  // turns and we want fresh metadata in the chips.
+  useEffect(() => {
+    let cancelled = false;
+    if (mode !== 'build') {
+      setSavedDatasources([]);
+      setSourceMentions([]);
+      setSourcePickerOpen(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+    (async () => {
+      try {
+        const defs = await datasourceApi.list();
+        if (cancelled) return;
+        setSavedDatasources(defs);
+      } catch (err) {
+        if (cancelled) return;
+        console.error('Failed to load datasource catalog for source picker:', err);
+        setSavedDatasources([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, dashboardId, session?.id]);
+
+  // W48: drop stale source mentions on context switches.
+  useEffect(() => {
+    setSourceMentions([]);
+    setSourcePickerOpen(false);
+    setSourcePickerQuery('');
+  }, [session?.id, dashboardId, mode]);
+
   useEffect(() => {
     const textarea = inputRef.current;
     if (!textarea) return;
@@ -240,27 +446,111 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
   }, [initialPrompt, onInitialPromptConsumed]);
 
   const handleInputChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInput(normalizeChatInput(event.target.value));
+    const next = normalizeChatInput(event.target.value);
+    setInput(next);
+    // W38: open the widget picker when the cursor sits inside an
+    // `@<query>` token (no spaces). W48: same UX but for `&<query>`
+    // routed to the source picker.
+    if (mode === 'build') {
+      const cursor = event.target.selectionStart ?? next.length;
+      const upto = next.slice(0, cursor);
+      const sourceMatch = /(^|\s)&([\w-]*)$/.exec(upto);
+      if (sourceMatch) {
+        setSourcePickerOpen(true);
+        setSourcePickerQuery(sourceMatch[2]);
+      }
+      if (dashboardId) {
+        const atMatch = /(^|\s)@([\w-]*)$/.exec(upto);
+        if (atMatch) {
+          setPickerOpen(true);
+          setPickerQuery(atMatch[2]);
+        } else if (pickerOpen && !pickerQuery) {
+          // user moved away from the `@` — keep the picker open only if
+          // they explicitly opened it via the button.
+        }
+      }
+    }
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || !session || runtime.isLoading) return;
-    const content = normalizeChatInput(input).trim();
-    setInput('');
-    sessionIdRef.current = session.id;
+  const canSendNow = !runtime.isLoading && !isCancelling && Boolean(activeProvider) && !isInitialising;
+  const sendBlockedReason: string | null = isInitialising
+    ? 'Loading chat session…'
+    : !activeProvider
+      ? 'No LLM provider is active. Open Provider Settings to configure OpenRouter, Ollama, or a custom OpenAI-compatible endpoint.'
+      : null;
 
+  const handleSend = async () => {
+    if (!input.trim() || runtime.isLoading || isCancelling) return;
+    if (!activeProvider) {
+      setPanelError({
+        scope: 'send',
+        message: 'No LLM provider is active. Configure one before sending.',
+      });
+      return;
+    }
+    const content = normalizeChatInput(input).trim();
+
+    // W28: lazy backend session creation. Only persist a session row
+    // once the user commits a real message; drawer open / mode toggle
+    // / dashboard switch never produces empty rows.
+    let activeSession = session;
+    if (!activeSession) {
+      try {
+        activeSession = await chatApi.createSession(mode, dashboardId);
+        sessionIdRef.current = activeSession.id;
+        setSession(activeSession);
+        setRuntime(createChatRuntimeState(activeSession.messages));
+        setSessions(prev => [sessionToSummary(activeSession!), ...prev]);
+        swapDraftKey(draftKey(mode, dashboardId, activeSession.id));
+      } catch (err) {
+        console.error('Failed to create chat session for send:', err);
+        setPanelError({
+          scope: 'send',
+          message: err instanceof Error ? err.message : 'Could not start a new chat session.',
+        });
+        return;
+      }
+    }
+    setInput('');
+    draftsRef.current.delete(draftKeyRef.current);
+    sessionIdRef.current = activeSession.id;
+    setPanelError(null);
+
+    // W38/W48: snapshot mention chips at send-time and clear the
+    // composer chip rail so the next turn starts fresh.
+    const turnMentions = mode === 'build' ? mentions : [];
+    const turnSourceMentions = mode === 'build' ? sourceMentions : [];
+    setMentions([]);
+    setPickerOpen(false);
+    setPickerQuery('');
+    setSourceMentions([]);
+    setSourcePickerOpen(false);
+    setSourcePickerQuery('');
+
+    const userParts: ChatMessagePart[] = [{ type: 'text', text: content }];
+    if (turnMentions.length > 0) {
+      userParts.push({ type: 'widget_mentions', mentions: turnMentions });
+    }
+    if (turnSourceMentions.length > 0) {
+      userParts.push({ type: 'source_mentions', mentions: turnSourceMentions });
+    }
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
       content,
-      parts: [{ type: 'text', text: content }],
+      parts: userParts,
       mode,
       timestamp: Date.now(),
     };
     setRuntime(prev => appendUserRuntimeMessage(prev, userMsg));
 
     try {
-      const assistant = await chatApi.sendMessageStream(session.id, content);
+      const assistant = await chatApi.sendMessageStream(
+        activeSession.id,
+        content,
+        turnMentions,
+        turnSourceMentions,
+      );
       setRuntime(prev => prev.messages.some(message => message.id === assistant.id)
         ? prev
         : {
@@ -275,48 +565,73 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
             ],
           });
     } catch (err) {
-      setRuntime(prev => appendErrorRuntimeMessage(
-        prev,
-        `Error: ${err instanceof Error ? err.message : String(err)}`,
-        mode
-      ));
+      const message = err instanceof Error ? err.message : String(err);
+      setRuntime(prev => appendErrorRuntimeMessage(prev, `Error: ${message}`, mode));
+      setPanelError({ scope: 'send', message });
     }
   };
 
   const handleCancel = async () => {
-    if (!session || !runtime.isLoading) return;
-    try {
-      await chatApi.cancelResponse(session.id);
-    } catch (err) {
-      console.error('Failed to cancel chat response:', err);
-    }
+    if (!runtime.isLoading) return;
+    await cancelActiveStream();
   };
 
   const resubmitFromMessage = async (messageId: string, content: string) => {
     if (!session || runtime.isLoading) return;
     const trimmed = content.trim();
     if (!trimmed) return;
+    // W38: preserve the original mention scope when regenerating /
+    // editing a Build user message so the agent keeps the same target
+    // set across retries. W48: same for source mentions.
+    const originalMentions: WidgetMention[] = (() => {
+      const original = runtime.messages.find(m => m.id === messageId);
+      if (!original) return [];
+      const part = original.parts.find(p => p.type === 'widget_mentions');
+      return part && part.type === 'widget_mentions' ? part.mentions : [];
+    })();
+    const originalSourceMentions: SourceMention[] = (() => {
+      const original = runtime.messages.find(m => m.id === messageId);
+      if (!original) return [];
+      const part = original.parts.find(p => p.type === 'source_mentions');
+      return part && part.type === 'source_mentions' ? part.mentions : [];
+    })();
     try {
       const truncated = await chatApi.truncateMessages(session.id, messageId);
       setSession(truncated);
       setRuntime(createChatRuntimeState(truncated.messages));
     } catch (err) {
       console.error('Failed to truncate messages:', err);
+      setPanelError({
+        scope: 'send',
+        message: err instanceof Error ? err.message : 'Failed to truncate session before resend.',
+      });
       return;
     }
 
+    const resubmitParts: ChatMessagePart[] = [{ type: 'text', text: trimmed }];
+    if (originalMentions.length > 0) {
+      resubmitParts.push({ type: 'widget_mentions', mentions: originalMentions });
+    }
+    if (originalSourceMentions.length > 0) {
+      resubmitParts.push({ type: 'source_mentions', mentions: originalSourceMentions });
+    }
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
       content: trimmed,
-      parts: [{ type: 'text', text: trimmed }],
+      parts: resubmitParts,
       mode,
       timestamp: Date.now(),
     };
     setRuntime(prev => appendUserRuntimeMessage(prev, userMsg));
 
     try {
-      const assistant = await chatApi.sendMessageStream(session.id, trimmed);
+      const assistant = await chatApi.sendMessageStream(
+        session.id,
+        trimmed,
+        originalMentions,
+        originalSourceMentions,
+      );
       setRuntime(prev => prev.messages.some(message => message.id === assistant.id)
         ? prev
         : {
@@ -331,11 +646,9 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
             ],
           });
     } catch (err) {
-      setRuntime(prev => appendErrorRuntimeMessage(
-        prev,
-        `Error: ${err instanceof Error ? err.message : String(err)}`,
-        mode
-      ));
+      const message = err instanceof Error ? err.message : String(err);
+      setRuntime(prev => appendErrorRuntimeMessage(prev, `Error: ${message}`, mode));
+      setPanelError({ scope: 'send', message });
     }
   };
 
@@ -372,6 +685,14 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape' && (pickerOpen || sourcePickerOpen)) {
+      e.preventDefault();
+      setPickerOpen(false);
+      setPickerQuery('');
+      setSourcePickerOpen(false);
+      setSourcePickerQuery('');
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -422,26 +743,31 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
           </div>
         </div>
         <div className="flex items-center gap-1">
-          <button onClick={handleNewChat} title="New chat (cancels current if streaming)" className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground">
+          <button
+            onClick={handleNewChat}
+            title={runtime.isLoading ? 'New chat — will cancel the streaming response' : 'New chat'}
+            aria-label="Start new chat"
+            className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+          >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
             </svg>
           </button>
-          {runtime.isLoading && (
-            <button
-              onClick={() => {
-                if (session) { chatApi.cancelResponse(session.id).catch(() => {}); }
-                setRuntime(prev => ({ ...prev, isLoading: false }));
-              }}
-              title="Reset stuck loading state"
-              className="p-1.5 rounded hover:bg-muted transition-colors text-amber-600 dark:text-amber-400"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-            </button>
+          {isCancelling && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm border border-amber-500/40 bg-amber-500/10 text-[10px] mono uppercase tracking-wider text-amber-500" aria-live="polite">
+              <span className="inline-block h-2 w-2 animate-spin rounded-full border border-amber-500/40 border-t-amber-500" />
+              cancelling
+            </span>
           )}
-          <button onClick={() => onModeChange(mode === 'build' ? 'context' : 'build')} className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground">
+          <button
+            onClick={() => {
+              if (!confirmDuringStream('Switching mode')) return;
+              onModeChange(mode === 'build' ? 'context' : 'build');
+            }}
+            title={mode === 'build' ? 'Switch to Context chat' : 'Switch to Build chat'}
+            aria-label={mode === 'build' ? 'Switch to Context chat' : 'Switch to Build chat'}
+            className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+          >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
             </svg>
@@ -459,6 +785,27 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
               </svg>
             </button>
           )}
+          {session && (
+            <button
+              onClick={() => {
+                setLanguageModalError(null);
+                setIsLanguageModalOpen(true);
+              }}
+              title={
+                session.language_override == null
+                  ? 'Assistant language: inheriting dashboard / app default'
+                  : session.language_override.mode === 'auto'
+                  ? 'Assistant language: auto (session)'
+                  : `Assistant language: ${session.language_override.tag} (session)`
+              }
+              aria-label="Set session assistant language"
+              className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
+              </svg>
+            </button>
+          )}
           <button onClick={onClose} className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -472,7 +819,63 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
         onScroll={handleScroll}
         className="relative flex-1 overflow-y-auto p-4 space-y-4 scrollbar-thin"
       >
-        {runtime.messages.length === 0 && (
+        {/* W28: surface init / load / delete / send failures inline so
+            the panel never looks idle while errors pile up in the
+            console. Includes a retry hook when applicable. */}
+        {panelError && (
+          <ChatErrorBanner
+            error={panelError}
+            onDismiss={() => setPanelError(null)}
+            onRetry={panelError.scope === 'init' || panelError.scope === 'load'
+              ? () => { setPanelError(null); refreshSessionsList(); }
+              : undefined}
+          />
+        )}
+
+        {/* W28 / W29: explicit, visible no-provider remediation. Send is
+            disabled below; this banner names the fix. `local_mock` is no
+            longer a product option — operators must configure a real
+            provider (OpenRouter, Ollama, or a custom OpenAI-compatible
+            endpoint) before sending. */}
+        {!activeProvider && !isInitialising && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-destructive">// no provider</p>
+            <p className="mt-1.5 text-muted-foreground">
+              No LLM provider is active. Configure OpenRouter, Ollama, or a custom OpenAI-compatible endpoint before sending — chat fails closed without one.
+            </p>
+            {onOpenProviderSettings && (
+              <button
+                type="button"
+                onClick={onOpenProviderSettings}
+                className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-[10px] mono uppercase tracking-wider text-destructive hover:bg-destructive/15"
+              >
+                Open Provider Settings
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* W28: when the panel reloaded the latest *non-empty* session
+            for this dashboard, give the user a one-click escape into a
+            fresh draft. Avoids the "I clicked Build and silently
+            landed in an old conversation" surprise. */}
+        {session && runtime.messages.length > 0 && (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-muted/30 px-3 py-1.5 text-[11px]">
+            <span className="truncate text-muted-foreground mono">
+              <span className="uppercase tracking-wider text-[10px] mr-1.5 opacity-70">// continuing</span>
+              {session.title?.trim() || (session.mode === 'build' ? 'last build chat' : 'last context chat')}
+            </span>
+            <button
+              type="button"
+              onClick={handleNewChat}
+              className="rounded-md border border-border bg-background px-2 py-0.5 text-[10px] mono uppercase tracking-wider text-muted-foreground hover:text-primary hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            >
+              Start fresh
+            </button>
+          </div>
+        )}
+
+        {runtime.messages.length === 0 && !isInitialising && (
           <div className="text-center text-muted-foreground text-sm mt-8">
             <div className="relative inline-flex w-12 h-12 rounded-md bg-primary/10 border border-primary/30 items-center justify-center mb-3">
               <svg className="w-6 h-6 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -483,12 +886,14 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
               {mode === 'build' ? 'Ask for build guidance' : 'Ask about your dashboard data'}
             </p>
             <p className="text-xs mt-1 opacity-70">
-              {mode === 'build' ? 'Generated proposals are applied only after explicit confirmation.' : 'Requires a configured provider or local_mock dev/test provider.'}
+              {mode === 'build'
+                ? (session ? 'Generated proposals are applied only after explicit confirmation.' : 'Fresh Build draft — a session will be created when you send your first message.')
+                : 'Requires a configured OpenRouter, Ollama, or custom OpenAI-compatible provider.'}
             </p>
           </div>
         )}
 
-        {mode === 'build' && (
+        {mode === 'build' && runtime.messages.length === 0 && !isInitialising && (
           <div className="rounded-md border border-neon-amber/30 bg-neon-amber/5 p-3 text-xs">
             <p className="mono text-[10px] uppercase tracking-[0.18em] text-neon-amber">// build proposals</p>
             <p className="mt-1.5 text-muted-foreground">
@@ -514,27 +919,23 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
               </div>
             );
           }
+          const isBuildUser = msg.role === 'user' && mode === 'build';
+          // W28: Build retry/edit honesty.
+          // In Build mode in-place edit/regenerate would reuse derived
+          // plan state, cost totals, and the same title — the backend
+          // `truncate_chat_messages` only truncates *messages*. Until
+          // that contract is widened, route Build retries through
+          // "Fork to fresh Build chat" (handled by host App).
+          const showInlineEdit = !isEditing && msg.role === 'user' && !isBuildUser && !runtime.isLoading;
+          const showForkBuild = !isEditing && isBuildUser && Boolean(onForkBuildChat);
+          const showRegenerate = !isEditing && isLastAssistant && !runtime.isLoading && mode === 'context';
           return (
-            <div key={msg.id} className={`group flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div key={msg.id} className={`group flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
               <div className={`relative max-w-[85%] rounded-md px-3.5 py-2.5 text-sm leading-relaxed border ${
                 msg.role === 'user'
                   ? 'bg-primary/15 text-foreground border-primary/40 rounded-br-sm'
                   : 'bg-muted/40 text-foreground border-border rounded-bl-sm'
               }`}>
-                {!isEditing && <CopyMessageButton message={msg} />}
-                {!isEditing && msg.role === 'user' && !runtime.isLoading && (
-                  <button
-                    type="button"
-                    onClick={() => handleStartEdit(msg.id, messageText(msg))}
-                    title="Edit and resubmit"
-                    className="absolute -top-2 -left-2 hidden group-hover:inline-flex items-center justify-center h-6 w-6 rounded-full border border-border bg-background text-muted-foreground hover:text-foreground shadow-sm"
-                  >
-                    <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-                      <path d="M17.414 2.586a2 2 0 00-2.828 0L7 10.172V13h2.828l7.586-7.586a2 2 0 000-2.828z" />
-                      <path fillRule="evenodd" d="M2 6a2 2 0 012-2h4a1 1 0 010 2H4v10h10v-4a1 1 0 112 0v4a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" clipRule="evenodd" />
-                    </svg>
-                  </button>
-                )}
                 {isEditing ? (
                   <div className="flex flex-col gap-2 min-w-[16rem]">
                     <textarea
@@ -581,20 +982,20 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
                     {msg.tokens ? ` - ${msg.tokens.prompt}/${msg.tokens.completion} tokens` : ''}
                   </div>
                 )}
-                {!isEditing && isLastAssistant && !runtime.isLoading && (
-                  <button
-                    type="button"
-                    onClick={handleRegenerate}
-                    title="Regenerate response"
-                    className="absolute -bottom-3 -right-2 hidden group-hover:inline-flex items-center gap-1 rounded-full border border-border bg-background px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground shadow-sm"
-                  >
-                    <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-                      <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
-                    </svg>
-                    Regenerate
-                  </button>
-                )}
               </div>
+              {/* W28: stable action row beneath the bubble. Visible on
+                  hover, focus-within, or keyboard focus — no more
+                  overlapping absolute hover targets on the corners. */}
+              {!isEditing && (
+                <MessageActionRow
+                  message={msg}
+                  side={msg.role === 'user' ? 'end' : 'start'}
+                  onCopy={() => navigator.clipboard.writeText(messageCopyText(msg)).catch(err => console.error('Copy failed:', err))}
+                  onEdit={showInlineEdit ? () => handleStartEdit(msg.id, messageText(msg)) : undefined}
+                  onForkBuild={showForkBuild ? () => onForkBuildChat!(messageText(msg)) : undefined}
+                  onRegenerate={showRegenerate ? handleRegenerate : undefined}
+                />
+              )}
             </div>
           );
         })}
@@ -645,7 +1046,85 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
         </div>
       )}
       <div className="p-3 border-t border-border bg-muted/20">
+        {mode === 'build' && (mentions.length > 0 || pickerOpen) && (
+          <MentionComposerBar
+            mentions={mentions}
+            widgets={dashboardWidgets}
+            dashboardId={dashboardId}
+            pickerOpen={pickerOpen}
+            pickerQuery={pickerQuery}
+            onPickerQueryChange={setPickerQuery}
+            onAdd={mention => {
+              setMentions(prev =>
+                prev.some(m => m.widget_id === mention.widget_id)
+                  ? prev
+                  : [...prev, mention]
+              );
+            }}
+            onRemove={widgetId => setMentions(prev => prev.filter(m => m.widget_id !== widgetId))}
+            onClose={() => { setPickerOpen(false); setPickerQuery(''); }}
+          />
+        )}
+        {mode === 'build' && (sourceMentions.length > 0 || sourcePickerOpen) && (
+          <SourceMentionComposerBar
+            mentions={sourceMentions}
+            datasources={savedDatasources}
+            widgets={dashboardWidgets}
+            dashboardId={dashboardId}
+            pickerOpen={sourcePickerOpen}
+            pickerQuery={sourcePickerQuery}
+            onPickerQueryChange={setSourcePickerQuery}
+            onAdd={mention => {
+              setSourceMentions(prev => {
+                const key = sourceMentionKey(mention);
+                return prev.some(m => sourceMentionKey(m) === key)
+                  ? prev
+                  : [...prev, mention];
+              });
+            }}
+            onRemove={key =>
+              setSourceMentions(prev => prev.filter(m => sourceMentionKey(m) !== key))
+            }
+            onClose={() => {
+              setSourcePickerOpen(false);
+              setSourcePickerQuery('');
+            }}
+          />
+        )}
         <div className="flex items-end gap-2">
+          {mode === 'build' && (
+            <button
+              type="button"
+              onClick={() => {
+                if (!dashboardId) return;
+                setPickerOpen(open => !open);
+                setPickerQuery('');
+              }}
+              disabled={!dashboardId || isCancelling || isInitialising}
+              title={!dashboardId
+                ? 'Mentions require an active dashboard'
+                : 'Mention a widget on this dashboard (@)'}
+              aria-label="Mention a widget"
+              className="p-2.5 rounded-md border border-border bg-card text-muted-foreground hover:text-foreground hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              <span className="mono text-xs">@</span>
+            </button>
+          )}
+          {mode === 'build' && (
+            <button
+              type="button"
+              onClick={() => {
+                setSourcePickerOpen(open => !open);
+                setSourcePickerQuery('');
+              }}
+              disabled={isCancelling || isInitialising}
+              title="Mention a saved datasource, workflow, or widget-backed source (&)"
+              aria-label="Mention a data source"
+              className="p-2.5 rounded-md border border-border bg-card text-muted-foreground hover:text-foreground hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              <span className="mono text-xs">&amp;</span>
+            </button>
+          )}
           <textarea
             ref={inputRef}
             value={input}
@@ -656,31 +1135,42 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
             autoCorrect="off"
             autoComplete="off"
             spellCheck={false}
-            className="flex-1 resize-none overflow-y-auto rounded-md border border-border bg-card px-3 py-2.5 text-sm focus:outline-none focus:border-primary/60 min-h-[40px] max-h-32"
+            disabled={isCancelling || isInitialising}
+            placeholder={sendBlockedReason ?? (mode === 'build' ? 'Describe what to build…' : 'Ask about your data…')}
+            className="flex-1 resize-none overflow-y-auto rounded-md border border-border bg-card px-3 py-2.5 text-sm focus:outline-none focus:border-primary/60 disabled:opacity-60 disabled:cursor-not-allowed min-h-[40px] max-h-32"
             rows={1}
           />
           <button
             onClick={runtime.isLoading ? handleCancel : handleSend}
-            disabled={!runtime.isLoading && !input.trim()}
-            title={runtime.isLoading ? 'Cancel' : 'Send'}
-            className={`p-2.5 rounded-md disabled:opacity-40 disabled:cursor-not-allowed transition-all flex-shrink-0 border ${
+            disabled={runtime.isLoading ? isCancelling : (!input.trim() || !canSendNow)}
+            title={runtime.isLoading
+              ? (isCancelling ? 'Cancelling…' : 'Cancel current response')
+              : (sendBlockedReason ?? 'Send')}
+            aria-label={runtime.isLoading ? 'Cancel response' : 'Send message'}
+            className={`p-2.5 rounded-md disabled:opacity-40 disabled:cursor-not-allowed transition-all flex-shrink-0 border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${
               runtime.isLoading
                 ? 'bg-destructive/15 text-destructive border-destructive/40 hover:bg-destructive/25'
                 : 'bg-primary text-primary-foreground border-primary hover:glow-primary'
             }`}
           >
             {runtime.isLoading ? (
-              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M7 7h10v10H7z" />
-              </svg>
+              isCancelling ? (
+                <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-destructive/30 border-t-destructive" aria-hidden />
+              ) : (
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden>
+                  <path d="M7 7h10v10H7z" />
+                </svg>
+              )
             ) : (
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
               </svg>
             )}
           </button>
         </div>
-        <p className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60 mt-1.5 text-center">Shift+Enter for newline</p>
+        <p className="text-[10px] mono uppercase tracking-wider text-muted-foreground/60 mt-1.5 text-center">
+          {sendBlockedReason ? sendBlockedReason : 'Shift+Enter for newline'}
+        </p>
       </div>
     </aside>
     {isBudgetModalOpen && session && (
@@ -696,6 +1186,53 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
         }}
       />
     )}
+    {isLanguageModalOpen && session && (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 p-4 backdrop-blur-sm"
+        onClick={() => setIsLanguageModalOpen(false)}
+      >
+        <div
+          className="w-full max-w-md space-y-3 rounded-md border border-border bg-card p-4 shadow-2xl"
+          onClick={event => event.stopPropagation()}
+        >
+          <div>
+            <p className="mono text-[10px] uppercase tracking-[0.18em] text-primary">// language</p>
+            <h2 className="mt-0.5 text-base font-semibold tracking-tight">Session assistant language</h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Overrides the dashboard / app default for this chat. Choose
+              "Inherit" to fall back to the wider scope.
+            </p>
+          </div>
+          <AssistantLanguagePicker
+            value={session.language_override ?? null}
+            allowInherit
+            label="Language"
+            onChange={async next => {
+              try {
+                const updated = await languageApi.setSessionPolicy(session.id, next);
+                setSession(updated);
+                setLanguageModalError(null);
+                setIsLanguageModalOpen(false);
+              } catch (err) {
+                setLanguageModalError(err instanceof Error ? err.message : String(err));
+              }
+            }}
+          />
+          {languageModalError && (
+            <p className="text-[11px] text-destructive">{languageModalError}</p>
+          )}
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={() => setIsLanguageModalOpen(false)}
+              className="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-muted"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
     </div>
   );
 }
@@ -703,24 +1240,55 @@ export function ChatPanel({ mode, dashboardId, dashboardName, activeProvider, ca
 function formatCostFooter(snapshot: SessionCostSnapshot): string {
   const tokens = `${formatTokens(snapshot.input_tokens)} in / ${formatTokens(snapshot.output_tokens)} out`
     + (snapshot.reasoning_tokens > 0 ? ` / ${formatTokens(snapshot.reasoning_tokens)} think` : '');
-  const cost = ` · $${snapshot.cost_usd.toFixed(4)}`;
+  // W49: when pricing was unknown for at least one turn, surface that
+  // honestly instead of pretending the session was free / cheap.
+  const unknownTurns = snapshot.cost_unknown_turns ?? 0;
+  let cost: string;
+  if (unknownTurns > 0 && snapshot.cost_usd <= 0) {
+    cost = ' · unknown cost';
+  } else if (unknownTurns > 0) {
+    cost = ` · ≥$${snapshot.cost_usd.toFixed(4)}*`;
+  } else {
+    cost = ` · $${snapshot.cost_usd.toFixed(4)}`;
+  }
   const today = ` · today $${snapshot.today_cost_usd.toFixed(2)}`;
   const model = snapshot.model ? `${snapshot.model} · ` : '';
   return `${model}${tokens}${cost}${today}`;
 }
 
 function formatCostFooterTitle(snapshot: SessionCostSnapshot): string {
+  const unknownTurns = snapshot.cost_unknown_turns ?? 0;
+  const sessionCostLine = unknownTurns > 0 && snapshot.cost_usd <= 0
+    ? 'Session cost: unknown (no pricing entry matched this model)'
+    : unknownTurns > 0
+      ? `Session cost: ≥$${snapshot.cost_usd.toFixed(4)} (lower bound — ${unknownTurns} unpriced turn${unknownTurns === 1 ? '' : 's'})`
+      : `Session cost: $${snapshot.cost_usd.toFixed(4)}`;
+  const sourceLine = snapshot.latest_cost_source
+    ? `Cost source: ${costSourceLabel(snapshot.latest_cost_source)}`
+    : null;
   return [
     snapshot.model ? `Model: ${snapshot.model}` : null,
     `Prompt: ${snapshot.input_tokens} tokens`,
     `Completion: ${snapshot.output_tokens} tokens`,
     snapshot.reasoning_tokens > 0 ? `Reasoning: ${snapshot.reasoning_tokens} tokens` : null,
-    `Session cost: $${snapshot.cost_usd.toFixed(4)}`,
+    sessionCostLine,
+    sourceLine,
     `Today total: $${snapshot.today_cost_usd.toFixed(4)}`,
     snapshot.max_cost_usd != null ? `Cap: $${snapshot.max_cost_usd.toFixed(2)}` : null,
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+function costSourceLabel(source: NonNullable<SessionCostSnapshot['latest_cost_source']>): string {
+  switch (source) {
+    case 'provider_total':
+      return 'provider total (upstream billing)';
+    case 'pricing_table':
+      return 'local pricing table';
+    case 'unknown_pricing':
+      return 'unknown — pricing entry missing';
+  }
 }
 
 function formatTokens(count: number): string {
@@ -913,37 +1481,100 @@ function messageCopyText(message: ChatRuntimeMessage): string {
     .join('\n\n');
 }
 
-function CopyMessageButton({ message }: { message: ChatRuntimeMessage }) {
+// W28: stable per-message action row replacing the overlapping
+// hover-only absolute buttons. Always rendered, low-opacity by default,
+// promoted on hover/focus. Always reachable by keyboard with visible
+// focus rings, and each action carries an aria-label.
+function MessageActionRow({
+  message,
+  side,
+  onCopy,
+  onEdit,
+  onForkBuild,
+  onRegenerate,
+}: {
+  message: ChatRuntimeMessage;
+  side: 'start' | 'end';
+  onCopy: () => void;
+  onEdit?: () => void;
+  onForkBuild?: () => void;
+  onRegenerate?: () => void;
+}) {
   const [copied, setCopied] = useState(false);
-  const onClick = async () => {
-    const payload = messageCopyText(message);
-    if (!payload.trim()) return;
-    try {
-      await navigator.clipboard.writeText(payload);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch (err) {
-      console.error('Copy failed:', err);
-    }
+  const hasCopyableContent = messageCopyText(message).trim().length > 0;
+  const justify = side === 'end' ? 'justify-end' : 'justify-start';
+  const handleCopy = async () => {
+    if (!hasCopyableContent) return;
+    onCopy();
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
   };
+  const cls = "inline-flex items-center gap-1 rounded-md border border-border bg-background px-1.5 py-0.5 text-[10px] mono uppercase tracking-wider text-muted-foreground hover:text-foreground hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:opacity-100";
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={copied ? 'Copied' : 'Copy message'}
-      className={`absolute -top-2 ${message.role === 'user' ? '-left-2' : '-right-2'} hidden group-hover:inline-flex items-center justify-center h-6 w-6 rounded-full border border-border bg-background text-muted-foreground hover:text-foreground shadow-sm`}
-    >
-      {copied ? (
-        <svg className="h-3 w-3 text-emerald-500" viewBox="0 0 20 20" fill="currentColor">
-          <path fillRule="evenodd" d="M16.704 5.296a1 1 0 010 1.408l-8 8a1 1 0 01-1.408 0l-4-4a1 1 0 011.408-1.408L8 12.592l7.296-7.296a1 1 0 011.408 0z" clipRule="evenodd" />
-        </svg>
-      ) : (
-        <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-          <path d="M8 2a2 2 0 00-2 2v8a2 2 0 002 2h6a2 2 0 002-2V6.414A2 2 0 0015.414 5L13 2.586A2 2 0 0011.586 2H8z" />
-          <path d="M4 6a2 2 0 012-2v10a2 2 0 002 2h6a2 2 0 01-2 2H6a2 2 0 01-2-2V6z" />
-        </svg>
+    <div className={`mt-1 flex items-center gap-1 ${justify} opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity`}>
+      {hasCopyableContent && (
+        <button type="button" onClick={handleCopy} aria-label={copied ? 'Copied' : 'Copy message'} title={copied ? 'Copied' : 'Copy message'} className={cls}>
+          {copied ? 'copied' : 'copy'}
+        </button>
       )}
-    </button>
+      {onEdit && (
+        <button type="button" onClick={onEdit} aria-label="Edit and resend" title="Edit and resend" className={cls}>
+          edit
+        </button>
+      )}
+      {onForkBuild && (
+        <button type="button" onClick={onForkBuild} aria-label="Fork prompt into a fresh Build chat" title="Build retry uses a fresh chat (avoids reusing plan/cost state)" className={cls}>
+          fork build
+        </button>
+      )}
+      {onRegenerate && (
+        <button type="button" onClick={onRegenerate} aria-label="Regenerate response" title="Regenerate response" className={cls}>
+          regenerate
+        </button>
+      )}
+    </div>
+  );
+}
+
+// W28: inline error banner for init / load / delete / send failures.
+// Replaces the previous console.error-only path so the user can see
+// what broke and retry where it makes sense.
+function ChatErrorBanner({
+  error,
+  onDismiss,
+  onRetry,
+}: {
+  error: { scope: 'init' | 'load' | 'delete' | 'send'; message: string };
+  onDismiss: () => void;
+  onRetry?: () => void;
+}) {
+  const label =
+    error.scope === 'init' ? 'Could not load chat history' :
+    error.scope === 'load' ? 'Could not open that chat' :
+    error.scope === 'delete' ? 'Could not delete chat' :
+    'Send failed';
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px]" role="alert">
+      <svg className="mt-0.5 h-3 w-3 flex-shrink-0 text-destructive" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M4.93 19h14.14a2 2 0 001.73-3l-7.07-12a2 2 0 00-3.46 0l-7.07 12a2 2 0 001.73 3z" />
+      </svg>
+      <div className="min-w-0 flex-1">
+        <p className="mono uppercase tracking-wider text-[10px] text-destructive">// {label}</p>
+        <p className="mt-0.5 text-foreground break-words">{error.message}</p>
+      </div>
+      <div className="flex flex-shrink-0 items-center gap-1">
+        {onRetry && (
+          <button type="button" onClick={onRetry} className="rounded-md border border-destructive/40 bg-background px-1.5 py-0.5 text-[10px] mono uppercase tracking-wider text-destructive hover:bg-destructive/10">
+            Retry
+          </button>
+        )}
+        <button type="button" onClick={onDismiss} aria-label="Dismiss error" className="rounded-md p-1 text-muted-foreground hover:text-foreground hover:bg-muted">
+          <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -966,11 +1597,19 @@ function MessageParts({
     part.type === 'plan');
   const reflectionPart = message.parts.find((part): part is Extract<ChatMessagePart, { type: 'reflection_meta' }> =>
     part.type === 'reflection_meta');
+  const mentionsPart = message.parts.find((part): part is Extract<ChatMessagePart, { type: 'widget_mentions' }> =>
+    part.type === 'widget_mentions');
+  const sourceMentionsPart = message.parts.find(
+    (part): part is Extract<ChatMessagePart, { type: 'source_mentions' }> =>
+      part.type === 'source_mentions',
+  );
   const renderableParts = message.parts.filter(part =>
     part.type !== 'agent_phase'
       && part.type !== 'proposal_validation'
       && part.type !== 'plan'
       && part.type !== 'reflection_meta'
+      && part.type !== 'widget_mentions'
+      && part.type !== 'source_mentions'
       && part.type !== 'provider_opaque_reasoning_state'
   );
   const isStreaming = message.role === 'assistant' && (isLoading || message.status === 'streaming');
@@ -997,10 +1636,19 @@ function MessageParts({
           if (!part.text) return null;
           if (isProposalLikeText(part.text)) {
             if (hasFixupProposal) return null;
+            if (isStreaming) {
+              return (
+                <ProposalDraftBuilding
+                  key={`text-${index}`}
+                  length={part.text.length}
+                />
+              );
+            }
             return (
-              <ProposalDraftBuilding
+              <ProposalDraftSuppressed
                 key={`text-${index}`}
-                length={part.text.length}
+                text={part.text}
+                hasValidation={!!validationPart}
               />
             );
           }
@@ -1050,8 +1698,385 @@ function MessageParts({
         />
       )}
       {reflectionPart && <ReflectionBadge widgetIds={reflectionPart.widget_ids} />}
+      {mentionsPart && <WidgetMentionChips mentions={mentionsPart.mentions} />}
+      {sourceMentionsPart && <SourceMentionChips mentions={sourceMentionsPart.mentions} />}
       {body}
     </>
+  );
+}
+
+function MentionComposerBar({
+  mentions,
+  widgets,
+  dashboardId,
+  pickerOpen,
+  pickerQuery,
+  onPickerQueryChange,
+  onAdd,
+  onRemove,
+  onClose,
+}: {
+  mentions: WidgetMention[];
+  widgets: Widget[];
+  dashboardId?: string;
+  pickerOpen: boolean;
+  pickerQuery: string;
+  onPickerQueryChange: (value: string) => void;
+  onAdd: (mention: WidgetMention) => void;
+  onRemove: (widgetId: string) => void;
+  onClose: () => void;
+}) {
+  const selectedIds = new Set(mentions.map(m => m.widget_id));
+  const q = pickerQuery.trim().toLowerCase();
+  const filtered = widgets
+    .filter(w => !selectedIds.has(w.id))
+    .filter(w => {
+      if (!q) return true;
+      return w.title.toLowerCase().includes(q) || w.type.toLowerCase().includes(q);
+    })
+    .slice(0, 12);
+  const labelFor = (widget: Widget) => {
+    const baseLabel = widget.title.trim() || widget.id.slice(0, 8);
+    const dupes = widgets.filter(w => w.title.trim() === widget.title.trim() && w.id !== widget.id);
+    return dupes.length > 0
+      ? `${baseLabel} (${widget.id.slice(0, 6)})`
+      : baseLabel;
+  };
+  return (
+    <div className="mb-2 rounded-md border border-border bg-card/80 p-2">
+      {mentions.length > 0 && (
+        <div className="mb-1 flex flex-wrap items-center gap-1">
+          {mentions.map(mention => (
+            <span
+              key={mention.widget_id}
+              className="inline-flex items-center gap-1 rounded-md border border-primary/40 bg-primary/10 px-1.5 py-0.5 text-[10px] mono text-primary"
+              title={`widget_id: ${mention.widget_id}`}
+            >
+              @{mention.label || mention.widget_id.slice(0, 8)}
+              {mention.widget_kind ? <span className="opacity-60">· {mention.widget_kind}</span> : null}
+              <button
+                type="button"
+                onClick={() => onRemove(mention.widget_id)}
+                aria-label={`Remove mention ${mention.label}`}
+                className="ml-0.5 rounded hover:bg-primary/20 px-0.5"
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      {pickerOpen && (
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="mono text-[10px] uppercase tracking-wider text-muted-foreground">// mention widget</span>
+            <input
+              type="text"
+              value={pickerQuery}
+              onChange={e => onPickerQueryChange(e.target.value)}
+              placeholder="Filter by title or kind…"
+              autoFocus
+              className="flex-1 min-w-0 rounded border border-border bg-background px-2 py-1 text-[11px] focus:outline-none focus:border-primary/60"
+            />
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close mention picker"
+              className="rounded border border-border bg-card px-1.5 py-0.5 text-[10px] mono uppercase hover:bg-muted"
+            >
+              Esc
+            </button>
+          </div>
+          {!dashboardId ? (
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              Open or create a dashboard to mention its widgets.
+            </p>
+          ) : widgets.length === 0 ? (
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              No widgets on this dashboard yet.
+            </p>
+          ) : filtered.length === 0 ? (
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              No widgets match {pickerQuery ? `"${pickerQuery}"` : 'the filter'}.
+            </p>
+          ) : (
+            <ul className="mt-1 max-h-40 overflow-y-auto rounded border border-border/60 bg-background/60 text-[11px]">
+              {filtered.map(widget => (
+                <li key={widget.id}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onAdd({
+                        widget_id: widget.id,
+                        dashboard_id: dashboardId,
+                        label: labelFor(widget),
+                        widget_kind: widget.type,
+                      });
+                    }}
+                    className="flex w-full items-center justify-between gap-2 px-2 py-1 text-left hover:bg-muted/60"
+                  >
+                    <span className="truncate font-medium">{widget.title.trim() || '(untitled)'}</span>
+                    <span className="flex items-center gap-2 text-[10px] mono text-muted-foreground">
+                      <span>{widget.type}</span>
+                      <span className="opacity-60">{widget.id.slice(0, 6)}</span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WidgetMentionChips({ mentions }: { mentions: Extract<ChatMessagePart, { type: 'widget_mentions' }>['mentions'] }) {
+  if (mentions.length === 0) return null;
+  return (
+    <div className="mb-1 flex flex-wrap items-center gap-1">
+      <span className="mono text-[10px] uppercase tracking-wider text-muted-foreground">// targets</span>
+      {mentions.map(mention => (
+        <span
+          key={mention.widget_id}
+          title={`widget_id: ${mention.widget_id}`}
+          className="inline-flex items-center gap-1 rounded-md border border-primary/40 bg-primary/10 px-1.5 py-0.5 text-[10px] mono text-primary"
+        >
+          @{mention.label || mention.widget_id.slice(0, 8)}
+          {mention.widget_kind ? (
+            <span className="opacity-60">· {mention.widget_kind}</span>
+          ) : null}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** W48: stable identifier for a SourceMention (used for dedupe + chip
+ *  removal). Prefers the saved-datasource id so two mentions of the
+ *  same source via different surfaces (catalog vs. widget) collapse. */
+function sourceMentionKey(mention: SourceMention): string {
+  const id =
+    mention.datasource_definition_id ??
+    mention.workflow_id ??
+    mention.widget_id ??
+    mention.label;
+  return `${mention.kind}:${id}`;
+}
+
+function slugifyAlias(label: string, taken: Set<string>): string {
+  const base = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32) || 'source';
+  let candidate = base;
+  let n = 2;
+  while (taken.has(candidate)) {
+    candidate = `${base}_${n}`;
+    n += 1;
+  }
+  return candidate;
+}
+
+function SourceMentionComposerBar({
+  mentions,
+  datasources,
+  widgets,
+  dashboardId,
+  pickerOpen,
+  pickerQuery,
+  onPickerQueryChange,
+  onAdd,
+  onRemove,
+  onClose,
+}: {
+  mentions: SourceMention[];
+  datasources: DatasourceDefinition[];
+  widgets: Widget[];
+  dashboardId?: string;
+  pickerOpen: boolean;
+  pickerQuery: string;
+  onPickerQueryChange: (value: string) => void;
+  onAdd: (mention: SourceMention) => void;
+  onRemove: (key: string) => void;
+  onClose: () => void;
+}) {
+  const selectedKeys = new Set(mentions.map(sourceMentionKey));
+  const aliasesTaken = new Set(
+    mentions.map(m => m.input_alias).filter((s): s is string => Boolean(s)),
+  );
+  const q = pickerQuery.trim().toLowerCase();
+  type Candidate = {
+    label: string;
+    sub: string;
+    kind: SourceMention['kind'];
+    build: () => SourceMention;
+  };
+  const candidates: Candidate[] = [];
+  for (const def of datasources) {
+    candidates.push({
+      label: def.name,
+      sub: `${def.kind}${def.tool_name ? ` · ${def.tool_name}` : ''}`,
+      kind: 'datasource',
+      build: () => ({
+        kind: 'datasource',
+        label: def.name,
+        datasource_definition_id: def.id,
+        workflow_id: def.workflow_id,
+        input_alias: slugifyAlias(def.name, new Set(aliasesTaken)),
+      }),
+    });
+  }
+  if (dashboardId) {
+    for (const widget of widgets) {
+      const title = widget.title.trim() || `widget ${widget.id.slice(0, 6)}`;
+      candidates.push({
+        label: title,
+        sub: `widget · ${widget.type}`,
+        kind: 'widget',
+        build: () => ({
+          kind: 'widget',
+          label: title,
+          widget_id: widget.id,
+          dashboard_id: dashboardId,
+          input_alias: slugifyAlias(title, new Set(aliasesTaken)),
+        }),
+      });
+    }
+  }
+  const filtered = candidates
+    .filter(c => {
+      const built = c.build();
+      return !selectedKeys.has(sourceMentionKey(built));
+    })
+    .filter(c => {
+      if (!q) return true;
+      return (
+        c.label.toLowerCase().includes(q) ||
+        c.sub.toLowerCase().includes(q) ||
+        c.kind.includes(q)
+      );
+    })
+    .slice(0, 16);
+  return (
+    <div className="mb-2 rounded-md border border-border bg-card/80 p-2">
+      {mentions.length > 0 && (
+        <div className="mb-1 flex flex-wrap items-center gap-1">
+          {mentions.map(mention => {
+            const key = sourceMentionKey(mention);
+            return (
+              <span
+                key={key}
+                className="inline-flex items-center gap-1 rounded-md border border-neon-cyan/40 bg-neon-cyan/10 px-1.5 py-0.5 text-[10px] mono text-neon-cyan"
+                title={
+                  mention.datasource_definition_id
+                    ? `datasource_definition_id: ${mention.datasource_definition_id}`
+                    : mention.workflow_id
+                      ? `workflow_id: ${mention.workflow_id}`
+                      : mention.widget_id
+                        ? `widget_id: ${mention.widget_id}`
+                        : mention.label
+                }
+              >
+                &amp;{mention.label || key.split(':')[1].slice(0, 8)}
+                {mention.input_alias ? (
+                  <span className="opacity-60">·{mention.input_alias}</span>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => onRemove(key)}
+                  aria-label={`Remove source mention ${mention.label}`}
+                  className="ml-0.5 rounded hover:bg-neon-cyan/20 px-0.5"
+                >
+                  ×
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      )}
+      {pickerOpen && (
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="mono text-[10px] uppercase tracking-wider text-muted-foreground">// mention source</span>
+            <input
+              type="text"
+              value={pickerQuery}
+              onChange={e => onPickerQueryChange(e.target.value)}
+              placeholder="Filter saved datasources or dashboard widgets…"
+              autoFocus
+              className="flex-1 min-w-0 rounded border border-border bg-background px-2 py-1 text-[11px] focus:outline-none focus:border-primary/60"
+            />
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close source picker"
+              className="rounded border border-border bg-card px-1.5 py-0.5 text-[10px] mono uppercase hover:bg-muted"
+            >
+              Esc
+            </button>
+          </div>
+          {candidates.length === 0 ? (
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              No saved datasources yet. Save one from the Workbench, the Playground, or a Build proposal first.
+            </p>
+          ) : filtered.length === 0 ? (
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              No sources match {pickerQuery ? `"${pickerQuery}"` : 'the filter'}.
+            </p>
+          ) : (
+            <ul className="mt-1 max-h-48 overflow-y-auto rounded border border-border/60 bg-background/60 text-[11px]">
+              {filtered.map((candidate, idx) => (
+                <li key={`${candidate.kind}-${candidate.label}-${idx}`}>
+                  <button
+                    type="button"
+                    onClick={() => onAdd(candidate.build())}
+                    className="flex w-full items-center justify-between gap-2 px-2 py-1 text-left hover:bg-muted/60"
+                  >
+                    <span className="truncate font-medium">{candidate.label}</span>
+                    <span className="flex items-center gap-2 text-[10px] mono text-muted-foreground">
+                      <span>{candidate.sub}</span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SourceMentionChips({
+  mentions,
+}: {
+  mentions: Extract<ChatMessagePart, { type: 'source_mentions' }>['mentions'];
+}) {
+  if (mentions.length === 0) return null;
+  return (
+    <div className="mb-1 flex flex-wrap items-center gap-1">
+      <span className="mono text-[10px] uppercase tracking-wider text-muted-foreground">// sources</span>
+      {mentions.map(mention => {
+        const key = sourceMentionKey(mention);
+        const id =
+          mention.datasource_definition_id ??
+          mention.workflow_id ??
+          mention.widget_id ??
+          mention.label;
+        return (
+          <span
+            key={key}
+            title={`${mention.kind}: ${id}`}
+            className="inline-flex items-center gap-1 rounded-md border border-neon-cyan/40 bg-neon-cyan/10 px-1.5 py-0.5 text-[10px] mono text-neon-cyan"
+          >
+            &amp;{mention.label || id.slice(0, 8)}
+            {mention.input_alias ? <span className="opacity-60">·{mention.input_alias}</span> : null}
+          </span>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1071,6 +2096,33 @@ function ProposalDraftBuilding({ length }: { length: number }) {
       <span className="mono uppercase tracking-wider text-[10px] text-primary">composing proposal</span>
       <span className="ml-auto tabular mono opacity-60">{length} chars</span>
     </div>
+  );
+}
+
+function ProposalDraftSuppressed({
+  text,
+  hasValidation,
+}: {
+  text: string;
+  hasValidation: boolean;
+}) {
+  return (
+    <details className="rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+      <summary className="flex cursor-pointer items-center gap-2">
+        <span className="mono uppercase tracking-wider text-[10px]">
+          proposal not applied
+        </span>
+        <span className="ml-auto tabular mono opacity-60">{text.length} chars</span>
+      </summary>
+      <p className="mt-1 text-[10px] opacity-70">
+        {hasValidation
+          ? 'See validation issues above. The raw model output is preserved below for debugging.'
+          : 'The model produced JSON-like output that was not parsed into a proposal. Raw output below.'}
+      </p>
+      <pre className="mt-1 max-h-48 overflow-auto rounded border border-border bg-background/60 p-2 mono text-[10px] leading-snug whitespace-pre-wrap break-all">
+        {text}
+      </pre>
+    </details>
   );
 }
 
@@ -1282,8 +2334,7 @@ function ProposalValidationTile({
         ))}
       </ul>
       <p className="mt-1 text-[10px] opacity-70">
-        You can still apply this proposal, but it will likely fail when refreshed. Editing your prompt
-        and re-sending usually produces a clean result.
+        Apply is blocked for this proposal — edit your prompt and re-send. Backend rejects validation-failed proposals too, so the dashboard never sees them.
       </p>
     </div>
   );
@@ -1307,6 +2358,31 @@ function formatValidationIssue(issue: ValidationIssue): string {
       return `Widget #${issue.widget_index} "${issue.widget_title}" has an invalid pipeline: ${issue.error}`;
     case 'duplicate_shared_key':
       return `shared_datasources contains duplicate key "${issue.key}".`;
+    case 'unknown_parameter_reference':
+      return `Widget #${issue.widget_index} "${issue.widget_title}" references parameter "$${issue.param_name}" that is not declared.`;
+    case 'parameter_cycle':
+      return `Dashboard parameters form a depends_on cycle: ${issue.cycle.join(' → ')}.`;
+    case 'off_target_widget_replace':
+      return `Widget #${issue.widget_index} "${issue.widget_title}" replaces id "${issue.replace_widget_id}", which was not mentioned this turn.`;
+    case 'off_target_widget_remove':
+      return `Proposal removes widget id "${issue.remove_widget_id}", which was not mentioned this turn.`;
+    case 'unsafe_http_datasource':
+      return `Unsafe http_request ${issue.source_kind} datasource for widget #${issue.widget_index} "${issue.widget_title}": ${issue.reason}.`;
+    case 'hardcoded_gallery_items':
+      return `Gallery widget #${issue.widget_index} "${issue.widget_title}" embeds ${issue.item_count} hardcoded image items; items must come from the datasource pipeline.`;
+    case 'proposed_explicit_coordinates':
+      return `Widget #${issue.widget_index} "${issue.widget_title}" sets explicit x/y. Drop them — auto-pack owns placement on the 12-col grid.`;
+    case 'conflicting_layout_fields':
+      return `Widget #${issue.widget_index} "${issue.widget_title}" sets both size_preset and w/h. Pick one — prefer size_preset.`;
+    case 'unused_source_mention': {
+      const labels = issue.missing
+        .map((m) => {
+          const id = m.datasource_definition_id ?? m.workflow_id;
+          return id ? `${m.label} (${id})` : m.label;
+        })
+        .join(', ');
+      return `Proposal did not consume mentioned source(s): ${labels}. Use kind="compose" to combine inputs or bind the widget to one of them.`;
+    }
   }
 }
 
@@ -1438,6 +2514,7 @@ function MessagePart({
     case 'proposal_validation':
     case 'plan':
     case 'reflection_meta':
+    case 'widget_mentions':
       return null;
     case 'visible_reasoning':
       return <ReasoningTrace reasoning={part.text} />;
@@ -1511,6 +2588,7 @@ function ToolCallPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool_c
 
 function ToolResultPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool_result' }> }) {
   const [expanded, setExpanded] = useState(false);
+  const compression = part.compression;
   return (
     <div className="mt-2 rounded-md border border-border bg-muted/30 text-[11px]">
       <button
@@ -1525,8 +2603,11 @@ function ToolResultPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool
           </svg>
           <span className="truncate font-semibold mono text-foreground">{part.name} <span className="text-muted-foreground">→</span></span>
         </span>
-        <span className={`flex-shrink-0 text-[10px] mono uppercase tracking-wider ${part.status === 'error' ? 'text-destructive' : part.status === 'success' ? 'text-neon-lime' : 'text-muted-foreground'}`}>
-          {part.status}
+        <span className="flex flex-shrink-0 items-center gap-2">
+          {compression ? <CompressionBadge compression={compression} /> : null}
+          <span className={`text-[10px] mono uppercase tracking-wider ${part.status === 'error' ? 'text-destructive' : part.status === 'success' ? 'text-neon-lime' : 'text-muted-foreground'}`}>
+            {part.status}
+          </span>
         </span>
       </button>
       {expanded ? (
@@ -1535,8 +2616,9 @@ function ToolResultPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool
             <p className="text-destructive break-words">Error: {part.error}</p>
           ) : (
             <>
-              <p className="mb-1 text-[10px] mono uppercase tracking-wider text-muted-foreground">// result</p>
+              <p className="mb-1 text-[10px] mono uppercase tracking-wider text-muted-foreground">// compact result (sent to provider)</p>
               <JsonView data={part.result_preview} />
+              {compression ? <CompressionDetail compression={compression} /> : null}
             </>
           )}
         </div>
@@ -1547,6 +2629,93 @@ function ToolResultPart({ part }: { part: Extract<ChatMessagePart, { type: 'tool
       )}
     </div>
   );
+}
+
+/**
+ * W51: compact compression chip surfaced on the collapsed tool-result
+ * header so users see at a glance how much the provider request was
+ * shrunk for this call.
+ */
+function CompressionBadge({ compression }: { compression: ToolResultCompression }) {
+  const ratio = compression.raw_bytes > 0
+    ? Math.round((1 - compression.compact_bytes / compression.raw_bytes) * 100)
+    : 0;
+  return (
+    <span
+      className="rounded-sm border border-border bg-card/40 px-1.5 py-0.5 text-[10px] mono uppercase tracking-wider text-muted-foreground"
+      title={`${compression.profile} · raw ${formatBytes(compression.raw_bytes)} → ${formatBytes(compression.compact_bytes)} sent · saved ~${compression.estimated_tokens_saved} tokens`}
+    >
+      {ratio >= 0 ? `-${ratio}%` : `+${Math.abs(ratio)}%`}
+    </span>
+  );
+}
+
+/**
+ * W51: expanded compression detail. Shows raw/compact bytes,
+ * truncation paths, and a "view raw locally" button that streams the
+ * redacted raw payload back through `debugApi.getRawArtifact`.
+ */
+function CompressionDetail({ compression }: { compression: ToolResultCompression }) {
+  const [raw, setRaw] = useState<RawArtifactPayload | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const loadRaw = async () => {
+    if (!compression.raw_artifact_id) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const payload = await debugApi.getRawArtifact(compression.raw_artifact_id);
+      setRaw(payload);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <div className="mt-2 rounded-sm border border-border/60 bg-card/40 p-2 text-[10px] mono text-muted-foreground">
+      <div className="flex flex-wrap gap-x-3 gap-y-1">
+        <span>profile: {compression.profile}</span>
+        <span>raw: {formatBytes(compression.raw_bytes)}</span>
+        <span>compact: {formatBytes(compression.compact_bytes)}</span>
+        <span>saved ~{compression.estimated_tokens_saved} tokens</span>
+      </div>
+      {compression.truncation_paths.length > 0 ? (
+        <div className="mt-1">
+          <span className="uppercase tracking-wider">truncated paths:</span>{' '}
+          {compression.truncation_paths.join(', ')}
+        </div>
+      ) : null}
+      {compression.raw_artifact_id ? (
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            type="button"
+            className="rounded-sm border border-border bg-muted/40 px-2 py-1 text-[10px] uppercase tracking-wider text-foreground hover:bg-muted/60"
+            onClick={loadRaw}
+            disabled={loading}
+          >
+            {loading ? 'loading…' : raw ? 'reload raw' : 'view raw locally'}
+          </button>
+          <span className="text-[10px]">artifact: {compression.raw_artifact_id.slice(0, 8)}…</span>
+        </div>
+      ) : null}
+      {error ? <p className="mt-2 text-destructive">{error}</p> : null}
+      {raw ? (
+        <div className="mt-2">
+          <p className="mb-1 uppercase tracking-wider">// raw payload (redacted)</p>
+          <pre className="max-h-72 overflow-auto rounded bg-card/70 border border-border/60 p-2 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+            {raw.payload_json}
+          </pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 function JsonView({ data }: { data: unknown }) {
@@ -1571,6 +2740,26 @@ function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApp
   const [isApplying, setIsApplying] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   const [dryRuns, setDryRuns] = useState<Record<number, WidgetDryRunResult | { status: 'running' } | undefined>>({});
+  const [materialization, setMaterialization] = useState<ProposalMaterializationPreview | null>(null);
+  const [materializationError, setMaterializationError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setMaterialization(null);
+    setMaterializationError(null);
+    dashboardApi
+      .previewProposalMaterialization(proposal)
+      .then(result => {
+        if (!cancelled) setMaterialization(result);
+      })
+      .catch(err => {
+        if (!cancelled)
+          setMaterializationError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [proposal]);
 
   const runWidget = async (index: number, widget: BuildWidgetProposal) => {
     setDryRuns(prev => ({ ...prev, [index]: { status: 'running' } }));
@@ -1649,6 +2838,15 @@ function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApp
         )}
       </div>
 
+      {materialization && (
+        <MaterializationSummary preview={materialization} />
+      )}
+      {materializationError && (
+        <p className="mt-2 text-[10px] mono text-destructive">
+          datasource preview failed: {materializationError}
+        </p>
+      )}
+
       <div className="mt-2 space-y-1.5">
         {proposal.widgets.map((widget, index) => (
           <WidgetProposalRow
@@ -1664,6 +2862,68 @@ function ProposalPreview({ proposal, onApply }: { proposal: BuildProposal; onApp
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function MaterializationSummary({ preview }: { preview: ProposalMaterializationPreview }) {
+  const total =
+    preview.creates.length +
+    preview.reuses.length +
+    preview.rejects.length +
+    preview.passthrough.length;
+  if (total === 0) return null;
+  return (
+    <div className="mt-2 rounded-md border border-border bg-card/60 px-2 py-1.5 text-[11px]">
+      <p className="mono uppercase tracking-wider text-[10px] text-muted-foreground">
+        // datasources on apply
+      </p>
+      <ul className="mt-1 space-y-0.5">
+        {preview.creates.map((entry, i) => (
+          <li key={`c-${i}`} className="flex items-center gap-2">
+            <span className="rounded-sm border border-neon-lime/50 bg-neon-lime/10 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider text-neon-lime">
+              create
+            </span>
+            <span className="truncate">
+              <span className="font-medium">{entry.widget_title}</span>{' '}
+              <span className="text-muted-foreground">· {entry.label}</span>
+            </span>
+          </li>
+        ))}
+        {preview.reuses.map((entry, i) => (
+          <li key={`r-${i}`} className="flex items-center gap-2">
+            <span className="rounded-sm border border-primary/40 bg-primary/10 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider text-primary">
+              reuse
+            </span>
+            <span className="truncate">
+              <span className="font-medium">{entry.widget_title}</span>{' '}
+              <span className="text-muted-foreground">· {entry.label}</span>
+            </span>
+          </li>
+        ))}
+        {preview.passthrough.map((entry, i) => (
+          <li key={`p-${i}`} className="flex items-center gap-2">
+            <span className="rounded-sm border border-border bg-muted/40 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider text-muted-foreground">
+              inline
+            </span>
+            <span className="truncate text-muted-foreground">
+              <span className="font-medium text-foreground">{entry.widget_title}</span>{' '}
+              · {entry.label}
+            </span>
+          </li>
+        ))}
+        {preview.rejects.map((reject, i) => (
+          <li key={`x-${i}`} className="flex items-center gap-2">
+            <span className="rounded-sm border border-destructive/50 bg-destructive/10 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider text-destructive">
+              reject
+            </span>
+            <span className="truncate text-destructive">
+              <span className="font-medium">{reject.widget_title}</span>{' '}
+              · {reject.reason}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

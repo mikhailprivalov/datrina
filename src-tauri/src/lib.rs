@@ -35,6 +35,12 @@ pub struct AppState {
     /// originated from a chat session; consumed by `refresh_widget` once
     /// the widget renders real data for the first time.
     pub pending_reflections: Arc<dashmap::DashMap<String, ReflectionPending>>,
+    /// W42: widget_id -> latest refresh_run_id. Refresh emitters check
+    /// this registry before publishing a stream event; if the active
+    /// run id has flipped, the event is dropped on the floor and a
+    /// `Superseded` envelope is emitted for the stale run instead so
+    /// the UI clears its partial state.
+    pub widget_refresh_runs: Arc<dashmap::DashMap<String, String>>,
 }
 
 /// W18: one entry per widget waiting for its first successful refresh.
@@ -59,6 +65,9 @@ impl AppState {
         let mut scheduler = Scheduler::new();
         scheduler.start().await?;
         let tool_engine = Arc::new(ToolEngine::default());
+        if let Ok(Some(stored_ua)) = storage.get_config("http_user_agent").await {
+            tool_engine.set_user_agent(&stored_ua);
+        }
         let ai_engine = Arc::new(AIEngine::default());
         let memory_engine = Arc::new(MemoryEngine::new(storage.clone()));
         let app_handle = app.handle().clone();
@@ -67,7 +76,16 @@ impl AppState {
             .list_workflows()
             .await?
             .into_iter()
-            .filter(|workflow| workflow.is_enabled)
+            .filter(|workflow| {
+                // W50: skip user-paused workflows on startup. The pause
+                // state is persisted, so a paused schedule does NOT come
+                // back as ticking after restart.
+                workflow.is_enabled
+                    && matches!(
+                        workflow.pause_state,
+                        models::workflow::SchedulePauseState::Active
+                    )
+            })
         {
             let raw_cron = workflow
                 .trigger
@@ -107,6 +125,7 @@ impl AppState {
             memory_engine,
             chat_abort_flags: Arc::new(dashmap::DashMap::new()),
             pending_reflections: Arc::new(dashmap::DashMap::new()),
+            widget_refresh_runs: Arc::new(dashmap::DashMap::new()),
         })
     }
 }
@@ -114,6 +133,11 @@ impl AppState {
 async fn active_provider_for_startup(
     storage: &Storage,
 ) -> anyhow::Result<Option<models::provider::LLMProvider>> {
+    // W29: startup scheduler & autopilot smoke run before the user has
+    // had a chance to pick a provider. Tolerate an unset / invalid
+    // `active_provider_id` here — chat & build send paths use the
+    // strict `resolve_active_provider` helper that returns a typed
+    // setup error instead of silently falling back.
     let providers = storage.list_providers().await?;
     let active_provider_id = storage
         .get_config("active_provider_id")
@@ -122,12 +146,64 @@ async fn active_provider_for_startup(
     Ok(active_provider_id
         .as_deref()
         .and_then(|id| {
-            providers
-                .iter()
-                .find(|provider| provider.id == id && provider.is_enabled)
+            providers.iter().find(|provider| {
+                provider.id == id && provider.is_enabled && !provider.is_unsupported
+            })
         })
-        .or_else(|| providers.iter().find(|provider| provider.is_enabled))
         .cloned())
+}
+
+/// W29: strict active-provider resolution used by every chat / build
+/// send path. Returns the typed [`ProviderSetupError`] code the UI
+/// matches on instead of a generic string. Active provider id is the
+/// only normal selection — no silent "first enabled" fallback.
+pub async fn resolve_active_provider(
+    storage: &Storage,
+) -> anyhow::Result<Result<models::provider::LLMProvider, models::provider::ProviderSetupError>> {
+    use crate::models::provider::ProviderSetupError;
+
+    let providers = storage.list_providers().await?;
+    let active_provider_id = storage
+        .get_config("active_provider_id")
+        .await?
+        .filter(|id| !id.trim().is_empty());
+
+    let Some(active_id) = active_provider_id else {
+        if providers.is_empty() {
+            return Ok(Err(ProviderSetupError::NoActiveProvider));
+        }
+        // Providers exist but none picked — same remediation: open
+        // settings and choose one. Treat as "no active provider" so the
+        // UI surfaces the same CTA.
+        return Ok(Err(ProviderSetupError::NoActiveProvider));
+    };
+
+    let Some(provider) = providers.iter().find(|p| p.id == active_id).cloned() else {
+        return Ok(Err(ProviderSetupError::ActiveProviderMissing {
+            active_provider_id: active_id,
+        }));
+    };
+    if provider.is_unsupported {
+        return Ok(Err(ProviderSetupError::ProviderUnsupported {
+            active_provider_id: active_id,
+            provider_name: provider.name.clone(),
+            reason: "stored kind is no longer supported".to_string(),
+        }));
+    }
+    if !provider.is_enabled {
+        return Ok(Err(ProviderSetupError::ActiveProviderDisabled {
+            active_provider_id: active_id,
+            provider_name: provider.name.clone(),
+        }));
+    }
+    if let Err(error) = modules::ai::validate_provider(&provider) {
+        return Ok(Err(ProviderSetupError::ProviderInvalidConfig {
+            active_provider_id: active_id,
+            provider_name: provider.name.clone(),
+            reason: error.to_string(),
+        }));
+    }
+    Ok(Ok(provider))
 }
 
 // ─── Generate Tauri Command Handler ──────────────────────────────────────────
@@ -144,9 +220,17 @@ macro_rules! generate_handler {
             $crate::commands::dashboard::add_dashboard_widget,
             $crate::commands::dashboard::apply_build_change,
             $crate::commands::dashboard::apply_build_proposal,
+            // W43: dashboard/widget LLM model selection
+            $crate::commands::dashboard::set_dashboard_model_policy,
+            $crate::commands::dashboard::set_widget_model_override,
+            $crate::commands::dashboard::preview_proposal_materialization,
             $crate::commands::dashboard::dry_run_widget,
             $crate::commands::dashboard::delete_dashboard,
             $crate::commands::dashboard::refresh_widget,
+            // W40: batched dashboard widget refresh
+            $crate::commands::dashboard::refresh_dashboard_widgets,
+            // W36: widget runtime snapshots
+            $crate::commands::dashboard::list_widget_snapshots,
             // W19: dashboard versions / undo
             $crate::commands::dashboard::list_dashboard_versions,
             $crate::commands::dashboard::get_dashboard_version,
@@ -157,6 +241,8 @@ macro_rules! generate_handler {
             $crate::commands::dashboard::get_dashboard_parameter_values,
             $crate::commands::dashboard::set_dashboard_parameter_value,
             $crate::commands::dashboard::resolve_dashboard_parameters,
+            // W34: query-backed parameter option refresh
+            $crate::commands::dashboard::refresh_dashboard_parameter_options,
             // Chat commands
             $crate::commands::chat::list_sessions,
             $crate::commands::chat::list_session_summaries,
@@ -189,10 +275,25 @@ macro_rules! generate_handler {
             $crate::commands::workflow::execute_workflow,
             $crate::commands::workflow::create_workflow,
             $crate::commands::workflow::delete_workflow,
+            // Workflow Operations Cockpit (W35)
+            $crate::commands::workflow::list_workflow_summaries,
+            $crate::commands::workflow::list_workflow_runs,
+            $crate::commands::workflow::get_workflow_run_detail,
+            $crate::commands::workflow::retry_workflow_run,
+            $crate::commands::workflow::cancel_workflow_run,
+            $crate::commands::workflow::get_scheduler_health,
+            // W50: dashboard refresh pause + schedule controls
+            $crate::commands::workflow::pause_workflow_schedule,
+            $crate::commands::workflow::resume_workflow_schedule,
+            $crate::commands::workflow::set_workflow_schedule,
+            $crate::commands::workflow::pause_dashboard_schedules,
+            $crate::commands::workflow::resume_dashboard_schedules,
             // Tool commands
             $crate::commands::tool::get_whitelist,
             $crate::commands::tool::execute_curl,
             $crate::commands::tool::execute_http_request,
+            $crate::commands::tool::get_http_user_agent,
+            $crate::commands::tool::set_http_user_agent,
             // Memory commands (W17)
             $crate::commands::memory::list_memories,
             $crate::commands::memory::delete_memory,
@@ -216,6 +317,33 @@ macro_rules! generate_handler {
             $crate::commands::debug::list_widget_traces,
             $crate::commands::debug::get_widget_trace,
             $crate::commands::debug::set_widget_capture_traces,
+            // W51: raw artifact retention surface
+            $crate::commands::debug::get_raw_artifact,
+            // W41: widget execution observability + LLM provenance
+            $crate::commands::provenance::get_widget_provenance,
+            // Pipeline Studio replay (W32)
+            $crate::commands::debug::replay_pipeline,
+            // Datasource workbench commands (W30)
+            $crate::commands::datasource::list_datasource_definitions,
+            $crate::commands::datasource::get_datasource_definition,
+            $crate::commands::datasource::create_datasource_definition,
+            $crate::commands::datasource::update_datasource_definition,
+            $crate::commands::datasource::delete_datasource_definition,
+            $crate::commands::datasource::duplicate_datasource_definition,
+            $crate::commands::datasource::run_datasource_definition,
+            $crate::commands::datasource::list_datasource_consumers,
+            $crate::commands::datasource::preview_datasource_impact,
+            $crate::commands::datasource::bind_widget_to_datasource,
+            $crate::commands::datasource::unbind_widget_from_datasource,
+            $crate::commands::datasource::export_datasource_definitions,
+            $crate::commands::datasource::import_datasource_definitions,
+            // W37: external open-source catalog
+            $crate::commands::external_source::list_external_sources,
+            $crate::commands::external_source::set_external_source_enabled,
+            $crate::commands::external_source::set_external_source_credential,
+            $crate::commands::external_source::test_external_source,
+            $crate::commands::external_source::save_external_source_as_datasource,
+            $crate::commands::external_source::preview_external_source_impact,
             // Cost commands (W22)
             $crate::commands::cost::get_session_cost_snapshot,
             $crate::commands::cost::get_cost_summary,
@@ -225,6 +353,13 @@ macro_rules! generate_handler {
             // Config commands
             $crate::commands::config::get_config,
             $crate::commands::config::set_config,
+            // W47: assistant language settings
+            $crate::commands::language::list_assistant_languages,
+            $crate::commands::language::get_app_assistant_language,
+            $crate::commands::language::set_app_assistant_language,
+            $crate::commands::language::set_dashboard_language_policy,
+            $crate::commands::language::set_session_language_policy,
+            $crate::commands::language::resolve_assistant_language,
             // System commands
             $crate::commands::system::get_app_info,
             $crate::commands::system::open_url,
@@ -277,6 +412,8 @@ async fn run_startup_e2e_smoke(state: AppState, report_path: PathBuf) -> anyhow:
         created_at: now,
         updated_at: now,
         parameters: Vec::new(),
+        model_policy: None,
+        language_policy: None,
     };
 
     for workflow in &dashboard.workflows {

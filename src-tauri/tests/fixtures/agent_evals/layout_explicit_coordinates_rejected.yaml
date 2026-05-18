@@ -1,0 +1,48 @@
+id: layout_explicit_coordinates_rejected
+description: |
+  W45: agent set explicit `x`/`y` on a new widget. Auto-pack owns
+  placement; the validator must reject the proposal with
+  `proposed_explicit_coordinates`. The same proposal also conflicts
+  `size_preset` with raw `w`/`h`, so `conflicting_layout_fields` must
+  fire as well.
+
+trace:
+  proposal:
+    id: prop-layout-bad
+    title: Active releases
+    widgets:
+      - widget_type: stat
+        title: Active releases
+        data: 0
+        datasource_plan:
+          kind: builtin_tool
+          tool_name: http_request
+          arguments:
+            method: GET
+            url: https://api.example.test/releases
+          pipeline:
+            - { kind: pick, path: data.releases }
+            - { kind: length }
+        x: 3
+        y: 0
+        size_preset: kpi
+        w: 6
+  tool_calls: []
+  plan:
+    summary: One step propose.
+    steps:
+      - { id: s1, title: Propose, kind: propose }
+  usage:
+    provider_kind: openrouter
+    model: claude-haiku-4-5
+    prompt: 1200
+    completion: 180
+
+assertions:
+  - kind: validator_fails_with
+    issue: proposed_explicit_coordinates
+  - kind: validator_fails_with
+    issue: conflicting_layout_fields
+  - kind: proposal_widget
+    count: 1
+    widget_type: stat

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Sidebar } from './components/layout/Sidebar';
 import { DashboardGrid } from './components/layout/DashboardGrid';
@@ -9,15 +9,19 @@ import { ProviderSettings } from './components/layout/ProviderSettings';
 import { McpSettings } from './components/layout/McpSettings';
 import { MemorySettings } from './components/layout/MemorySettings';
 import { CostsView } from './components/layout/CostsView';
+import { DatrinaLogo } from './components/branding/DatrinaLogo';
 import { HistoryDrawer } from './components/dashboard/HistoryDrawer';
 import { Playground } from './components/playground/Playground';
 import { TemplateGallery } from './components/onboarding/TemplateGallery';
 import { AlertsView } from './components/alerts/AlertsView';
 import { AlertEditorModal } from './components/alerts/AlertEditorModal';
+import { Workbench } from './components/datasource/Workbench';
+import { SourceCatalog } from './components/sources/SourceCatalog';
+import { OperationsView } from './components/operations/OperationsView';
 import type { WidgetAlertStatus } from './components/layout/DashboardGrid';
 import type { DashboardTemplate } from './lib/templates';
-import { ALERT_EVENT_CHANNEL, alertApi, configApi, dashboardApi, providerApi } from './lib/api';
-import type { AlertEvent, AlertSeverity, BuildProposal, CreateProviderRequest, Dashboard, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WorkflowEventEnvelope, WorkflowRun } from './lib/api';
+import { ALERT_EVENT_CHANNEL, WIDGET_STREAM_EVENT_CHANNEL, alertApi, configApi, dashboardApi, providerApi } from './lib/api';
+import type { AlertEvent, AlertSeverity, BuildProposal, CreateProviderRequest, Dashboard, DashboardWidgetRefreshResult, LLMProvider, UpdateProviderRequest, Widget, WidgetRuntimeData, WidgetStreamEnvelope, WidgetStreamState, WorkflowEventEnvelope, WorkflowRun } from './lib/api';
 
 function App() {
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
@@ -36,8 +40,10 @@ function App() {
     const root = window.document.documentElement;
     if (theme === 'dark') {
       root.classList.add('dark');
+      root.classList.remove('is-light');
     } else {
       root.classList.remove('dark');
+      root.classList.add('is-light');
     }
     window.localStorage.setItem('datrina:theme', theme);
   }, [theme]);
@@ -47,6 +53,15 @@ function App() {
   const [statusMessage, setStatusMessage] = useState('Ready');
   const [error, setError] = useState<string | null>(null);
   const [widgetData, setWidgetData] = useState<Record<string, WidgetRuntimeData | undefined>>({});
+  // W36: per-widget snapshot timestamp. Non-null means the data shown
+  // came from the last-known-good cache and a live refresh has not
+  // produced fresh data yet. Cleared on every successful refresh.
+  const [widgetCachedAt, setWidgetCachedAt] = useState<Record<string, number | undefined>>({});
+  // W42: per-widget live streaming state. Populated by `widget:stream`
+  // events; the final widget runtime value is still owned by
+  // `widgetData` and only committed after the server acknowledges the
+  // refresh succeeded.
+  const [widgetStream, setWidgetStream] = useState<Record<string, WidgetStreamState | undefined>>({});
   const [widgetErrors, setWidgetErrors] = useState<Record<string, string | undefined>>({});
   const [workflowRuns, setWorkflowRuns] = useState<Record<string, WorkflowRun | undefined>>({});
   const [refreshingWidgetId, setRefreshingWidgetId] = useState<string | null>(null);
@@ -58,10 +73,13 @@ function App() {
   const [isCostsViewOpen, setIsCostsViewOpen] = useState(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [undoToast, setUndoToast] = useState<{ versionId: string; label: string } | null>(null);
-  const [route, setRoute] = useState<'dashboards' | 'playground' | 'alerts'>(() => {
+  const [route, setRoute] = useState<'dashboards' | 'playground' | 'alerts' | 'workbench' | 'sources' | 'operations'>(() => {
     if (typeof window === 'undefined') return 'dashboards';
     if (window.location.hash === '#/playground') return 'playground';
     if (window.location.hash === '#/alerts') return 'alerts';
+    if (window.location.hash === '#/workbench') return 'workbench';
+    if (window.location.hash === '#/sources') return 'sources';
+    if (window.location.hash.startsWith('#/operations')) return 'operations';
     return 'dashboards';
   });
   const [alertEvents, setAlertEvents] = useState<AlertEvent[]>([]);
@@ -69,6 +87,126 @@ function App() {
   const [alertEditorWidgetId, setAlertEditorWidgetId] = useState<string | null>(null);
   const [isTemplateGalleryOpen, setIsTemplateGalleryOpen] = useState(false);
   const [pendingBuildPrompt, setPendingBuildPrompt] = useState<string | null>(null);
+  // W28: bumping this forces ChatPanel to drop any reused session and
+  // open a fresh draft. Each top-bar Build click, template launch, and
+  // Playground "Use as widget" mints a new value.
+  const [freshChatSessionKey, setFreshChatSessionKey] = useState(0);
+
+  // W40: monotonic per-widget supersede counter. Every refresh issues a
+  // ticket; a refresh result is only applied when its ticket is still
+  // the latest one for that widget. This prevents a slow shared
+  // workflow from clobbering a fresher run that landed in the
+  // meantime (e.g. user clicks Refresh on one widget, then a batch
+  // refresh from a parameter change completes after).
+  const refreshTickets = useRef<Map<string, number>>(new Map());
+  const issueRefreshTicket = useCallback((widgetIds: string[]) => {
+    const tickets = new Map<string, number>();
+    for (const id of widgetIds) {
+      const next = (refreshTickets.current.get(id) ?? 0) + 1;
+      refreshTickets.current.set(id, next);
+      tickets.set(id, next);
+    }
+    return tickets;
+  }, []);
+  const isLatestTicket = useCallback(
+    (widgetId: string, ticket: number) => refreshTickets.current.get(widgetId) === ticket,
+    [],
+  );
+
+  const applyBatchedRefreshResults = useCallback(
+    (results: DashboardWidgetRefreshResult[], tickets: Map<string, number>) => {
+      const dataPatch: Record<string, WidgetRuntimeData> = {};
+      const dataReset: string[] = [];
+      const errorPatch: Record<string, string | undefined> = {};
+      const cachedReset: string[] = [];
+      for (const result of results) {
+        const ticket = tickets.get(result.widget_id);
+        if (ticket === undefined || !isLatestTicket(result.widget_id, ticket)) continue;
+        if (result.data) {
+          dataPatch[result.widget_id] = result.data;
+          errorPatch[result.widget_id] = undefined;
+          cachedReset.push(result.widget_id);
+        } else if (result.error) {
+          errorPatch[result.widget_id] = result.error;
+        } else {
+          errorPatch[result.widget_id] = `Widget refresh returned no runtime data: ${result.status}`;
+        }
+        // success path also drops the row from widgetData when no data
+        // came back (we'd otherwise keep stale prior data with an
+        // error banner on top).
+        if (!result.data && (result.error || result.status !== 'ok')) {
+          dataReset.push(result.widget_id);
+        }
+      }
+      if (Object.keys(dataPatch).length > 0 || dataReset.length > 0) {
+        setWidgetData(prev => {
+          const next = { ...prev, ...dataPatch };
+          for (const id of dataReset) next[id] = undefined;
+          return next;
+        });
+      }
+      if (Object.keys(errorPatch).length > 0) {
+        setWidgetErrors(prev => ({ ...prev, ...errorPatch }));
+      }
+      if (cachedReset.length > 0) {
+        setWidgetCachedAt(prev => {
+          const next = { ...prev };
+          for (const id of cachedReset) next[id] = undefined;
+          return next;
+        });
+      }
+    },
+    [isLatestTicket],
+  );
+
+  const refreshDashboardWidgets = useCallback(async (dashboard: Dashboard) => {
+    // W36: paint last-known-good data immediately so the dashboard
+    // appears populated before any live refresh runs. The backend has
+    // already pruned snapshots whose fingerprint no longer matches the
+    // current widget, so anything that comes back is safe to display.
+    try {
+      const snapshots = await dashboardApi.listWidgetSnapshots(dashboard.id);
+      if (snapshots.length > 0) {
+        const dataPatch: Record<string, WidgetRuntimeData> = {};
+        const cachedPatch: Record<string, number> = {};
+        for (const snap of snapshots) {
+          dataPatch[snap.widget_id] = snap.runtime_data;
+          cachedPatch[snap.widget_id] = snap.captured_at;
+        }
+        setWidgetData(prev => ({ ...prev, ...dataPatch }));
+        setWidgetCachedAt(prev => ({ ...prev, ...cachedPatch }));
+      }
+    } catch (err) {
+      console.warn('Failed to hydrate widget snapshots:', err);
+    }
+
+    // W40: one Tauri call refreshes the whole grid. The backend
+    // dedupes by workflow_id and runs independent workflows
+    // concurrently, so an 8-widget dashboard backed by two shared
+    // sources no longer pays for eight sequential refreshes.
+    const widgetIds = dashboard.layout.map(w => w.id);
+    if (widgetIds.length === 0) {
+      setRefreshingWidgetId(null);
+      return;
+    }
+    const tickets = issueRefreshTicket(widgetIds);
+    setRefreshingWidgetId(widgetIds[0] ?? null);
+    try {
+      const results = await dashboardApi.refreshDashboardWidgets(dashboard.id);
+      applyBatchedRefreshResults(results, tickets);
+    } catch (err) {
+      const message = errorMessage(err, 'Failed to refresh widgets');
+      setWidgetErrors(prev => {
+        const next = { ...prev };
+        for (const id of widgetIds) {
+          if (isLatestTicket(id, tickets.get(id) ?? -1)) next[id] = message;
+        }
+        return next;
+      });
+    } finally {
+      setRefreshingWidgetId(null);
+    }
+  }, [applyBatchedRefreshResults, isLatestTicket, issueRefreshTicket]);
 
   const loadDashboards = useCallback(async () => {
     try {
@@ -76,7 +214,9 @@ function App() {
       const data = await dashboardApi.list();
       setDashboards(data);
       if (data.length > 0 && !activeId) {
-        setActiveId(data[0].id);
+        const first = data[0];
+        setActiveId(first.id);
+        await refreshDashboardWidgets(first);
       }
     } catch (err) {
       console.error('Failed to load dashboards:', err);
@@ -84,7 +224,7 @@ function App() {
     } finally {
       setIsReady(true);
     }
-  }, [activeId]);
+  }, [activeId, refreshDashboardWidgets]);
 
   useEffect(() => {
     loadDashboards();
@@ -94,18 +234,21 @@ function App() {
     try {
       const data = await providerApi.list();
       const configuredActiveId = await configApi.get('active_provider_id');
+      // W29: only honour `active_provider_id` — no silent "first enabled"
+      // fallback. If the stored active provider is missing, disabled, or
+      // marked unsupported by the migration shim, the chat/build UI
+      // surfaces the typed correction state (open Provider Settings).
       const configuredProvider = configuredActiveId
-        ? data.find(provider => provider.id === configuredActiveId && provider.is_enabled)
+        ? data.find(provider =>
+            provider.id === configuredActiveId
+            && provider.is_enabled
+            && !provider.is_unsupported,
+          )
         : undefined;
-      const fallbackProvider = data.find(provider => provider.is_enabled);
-      const nextActiveId = configuredProvider?.id ?? fallbackProvider?.id ?? null;
+      const nextActiveId = configuredProvider?.id ?? null;
 
       setProviders(data);
       setActiveProviderId(nextActiveId);
-
-      if (nextActiveId && nextActiveId !== configuredActiveId) {
-        await configApi.set('active_provider_id', nextActiveId);
-      }
     } catch (err) {
       console.error('Failed to load providers:', err);
       setError(errorMessage(err, 'Failed to load providers'));
@@ -158,9 +301,122 @@ function App() {
     };
   }, []);
 
+  // W42: subscribe to widget refresh stream events. Updates only
+  // overwrite per-widget partial state when the event's `refresh_run_id`
+  // is at least as new as the one we are already tracking — anything
+  // from an older run is dropped so a slow superseded refresh does not
+  // overwrite the partials of a freshly started one. Final/failed
+  // envelopes always clear the partial state for their run id.
+  useEffect(() => {
+    const unsubscribe = listen<WidgetStreamEnvelope>(WIDGET_STREAM_EVENT_CHANNEL, event => {
+      const payload = event.payload;
+      setWidgetStream(prev => {
+        const existing = prev[payload.widget_id];
+        // Drop deltas that belong to a refresh older than the one we
+        // are tracking (sequence/run-id ordering safety from the doc).
+        if (
+          existing &&
+          existing.runId !== payload.refresh_run_id &&
+          (payload.kind === 'text_delta' ||
+            payload.kind === 'reasoning_delta' ||
+            payload.kind === 'status')
+        ) {
+          return prev;
+        }
+        switch (payload.kind) {
+          case 'refresh_started':
+            return {
+              ...prev,
+              [payload.widget_id]: {
+                runId: payload.refresh_run_id,
+                status: 'starting',
+                partialText: '',
+                reasoningText: '',
+                hasReasoning: false,
+              },
+            };
+          case 'reasoning_delta':
+            return {
+              ...prev,
+              [payload.widget_id]: {
+                runId: payload.refresh_run_id,
+                status: 'reasoning',
+                partialText: existing?.partialText ?? '',
+                reasoningText: (existing?.reasoningText ?? '') + (payload.text ?? ''),
+                hasReasoning: true,
+                statusHint: existing?.statusHint,
+              },
+            };
+          case 'text_delta':
+            return {
+              ...prev,
+              [payload.widget_id]: {
+                runId: payload.refresh_run_id,
+                status: 'streaming',
+                partialText: (existing?.partialText ?? '') + (payload.text ?? ''),
+                reasoningText: existing?.reasoningText ?? '',
+                hasReasoning: existing?.hasReasoning ?? false,
+                statusHint: existing?.statusHint,
+              },
+            };
+          case 'status':
+            return {
+              ...prev,
+              [payload.widget_id]: {
+                runId: payload.refresh_run_id,
+                status: 'waiting',
+                partialText: existing?.partialText ?? '',
+                reasoningText: existing?.reasoningText ?? '',
+                hasReasoning: existing?.hasReasoning ?? false,
+                statusHint: payload.status,
+              },
+            };
+          case 'final':
+          case 'superseded': {
+            // Drop partial state only when the terminal event belongs
+            // to the run we are tracking; otherwise leave whatever the
+            // newer run already published in place.
+            if (existing && existing.runId !== payload.refresh_run_id) return prev;
+            const next = { ...prev };
+            delete next[payload.widget_id];
+            return next;
+          }
+          case 'failed': {
+            if (existing && existing.runId !== payload.refresh_run_id) return prev;
+            return {
+              ...prev,
+              [payload.widget_id]: {
+                runId: payload.refresh_run_id,
+                status: 'failed',
+                partialText: existing?.partialText ?? '',
+                reasoningText: existing?.reasoningText ?? '',
+                hasReasoning: existing?.hasReasoning ?? false,
+                statusHint: existing?.statusHint,
+                error: payload.error,
+                partialOnFail: payload.partial_text ?? existing?.partialText,
+              },
+            };
+          }
+          default:
+            return prev;
+        }
+      });
+    });
+
+    return () => {
+      unsubscribe.then(dispose => dispose()).catch(err => {
+        console.error('Failed to unsubscribe from widget stream events:', err);
+      });
+    };
+  }, []);
+
   const activeDashboard = dashboards.find(d => d.id === activeId);
-  const activeProvider = providers.find(provider => provider.id === activeProviderId && provider.is_enabled)
-    ?? providers.find(provider => provider.is_enabled);
+  // W29: strict active provider — no silent first-enabled fallback.
+  const activeProvider = providers.find(provider =>
+    provider.id === activeProviderId
+    && provider.is_enabled
+    && !provider.is_unsupported,
+  );
 
   const handleSelectDashboard = async (id: string) => {
     setActiveId(id);
@@ -170,6 +426,8 @@ function App() {
     try {
       const dashboard = await dashboardApi.get(id);
       setDashboards(prev => upsertDashboard(prev, dashboard));
+      setStatusMessage('Refreshing widgets...');
+      await refreshDashboardWidgets(dashboard);
       setStatusMessage('Dashboard loaded');
     } catch (err) {
       console.error('Failed to load dashboard:', err);
@@ -326,13 +584,22 @@ function App() {
       }
 
       const newWidgets = updated.layout.slice(Math.max(0, updated.layout.length - proposal.widgets.length));
-      for (const widget of newWidgets) {
-        setRefreshingWidgetId(widget.id);
-        const result = await dashboardApi.refreshWidget(updated.id, widget.id);
-        if (result.data) {
-          setWidgetData(prev => ({ ...prev, [widget.id]: result.data }));
-        } else if (result.error) {
-          setWidgetErrors(prev => ({ ...prev, [widget.id]: result.error }));
+      const newWidgetIds = newWidgets.map(w => w.id);
+      if (newWidgetIds.length > 0) {
+        const tickets = issueRefreshTicket(newWidgetIds);
+        setRefreshingWidgetId(newWidgetIds[0] ?? null);
+        try {
+          const results = await dashboardApi.refreshDashboardWidgets(updated.id, newWidgetIds);
+          applyBatchedRefreshResults(results, tickets);
+        } catch (err) {
+          const message = errorMessage(err, 'Failed to refresh widget');
+          setWidgetErrors(prev => {
+            const next = { ...prev };
+            for (const id of newWidgetIds) {
+              if (isLatestTicket(id, tickets.get(id) ?? -1)) next[id] = message;
+            }
+            return next;
+          });
         }
       }
     } catch (err) {
@@ -354,14 +621,14 @@ function App() {
       setActiveId(restored.id);
       setUndoToast(null);
       setStatusMessage('Version restored');
-      for (const widget of restored.layout) {
+      const widgetIds = restored.layout.map(w => w.id);
+      if (widgetIds.length > 0) {
+        const tickets = issueRefreshTicket(widgetIds);
         try {
-          const result = await dashboardApi.refreshWidget(restored.id, widget.id);
-          if (result.data) {
-            setWidgetData(prev => ({ ...prev, [widget.id]: result.data }));
-          }
+          const results = await dashboardApi.refreshDashboardWidgets(restored.id, widgetIds);
+          applyBatchedRefreshResults(results, tickets);
         } catch (err) {
-          console.warn(`Failed to refresh widget ${widget.id} after restore:`, err);
+          console.warn('Failed to refresh widgets after restore:', err);
         }
       }
     } catch (err) {
@@ -383,6 +650,9 @@ function App() {
       const hash = window.location.hash;
       if (hash === '#/playground') setRoute('playground');
       else if (hash === '#/alerts') setRoute('alerts');
+      else if (hash === '#/workbench') setRoute('workbench');
+      else if (hash === '#/sources') setRoute('sources');
+      else if (hash.startsWith('#/operations')) setRoute('operations');
       else setRoute('dashboards');
     };
     window.addEventListener('hashchange', sync);
@@ -402,6 +672,25 @@ function App() {
   const navigateToAlerts = useCallback(() => {
     window.location.hash = '#/alerts';
     setRoute('alerts');
+  }, []);
+
+  const navigateToWorkbench = useCallback(() => {
+    window.location.hash = '#/workbench';
+    setRoute('workbench');
+  }, []);
+
+  const navigateToSources = useCallback(() => {
+    window.location.hash = '#/sources';
+    setRoute('sources');
+  }, []);
+
+  const navigateToOperations = useCallback((opts?: { workflowId?: string; runId?: string }) => {
+    const params = new URLSearchParams();
+    if (opts?.workflowId) params.set('workflow_id', opts.workflowId);
+    if (opts?.runId) params.set('run_id', opts.runId);
+    const query = params.toString();
+    window.location.hash = query ? `#/operations?${query}` : '#/operations';
+    setRoute('operations');
   }, []);
 
   // W21: keep the Sidebar badge + per-widget dot in sync. The count
@@ -459,11 +748,34 @@ function App() {
     return out;
   }, [alertEvents]);
 
+  // W28: seeded Build entrypoints (templates, Playground, fork-from-message)
+  // must land in a *fresh* Build chat, not in the latest matching session.
+  // Bumping freshChatSessionKey tells ChatPanel to drop any reused session.
   const openBuildChatWithPrompt = useCallback((prompt: string) => {
     setPendingBuildPrompt(prompt);
     setChatMode('build');
     setIsChatOpen(true);
+    setFreshChatSessionKey(k => k + 1);
   }, []);
+
+  // W28: top-bar Build button. If a Build chat is already open we just
+  // surface it. If it isn't, force a fresh Build draft so the user does
+  // not silently land inside the last persisted Build session for this
+  // dashboard.
+  const openBuildChatFromTopBar = useCallback(() => {
+    setChatMode('build');
+    if (!isChatOpen) {
+      setFreshChatSessionKey(k => k + 1);
+    }
+    setIsChatOpen(true);
+  }, [isChatOpen]);
+
+  // W28: "Fork to fresh Build chat" — explicit honest path for retrying
+  // a Build prompt without inheriting the prior session's derived plan
+  // state, cost totals, or proposal pipeline.
+  const forkToFreshBuildChat = useCallback((prompt: string) => {
+    openBuildChatWithPrompt(prompt);
+  }, [openBuildChatWithPrompt]);
 
   const handleTemplateSelect = useCallback(async (template: DashboardTemplate) => {
     if (template.launch === 'playground') {
@@ -480,8 +792,12 @@ function App() {
       if (template.launch === 'build_chat' && template.prompt) {
         openBuildChatWithPrompt(template.prompt);
       } else {
+        // W28: even template launches without a seeded prompt should
+        // open a fresh Build draft instead of reusing the last Build
+        // session for the just-created dashboard.
         setChatMode('build');
         setIsChatOpen(true);
+        setFreshChatSessionKey(k => k + 1);
       }
       setStatusMessage('Template ready — describe what you need in chat');
     } catch (err) {
@@ -497,11 +813,19 @@ function App() {
     setRefreshingWidgetId(widgetId);
     setWidgetErrors(prev => ({ ...prev, [widgetId]: undefined }));
     setStatusMessage('Refreshing widget...');
+    // W40: tag this run so a stale batched refresh can't overwrite it.
+    const tickets = issueRefreshTicket([widgetId]);
+    const ticket = tickets.get(widgetId) ?? -1;
 
     try {
       const result = await dashboardApi.refreshWidget(activeDashboard.id, widgetId);
+      if (!isLatestTicket(widgetId, ticket)) {
+        setStatusMessage('Widget refresh superseded');
+        return;
+      }
       if (result.data) {
         setWidgetData(prev => ({ ...prev, [widgetId]: result.data }));
+        setWidgetCachedAt(prev => ({ ...prev, [widgetId]: undefined }));
         setStatusMessage('Widget refreshed');
         return;
       }
@@ -514,6 +838,7 @@ function App() {
       setWidgetErrors(prev => ({ ...prev, [widgetId]: reason }));
       setStatusMessage('Widget refresh unavailable');
     } catch (err) {
+      if (!isLatestTicket(widgetId, ticket)) return;
       console.error('Failed to refresh widget:', err);
       setWidgetErrors(prev => ({ ...prev, [widgetId]: errorMessage(err, 'Failed to refresh widget') }));
       setStatusMessage('Widget refresh failed');
@@ -645,9 +970,7 @@ function App() {
         <div className="text-center space-y-4">
           <div className="relative w-14 h-14 rounded-lg bg-gradient-to-br from-primary/20 to-accent/20 flex items-center justify-center mx-auto border border-primary/30">
             <span className="neon-pulse" aria-hidden />
-            <svg className="w-7 h-7 text-primary relative" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-            </svg>
+            <DatrinaLogo className="relative h-10 w-10 rounded-md border border-primary/30 bg-background/80" imageClassName="scale-110" />
           </div>
           <p className="text-muted-foreground text-xs mono uppercase tracking-[0.2em]">Booting Datrina…</p>
         </div>
@@ -674,6 +997,12 @@ function App() {
         isPlaygroundActive={route === 'playground'}
         onOpenAlerts={navigateToAlerts}
         isAlertsActive={route === 'alerts'}
+        onOpenWorkbench={navigateToWorkbench}
+        isWorkbenchActive={route === 'workbench'}
+        onOpenSources={navigateToSources}
+        isSourcesActive={route === 'sources'}
+        onOpenOperations={() => navigateToOperations()}
+        isOperationsActive={route === 'operations'}
         unacknowledgedAlertCount={unacknowledgedAlertCount}
         isCollapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
@@ -685,7 +1014,7 @@ function App() {
           activeProvider={activeProvider}
           isChatOpen={isChatOpen}
           onToggleChat={() => setIsChatOpen(!isChatOpen)}
-          onOpenBuildChat={() => { setChatMode('build'); setIsChatOpen(true); }}
+          onOpenBuildChat={openBuildChatFromTopBar}
           onOpenSettings={() => setIsProviderSettingsOpen(true)}
         />
 
@@ -713,13 +1042,58 @@ function App() {
                 navigateToDashboards();
                 handleSelectDashboard(dashboardId);
               }}
+              onJumpToRun={(runId) => navigateToOperations({ runId })}
               onClose={navigateToDashboards}
             />
+          ) : route === 'workbench' ? (
+            <Workbench
+              onClose={navigateToDashboards}
+              onJumpToWidget={(dashboardId) => {
+                navigateToDashboards();
+                handleSelectDashboard(dashboardId);
+              }}
+              onJumpToOperations={(workflowId) => navigateToOperations({ workflowId })}
+            />
+          ) : route === 'sources' ? (
+            <SourceCatalog
+              onClose={navigateToDashboards}
+              onOpenWorkbench={navigateToWorkbench}
+            />
+          ) : route === 'operations' ? (
+            (() => {
+              // Parse the hash query once per render so deep-links like
+              // `#/operations?workflow_id=…&run_id=…` map to the
+              // OperationsView props. Returning a tuple via IIFE keeps
+              // the JSX site readable.
+              const params = (() => {
+                if (typeof window === 'undefined') return null;
+                const hash = window.location.hash;
+                const idx = hash.indexOf('?');
+                if (idx < 0) return null;
+                return new URLSearchParams(hash.slice(idx + 1));
+              })();
+              const workflowId = params?.get('workflow_id') ?? undefined;
+              const runId = params?.get('run_id') ?? undefined;
+              return (
+                <OperationsView
+                  onClose={navigateToDashboards}
+                  onJumpToWidget={(dashboardId) => {
+                    navigateToDashboards();
+                    handleSelectDashboard(dashboardId);
+                  }}
+                  onJumpToDatasource={() => navigateToWorkbench()}
+                  initialFilter={workflowId ? { workflow_id: workflowId } : undefined}
+                  initialRunId={runId}
+                />
+              );
+            })()
           ) : activeDashboard ? (
             <DashboardGrid
               dashboard={activeDashboard}
               widgetData={widgetData}
+              widgetCachedAt={widgetCachedAt}
               widgetErrors={widgetErrors}
+              widgetStream={widgetStream}
               workflowRuns={workflowRuns}
               refreshingWidgetId={refreshingWidgetId}
               onRefreshWidget={handleRefreshWidget}
@@ -729,6 +1103,10 @@ function App() {
               onOpenHistory={() => setIsHistoryOpen(true)}
               widgetAlertStatus={widgetAlertStatus}
               onOpenAlertsEditor={(widgetId) => setAlertEditorWidgetId(widgetId)}
+              providers={providers}
+              onDashboardChange={(updated) =>
+                setDashboards((prev) => upsertDashboard(prev, updated))
+              }
             />
           ) : (
             <TemplateGallery
@@ -751,9 +1129,12 @@ function App() {
           canApplyToDashboard={Boolean(activeDashboard)}
           initialPrompt={pendingBuildPrompt ?? undefined}
           onInitialPromptConsumed={() => setPendingBuildPrompt(null)}
+          freshSessionKey={freshChatSessionKey}
           onClose={() => setIsChatOpen(false)}
           onModeChange={setChatMode}
           onApplyBuildProposal={handleApplyBuildProposal}
+          onOpenProviderSettings={() => setIsProviderSettingsOpen(true)}
+          onForkBuildChat={forkToFreshBuildChat}
         />
       )}
 

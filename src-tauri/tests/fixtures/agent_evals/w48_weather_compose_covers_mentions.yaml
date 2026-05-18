@@ -1,0 +1,60 @@
+id: w48_weather_compose_covers_mentions
+description: |
+  W48 happy path. The user mentioned both an open-meteo "forecast" datasource
+  and an "air_quality" datasource, then asked Build chat for one text widget
+  combining the two. The captured proposal uses kind="compose" with both
+  inner plans referencing the named datasource_definition_id values inside
+  their arguments. The validator must not flag UnusedSourceMention.
+
+mentioned_sources:
+  - label: Open-Meteo forecast
+    datasource_definition_id: def-forecast
+  - label: Open-Meteo air quality
+    datasource_definition_id: def-air
+
+trace:
+  proposal:
+    id: prop-w48-happy
+    title: Weather narrative
+    widgets:
+      - widget_type: text
+        title: "Weather + air quality narrative"
+        data: ""
+        datasource_plan:
+          kind: compose
+          pipeline:
+            - kind: llm_postprocess
+              shape: text
+              prompt: "Summarise current weather and air quality in two short paragraphs."
+          inputs:
+            forecast:
+              kind: builtin_tool
+              tool_name: http_request
+              arguments:
+                method: GET
+                url: "https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
+                datasource_definition_id: def-forecast
+            air_quality:
+              kind: builtin_tool
+              tool_name: http_request
+              arguments:
+                method: GET
+                url: "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=52.52&longitude=13.41&current=pm2_5,pm10,ozone"
+                datasource_definition_id: def-air
+  tool_calls: []
+  plan:
+    summary: "Combine forecast + air-quality into one text widget."
+    steps: []
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 1500
+    completion: 700
+
+assertions:
+  - kind: source_mentions_covered
+  - kind: proposal_widget
+    count: 1
+    widget_type: text
+  - kind: cost_lt_usd
+    value: 0.1

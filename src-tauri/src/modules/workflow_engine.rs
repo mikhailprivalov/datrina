@@ -12,6 +12,7 @@ use crate::models::workflow::{
 use crate::models::Id;
 use crate::modules::ai::AIEngine;
 use crate::modules::mcp_manager::MCPManager;
+use crate::modules::storage::Storage;
 use crate::modules::tool_engine::ToolEngine;
 
 pub struct WorkflowExecution {
@@ -25,6 +26,18 @@ pub struct WorkflowEngine<'a> {
     mcp_manager: Option<&'a MCPManager>,
     ai_engine: Option<&'a AIEngine>,
     provider: Option<LLMProvider>,
+    /// W37: optional storage handle used at runtime to resolve external
+    /// source credentials when a workflow node carries a
+    /// `_external_source_id` reference. Off-by-default so call-sites
+    /// that don't care about BYOK (legacy paths, tests) keep working.
+    storage: Option<&'a Storage>,
+    /// W47: resolved assistant language directive injected into the
+    /// system prompt of every LLM-backed node + pipeline step. `None`
+    /// means "no override" — providers receive the original system
+    /// prompt and follow the user's language. The string itself is
+    /// produced by
+    /// [`crate::models::language::EffectiveAssistantLanguage::system_directive`].
+    language_directive: Option<String>,
 }
 
 impl<'a> WorkflowEngine<'a> {
@@ -34,6 +47,8 @@ impl<'a> WorkflowEngine<'a> {
             mcp_manager: None,
             ai_engine: None,
             provider: None,
+            storage: None,
+            language_directive: None,
         }
     }
 
@@ -43,6 +58,8 @@ impl<'a> WorkflowEngine<'a> {
             mcp_manager: None,
             ai_engine: None,
             provider: None,
+            storage: None,
+            language_directive: None,
         }
     }
 
@@ -57,7 +74,28 @@ impl<'a> WorkflowEngine<'a> {
             mcp_manager: Some(mcp_manager),
             ai_engine: Some(ai_engine),
             provider,
+            storage: None,
+            language_directive: None,
         }
+    }
+
+    /// W37: attach the storage handle so saved external-source
+    /// datasources can resolve their credentials at run-time without
+    /// the key ever being inlined into the workflow JSON.
+    pub fn with_storage(mut self, storage: &'a Storage) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// W47: attach the resolved assistant language directive so the
+    /// engine's LLM node and any `LlmPostprocess` pipeline steps get a
+    /// localized system prompt without each call site having to thread
+    /// the string itself. Caller is responsible for resolving the
+    /// effective language (session → dashboard → app) before passing it
+    /// in; the engine treats `None` as "no injection".
+    pub fn with_language(mut self, directive: Option<String>) -> Self {
+        self.language_directive = directive;
+        self
     }
 
     /// Execute a workflow by ID
@@ -238,11 +276,18 @@ impl<'a> WorkflowEngine<'a> {
                     .and_then(|key| context.get(key))
                     .cloned()
                     .unwrap_or_else(|| serde_json::to_value(context).unwrap_or(json!({})));
+                let system = compose_system_prompt(
+                    "You are executing a Datrina workflow LLM node. Return concise content for downstream workflow nodes.",
+                    self.language_directive.as_deref(),
+                );
                 let messages = vec![
-                    runtime_chat_message(MessageRole::System, "You are executing a Datrina workflow LLM node. Return concise content for downstream workflow nodes."),
+                    runtime_chat_message(MessageRole::System, &system),
                     runtime_chat_message(
                         MessageRole::User,
-                        &format!("Prompt: {}\nWorkflow context JSON: {}", prompt, grounded_input),
+                        &format!(
+                            "Prompt: {}\nWorkflow context JSON: {}",
+                            prompt, grounded_input
+                        ),
                     ),
                 ];
                 let response = ai_engine.complete_chat(provider, &messages).await?;
@@ -297,6 +342,7 @@ impl<'a> WorkflowEngine<'a> {
                             self.ai_engine,
                             self.provider.as_ref(),
                             self.mcp_manager,
+                            self.language_directive.as_deref(),
                         )
                         .await
                     }
@@ -333,11 +379,25 @@ impl<'a> WorkflowEngine<'a> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                // Optional alias map: { <node_id>: <output_key> }. When
+                // provided, the merged object uses the alias instead of
+                // the raw node id. Lets a compose plan name its inputs
+                // independently of the internal node naming.
+                let key_map = config
+                    .get("key_map")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
 
                 let mut merged = serde_json::Map::new();
                 for key in &keys {
                     if let Some(val) = context.get(key) {
-                        merged.insert(key.clone(), val.clone());
+                        let alias = key_map
+                            .get(key)
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| key.clone());
+                        merged.insert(alias, val.clone());
                     }
                 }
                 info!("🔗 Merged {} keys", merged.len());
@@ -386,13 +446,19 @@ impl<'a> WorkflowEngine<'a> {
                     .get("url")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("http_request requires url"))?;
+                // W37: resolve the external-source credential lazily so
+                // the workflow JSON never contains the secret. The
+                // catalog entry tells us which header to inject into.
+                let mut headers = arguments.get("headers").cloned();
+                if let Some(source_id) =
+                    arguments.get("_external_source_id").and_then(Value::as_str)
+                {
+                    headers = self
+                        .resolve_external_source_credential(source_id, headers)
+                        .await?;
+                }
                 tool_engine
-                    .http_request(
-                        method,
-                        url,
-                        arguments.get("body").cloned(),
-                        arguments.get("headers").cloned(),
-                    )
+                    .http_request(method, url, arguments.get("body").cloned(), headers)
                     .await
             }
             "curl" => {
@@ -413,6 +479,61 @@ impl<'a> WorkflowEngine<'a> {
                 tool_engine.execute_curl(args).await
             }
             other => Err(anyhow!("Unsupported built-in workflow tool '{}'", other)),
+        }
+    }
+
+    /// W37: merge the catalog-mandated credential header into the
+    /// caller-supplied header object. Honours `credential_policy`:
+    ///
+    /// * `Required` and credential absent → hard error.
+    /// * `Optional` and credential absent → leave headers untouched.
+    /// * `None` → no-op (defensive; should not be reachable from a
+    ///   correctly-built saved datasource).
+    async fn resolve_external_source_credential(
+        &self,
+        source_id: &str,
+        headers: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let source = crate::modules::external_source_catalog::find(source_id).ok_or_else(|| {
+            anyhow!(
+                "External source '{}' referenced by workflow is no longer in the catalog",
+                source_id
+            )
+        })?;
+        let storage = self.storage.ok_or_else(|| {
+            anyhow!(
+                "Workflow engine missing storage handle; cannot resolve credential for '{}'",
+                source_id
+            )
+        })?;
+        let credential = storage
+            .get_external_source_state(source_id)
+            .await?
+            .and_then(|(_, cred, _)| cred);
+        match (
+            source.credential_policy,
+            credential.as_deref(),
+            source.http.credential_header.as_deref(),
+        ) {
+            (crate::models::external_source::ExternalSourceCredentialPolicy::Required, None, _) => {
+                Err(anyhow!(
+                "External source '{}' requires a credential — open the Source Catalog and set one.",
+                source.display_name
+            ))
+            }
+            (_, Some(cred), Some(header_name)) => {
+                let prefix = source.http.credential_prefix.as_deref().unwrap_or("");
+                let mut map = match headers {
+                    Some(Value::Object(m)) => m,
+                    _ => serde_json::Map::new(),
+                };
+                map.insert(
+                    header_name.to_string(),
+                    Value::String(format!("{}{}", prefix, cred)),
+                );
+                Ok(Some(Value::Object(map)))
+            }
+            _ => Ok(headers),
         }
     }
 
@@ -709,12 +830,58 @@ async fn run_pipeline(
     ai_engine: Option<&crate::modules::ai::AIEngine>,
     provider: Option<&crate::models::provider::LLMProvider>,
     mcp_manager: Option<&MCPManager>,
+    language_directive: Option<&str>,
 ) -> Result<Value> {
     let mut current = input;
     for step in steps {
-        current = apply_pipeline_step(current, step, ai_engine, provider, mcp_manager).await?;
+        current = apply_pipeline_step(
+            current,
+            step,
+            ai_engine,
+            provider,
+            mcp_manager,
+            language_directive,
+        )
+        .await?;
     }
     Ok(current)
+}
+
+/// W37: thin wrapper that lets the external-source dispatcher reuse the
+/// regular pipeline runner without leaking `apply_pipeline_step` to the
+/// rest of the crate. Builtin/keyless sources only need deterministic
+/// steps, but the full engine is passed through so `LlmPostprocess` and
+/// `McpCall` keep working should a catalog entry need them later.
+pub async fn execute_pipeline_for_external_source(
+    state: &crate::AppState,
+    steps: &[crate::models::pipeline::PipelineStep],
+    input: Value,
+) -> Result<Value> {
+    if steps.is_empty() {
+        return Ok(input);
+    }
+    let provider = crate::resolve_active_provider(state.storage.as_ref())
+        .await
+        .ok()
+        .and_then(|inner| inner.ok());
+    // W47: external sources have no dashboard/session scope, so the
+    // app default is the only relevant policy. Resolve here so a
+    // catalog entry that ends in an LLM step honours the user's
+    // language pick.
+    let language_directive =
+        crate::commands::language::resolve_effective_language(state.storage.as_ref(), None, None)
+            .await
+            .ok()
+            .and_then(|resolved| resolved.system_directive());
+    run_pipeline(
+        input,
+        steps,
+        Some(state.ai_engine.as_ref()),
+        provider.as_ref(),
+        Some(state.mcp_manager.as_ref()),
+        language_directive.as_deref(),
+    )
+    .await
 }
 
 /// W23: trace-instrumented pipeline runner. Returns the final value and a
@@ -727,6 +894,7 @@ pub(crate) async fn run_pipeline_with_trace(
     ai_engine: Option<&crate::modules::ai::AIEngine>,
     provider: Option<&crate::models::provider::LLMProvider>,
     mcp_manager: Option<&MCPManager>,
+    language_directive: Option<&str>,
 ) -> (Value, Vec<crate::models::pipeline::PipelineStepTrace>) {
     let mut current = input;
     let mut traces = Vec::with_capacity(steps.len());
@@ -735,7 +903,16 @@ pub(crate) async fn run_pipeline_with_trace(
         let started = std::time::Instant::now();
         let kind = pipeline_step_kind(step);
         let config_json = serde_json::to_value(step).unwrap_or(Value::Null);
-        match apply_pipeline_step(current.clone(), step, ai_engine, provider, mcp_manager).await {
+        match apply_pipeline_step(
+            current.clone(),
+            step,
+            ai_engine,
+            provider,
+            mcp_manager,
+            language_directive,
+        )
+        .await
+        {
             Ok(next) => {
                 let duration_ms = started.elapsed().as_millis() as u32;
                 let output_sample = prune_for_trace(&next);
@@ -766,6 +943,183 @@ pub(crate) async fn run_pipeline_with_trace(
         }
     }
     (current, traces)
+}
+
+/// W42: pipeline step event emitted while a tail pipeline streams.
+/// Carries provider deltas so the caller can re-emit them as
+/// widget-level stream envelopes.
+pub enum PipelineStreamEvent<'a> {
+    /// We are about to execute a step; `kind` is the registered name
+    /// (e.g. "llm_postprocess").
+    StepStarted { index: usize, kind: &'a str },
+    /// LLM reasoning delta from a streaming provider.
+    ReasoningDelta(String),
+    /// LLM text delta from a streaming provider.
+    TextDelta(String),
+    /// The provider does not support streaming — we are blocked
+    /// waiting for the final response.
+    NonStreamingProgress,
+}
+
+/// W42: same as [`run_pipeline_with_trace`] but routes the terminal
+/// `LlmPostprocess { expect: Text }` step through the streaming
+/// provider path so the caller can surface partial output and
+/// reasoning state. Non-text expectations and non-final
+/// `LlmPostprocess` steps stay on the blocking path because the
+/// downstream steps need the fully-materialised value.
+pub(crate) async fn run_pipeline_with_streaming<F>(
+    input: Value,
+    steps: &[crate::models::pipeline::PipelineStep],
+    ai_engine: Option<&crate::modules::ai::AIEngine>,
+    provider: Option<&crate::models::provider::LLMProvider>,
+    mcp_manager: Option<&MCPManager>,
+    language_directive: Option<&str>,
+    mut on_event: F,
+) -> (
+    Result<Value>,
+    Vec<crate::models::pipeline::PipelineStepTrace>,
+)
+where
+    F: FnMut(PipelineStreamEvent<'_>),
+{
+    use crate::models::pipeline::{LlmExpect, PipelineStep};
+    let mut current = input;
+    let mut traces = Vec::with_capacity(steps.len());
+    let last_index = steps.len().saturating_sub(1);
+    for (index, step) in steps.iter().enumerate() {
+        let kind = pipeline_step_kind(step);
+        on_event(PipelineStreamEvent::StepStarted {
+            index,
+            kind: kind.as_str(),
+        });
+        let input_sample = prune_for_trace(&current);
+        let config_json = serde_json::to_value(step).unwrap_or(Value::Null);
+        let started = std::time::Instant::now();
+
+        let step_result: Result<Value> = match step {
+            PipelineStep::LlmPostprocess {
+                prompt,
+                expect: LlmExpect::Text,
+            } if index == last_index => {
+                stream_terminal_llm_postprocess_text(
+                    &current,
+                    prompt,
+                    ai_engine,
+                    provider,
+                    language_directive,
+                    &mut on_event,
+                )
+                .await
+            }
+            _ => {
+                apply_pipeline_step(
+                    current.clone(),
+                    step,
+                    ai_engine,
+                    provider,
+                    mcp_manager,
+                    language_directive,
+                )
+                .await
+            }
+        };
+
+        match step_result {
+            Ok(next) => {
+                let duration_ms = started.elapsed().as_millis() as u32;
+                let output_sample = prune_for_trace(&next);
+                traces.push(crate::models::pipeline::PipelineStepTrace {
+                    index: index as u32,
+                    kind,
+                    config_json,
+                    input_sample,
+                    output_sample,
+                    duration_ms,
+                    error: None,
+                });
+                current = next;
+            }
+            Err(error) => {
+                let duration_ms = started.elapsed().as_millis() as u32;
+                let error_message = error.to_string();
+                traces.push(crate::models::pipeline::PipelineStepTrace {
+                    index: index as u32,
+                    kind,
+                    config_json,
+                    input_sample,
+                    output_sample: prune_for_trace(&Value::Null),
+                    duration_ms,
+                    error: Some(error_message),
+                });
+                return (Err(error), traces);
+            }
+        }
+    }
+    (Ok(current), traces)
+}
+
+/// W42: helper used by `run_pipeline_with_streaming` for the terminal
+/// `LlmPostprocess { expect: Text }` case. Pulled out so the dispatch
+/// inside the loop stays readable and the early-error branches don't
+/// leak `?` semantics across the trace bookkeeping.
+async fn stream_terminal_llm_postprocess_text<F>(
+    current: &Value,
+    prompt: &str,
+    ai_engine: Option<&crate::modules::ai::AIEngine>,
+    provider: Option<&crate::models::provider::LLMProvider>,
+    language_directive: Option<&str>,
+    on_event: &mut F,
+) -> Result<Value>
+where
+    F: FnMut(PipelineStreamEvent<'_>),
+{
+    let engine = ai_engine.ok_or_else(|| anyhow!("LlmPostprocess requires an active provider"))?;
+    let provider_ref =
+        provider.ok_or_else(|| anyhow!("LlmPostprocess requires an active provider"))?;
+    let system = compose_system_prompt(
+        "You are a deterministic data postprocessor in a Datrina workflow pipeline. Read the JSON input and produce a CONCISE human-readable answer per the prompt. Respond with plain text or markdown; never wrap your answer in JSON.",
+        language_directive,
+    );
+    let user = format!(
+        "Prompt: {}\nInput JSON:\n{}",
+        prompt,
+        serde_json::to_string_pretty(current).unwrap_or_else(|_| current.to_string())
+    );
+    let messages = vec![
+        runtime_chat_message(MessageRole::System, &system),
+        runtime_chat_message(MessageRole::User, &user),
+    ];
+    let supports_streaming = matches!(
+        provider_ref.kind,
+        crate::models::provider::ProviderKind::Openrouter
+            | crate::models::provider::ProviderKind::Custom
+    );
+    if !supports_streaming {
+        on_event(PipelineStreamEvent::NonStreamingProgress);
+    }
+    let response = engine
+        .complete_chat_with_tools_streaming(
+            provider_ref,
+            &messages,
+            &[],
+            |event| match event {
+                crate::modules::ai::AIStreamEvent::ContentDelta(text) => {
+                    on_event(PipelineStreamEvent::TextDelta(text));
+                }
+                crate::modules::ai::AIStreamEvent::ReasoningDelta(text) => {
+                    on_event(PipelineStreamEvent::ReasoningDelta(text));
+                }
+            },
+            || false,
+        )
+        .await?;
+    Ok(Value::String(response.content))
+}
+
+/// W32: same logic as [`pipeline_step_kind`], exposed for the Studio
+/// replay command so error messages can name the rejected variant.
+pub(crate) fn pipeline_step_kind_public(step: &crate::models::pipeline::PipelineStep) -> String {
+    pipeline_step_kind(step)
 }
 
 fn pipeline_step_kind(step: &crate::models::pipeline::PipelineStep) -> String {
@@ -901,6 +1255,7 @@ async fn apply_pipeline_step(
     ai_engine: Option<&crate::modules::ai::AIEngine>,
     provider: Option<&crate::models::provider::LLMProvider>,
     mcp_manager: Option<&MCPManager>,
+    language_directive: Option<&str>,
 ) -> Result<Value> {
     use crate::models::pipeline::{LlmExpect, PipelineStep, SortOrder};
     match step {
@@ -1050,17 +1405,21 @@ async fn apply_pipeline_step(
                 ai_engine.ok_or_else(|| anyhow!("LlmPostprocess requires an active provider"))?;
             let provider =
                 provider.ok_or_else(|| anyhow!("LlmPostprocess requires an active provider"))?;
-            let system = match expect {
+            // W47: JSON-expect path keeps the strict structured-output
+            // wording — the directive only constrains prose, never the
+            // JSON shape, which the downstream step still has to parse.
+            let base_system = match expect {
                 LlmExpect::Text => "You are a deterministic data postprocessor in a Datrina workflow pipeline. Read the JSON input and produce a CONCISE human-readable answer per the prompt. Respond with plain text or markdown; never wrap your answer in JSON.",
                 LlmExpect::Json => "You are a deterministic data postprocessor in a Datrina workflow pipeline. Read the JSON input and produce STRICT JSON per the prompt. Do not include markdown fences or commentary.",
             };
+            let system = compose_system_prompt(base_system, language_directive);
             let user = format!(
                 "Prompt: {}\nInput JSON:\n{}",
                 prompt,
                 serde_json::to_string_pretty(&current).unwrap_or_else(|_| current.to_string())
             );
             let messages = vec![
-                runtime_chat_message(MessageRole::System, system),
+                runtime_chat_message(MessageRole::System, &system),
                 runtime_chat_message(MessageRole::User, &user),
             ];
             let response = engine.complete_chat(provider, &messages).await?;
@@ -1076,13 +1435,12 @@ async fn apply_pipeline_step(
             arguments,
         } => {
             let manager = mcp_manager.ok_or_else(|| {
-                anyhow!("McpCall step requires an MCP manager (pipeline ran in a context without one)")
+                anyhow!(
+                    "McpCall step requires an MCP manager (pipeline ran in a context without one)"
+                )
             })?;
             if !manager.is_connected(server_id).await {
-                return Err(anyhow!(
-                    "McpCall: MCP server '{}' not connected",
-                    server_id
-                ));
+                return Err(anyhow!("McpCall: MCP server '{}' not connected", server_id));
             }
             let resolved = match arguments {
                 Some(args) => substitute_current(args, &current),
@@ -1182,23 +1540,6 @@ fn compare_path_values(a: &Value, b: &Value) -> std::cmp::Ordering {
             }
         }
         _ => a.to_string().cmp(&b.to_string()),
-    }
-}
-
-fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a, b) {
-        (Some(av), Some(bv)) => match (av, bv) {
-            (Value::Number(an), Value::Number(bn)) => an
-                .as_f64()
-                .partial_cmp(&bn.as_f64())
-                .unwrap_or(Ordering::Equal),
-            (Value::String(an), Value::String(bn)) => an.cmp(bn),
-            _ => av.to_string().cmp(&bv.to_string()),
-        },
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
     }
 }
 
@@ -1373,6 +1714,19 @@ impl<'a> Default for WorkflowEngine<'a> {
     }
 }
 
+/// W47: prepend the resolved language directive (if any) ahead of a
+/// base system prompt. The directive lands first so providers honour
+/// it before the postprocess role instructions; the base prompt's
+/// schema/format rules ("respond in plain text", "produce strict
+/// JSON", etc.) still take precedence because the directive only
+/// pins prose language and explicitly preserves machine tokens.
+fn compose_system_prompt(base: &str, language_directive: Option<&str>) -> String {
+    match language_directive {
+        Some(directive) if !directive.trim().is_empty() => format!("{directive}\n\n{base}"),
+        _ => base.to_string(),
+    }
+}
+
 fn runtime_chat_message(role: MessageRole, content: &str) -> ChatMessage {
     ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1413,6 +1767,9 @@ mod tests {
                 config: None,
             },
             is_enabled: true,
+            pause_state: Default::default(),
+            last_paused_at: None,
+            last_pause_reason: None,
             last_run: None,
             created_at: now,
             updated_at: now,
@@ -1515,6 +1872,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_pipeline_with_streaming_emits_step_started_for_each_step() -> Result<()> {
+        use crate::models::pipeline::PipelineStep;
+        let steps = vec![
+            PipelineStep::Pick {
+                path: "items".into(),
+            },
+            PipelineStep::Length,
+        ];
+        let initial = json!({ "items": [1, 2, 3] });
+        let mut started: Vec<String> = Vec::new();
+        let (result, traces) =
+            run_pipeline_with_streaming(initial, &steps, None, None, None, None, |event| {
+                if let PipelineStreamEvent::StepStarted { kind, .. } = event {
+                    started.push(kind.to_string());
+                }
+            })
+            .await;
+        assert_eq!(result?, json!(3));
+        assert_eq!(traces.len(), 2);
+        assert_eq!(started, vec!["pick".to_string(), "length".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_with_streaming_records_error_and_does_not_finalise() -> Result<()> {
+        use crate::models::pipeline::PipelineStep;
+        // McpCall without manager fails — exercises the error path of
+        // the streaming runner so we know fail-after-partial cannot
+        // silently land as a successful final.
+        let steps = vec![PipelineStep::McpCall {
+            server_id: "any".into(),
+            tool_name: "any".into(),
+            arguments: None,
+        }];
+        let (result, traces) =
+            run_pipeline_with_streaming(json!({}), &steps, None, None, None, None, |_| {}).await;
+        assert!(
+            result.is_err(),
+            "expected error result for missing MCP manager"
+        );
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].error.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_pipeline_with_trace_records_steps_and_durations() -> Result<()> {
         use crate::models::pipeline::PipelineStep;
         let steps = vec![
@@ -1526,7 +1929,7 @@ mod tests {
         ];
         let initial = json!({ "items": [{"id":1},{"id":2},{"id":3},{"id":4}] });
         let (final_value, traces) =
-            run_pipeline_with_trace(initial, &steps, None, None, None).await;
+            run_pipeline_with_trace(initial, &steps, None, None, None, None).await;
         assert_eq!(final_value, json!(2));
         assert_eq!(traces.len(), 3);
         assert_eq!(traces[0].kind, "pick");
@@ -1594,7 +1997,7 @@ mod tests {
             arguments: None,
         }];
         let (final_value, traces) =
-            run_pipeline_with_trace(json!({}), &steps, None, None, None).await;
+            run_pipeline_with_trace(json!({}), &steps, None, None, None, None).await;
         assert_eq!(final_value, Value::Null);
         assert_eq!(traces.len(), 1);
         let err = traces[0]
@@ -1633,5 +2036,27 @@ mod tests {
             .contains("AI runtime is unavailable"));
 
         Ok(())
+    }
+
+    #[test]
+    fn compose_system_prompt_prepends_directive_with_blank_line() {
+        let base = "You are a postprocessor.";
+        let composed = compose_system_prompt(base, Some("Respond in Russian."));
+        assert!(composed.starts_with("Respond in Russian."));
+        assert!(composed.ends_with(base));
+        assert!(composed.contains("\n\n"));
+    }
+
+    #[test]
+    fn compose_system_prompt_returns_base_when_directive_none() {
+        let base = "Original prompt";
+        assert_eq!(compose_system_prompt(base, None), base);
+    }
+
+    #[test]
+    fn compose_system_prompt_returns_base_when_directive_whitespace() {
+        let base = "Original prompt";
+        assert_eq!(compose_system_prompt(base, Some("   ")), base);
+        assert_eq!(compose_system_prompt(base, Some("")), base);
     }
 }

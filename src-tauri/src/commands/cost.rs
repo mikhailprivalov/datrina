@@ -9,7 +9,10 @@ use crate::AppState;
 /// W22: snapshot returned to the chat footer. Combines live session
 /// running totals with today's global spend so the UI can render
 /// "12.4k in / 8.2k out · $0.043 · today $0.84" without making three
-/// separate IPC calls per render.
+/// separate IPC calls per render. W49: `cost_unknown_turns` is the
+/// count of assistant turns whose pricing was missing — when > 0 the
+/// UI renders the total as a lower bound (`≥ $X.XXXX`) or as
+/// `unknown cost` when `cost_usd` is still 0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCostSnapshot {
     pub session_id: String,
@@ -20,6 +23,10 @@ pub struct SessionCostSnapshot {
     pub cost_usd: f64,
     pub max_cost_usd: Option<f64>,
     pub today_cost_usd: f64,
+    #[serde(default)]
+    pub cost_unknown_turns: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_cost_source: Option<crate::models::pricing::CostSource>,
 }
 
 /// Daily roll-up entry for the Costs view bar chart.
@@ -80,6 +87,8 @@ pub async fn get_session_cost_snapshot(
         cost_usd: session.total_cost_usd,
         max_cost_usd: session.max_cost_usd,
         today_cost_usd: today,
+        cost_unknown_turns: session.cost_unknown_turns,
+        latest_cost_source: latest_assistant_cost_source(&session),
     }))
 }
 
@@ -193,6 +202,19 @@ fn latest_assistant_model(session: &ChatSession) -> Option<String> {
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.model.clone())
+    })
+}
+
+/// W49: most recent assistant turn's pricing provenance, so the footer
+/// can render a "billed by provider" vs "local pricing table" hint.
+fn latest_assistant_cost_source(
+    session: &ChatSession,
+) -> Option<crate::models::pricing::CostSource> {
+    session.messages.iter().rev().find_map(|message| {
+        message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.cost_source)
     })
 }
 

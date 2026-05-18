@@ -126,12 +126,25 @@ async fn execute_scheduled_workflow(
     runtime: ScheduledRuntime,
 ) -> anyhow::Result<()> {
     reconnect_enabled_mcp_servers(&runtime).await?;
+    // W47: scheduled workflows run outside a session/dashboard context,
+    // so the app default is the only relevant language policy. Errors
+    // here are swallowed because a missing language is "auto", not a
+    // failure mode.
+    let language_directive =
+        crate::commands::language::resolve_effective_language(runtime.storage.as_ref(), None, None)
+            .await
+            .ok()
+            .and_then(|resolved| resolved.system_directive());
     let engine = WorkflowEngine::with_runtime(
         runtime.tool_engine.as_ref(),
         runtime.mcp_manager.as_ref(),
         runtime.ai_engine.as_ref(),
-        active_provider(&runtime).await?.or(runtime.provider),
-    );
+        active_provider(&runtime)
+            .await?
+            .or(runtime.provider.clone()),
+    )
+    .with_storage(runtime.storage.as_ref())
+    .with_language(language_directive);
     let execution = engine.execute(&workflow, None).await?;
     let run = execution.run;
     runtime
@@ -149,21 +162,15 @@ async fn execute_scheduled_workflow(
 }
 
 async fn active_provider(runtime: &ScheduledRuntime) -> anyhow::Result<Option<LLMProvider>> {
-    let providers = runtime.storage.list_providers().await?;
-    let active_provider_id = runtime
-        .storage
-        .get_config("active_provider_id")
-        .await?
-        .filter(|id| !id.trim().is_empty());
-    Ok(active_provider_id
-        .as_deref()
-        .and_then(|id| {
-            providers
-                .iter()
-                .find(|provider| provider.id == id && provider.is_enabled)
-        })
-        .or_else(|| providers.iter().find(|provider| provider.is_enabled))
-        .cloned())
+    // W29: cron-driven workflows reuse the typed resolver. When the
+    // operator hasn't picked / has disabled the active provider, we
+    // fall through to the runtime's captured provider (set at schedule
+    // time) so a transient settings change doesn't kill an in-flight
+    // cron tick.
+    match crate::resolve_active_provider(runtime.storage.as_ref()).await? {
+        Ok(provider) => Ok(Some(provider)),
+        Err(_setup_error) => Ok(None),
+    }
 }
 
 async fn reconnect_enabled_mcp_servers(runtime: &ScheduledRuntime) -> anyhow::Result<()> {

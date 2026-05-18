@@ -1,6 +1,6 @@
 # W28 Chat UX Hardening And Regression Pass
 
-Status: planned
+Status: shipped
 
 Date: 2026-05-17
 
@@ -196,6 +196,95 @@ durable session pinning.
   backend/API scope is explicitly accepted inside this workstream.
 - Multi-agent orchestration, autonomous actions, alert-triggered sessions, or
   changes to W21/W26 runtime behavior.
+
+## Result
+
+Shipped 2026-05-17, frontend-only (no backend/API changes were needed).
+
+Lifecycle:
+- `ChatPanel` no longer creates an empty persisted `ChatSession` on
+  drawer open, mode toggle, or dashboard switch. The init effect now
+  loads only the latest **non-empty** matching session and falls back
+  to a local draft (`session === null`). The backend row is created
+  lazily in `handleSend`, on the first real user message.
+- A new `freshSessionKey` prop, bumped by `App` for top-bar Build,
+  template launches, Playground "Use as widget", and Fork-to-fresh,
+  forces the panel into a draft regardless of any reusable session.
+- Local drafts are preserved per (sessionId | mode+dashboardId) in a
+  ref-backed map, so switching session/mode/dashboard restores the
+  textarea contents without persisting empty rows.
+
+Build entrypoints:
+- `TopBar` Build opens a fresh Build draft when the drawer was closed,
+  and a "Start fresh" pill is shown in the panel when a reused session
+  is on screen, giving the user the explicit choice the spec asks for.
+- Template Gallery and Playground "Use as widget" both bump
+  `freshChatSessionKey`, so seeded prompts always land in a fresh
+  Build run.
+
+Cancellation and switch guards:
+- New `isCancelling` state distinct from `isLoading`; the Send button
+  shows a spinning indicator and disables itself while a cancel is
+  in flight. The "cancelling" pill in the header confirms the
+  transition.
+- `handleNewChat`, `handleSwitchSession`, `handleDeleteSession`, and
+  mode toggle all confirm before interrupting a stream and then await
+  `cancelActiveStream` before continuing.
+- The "Reset stuck loading" amber escape hatch was removed; the
+  real Send/Cancel button on the input row is now the only path.
+- The event listener already filters by `sessionIdRef.current`, so
+  late events from a cancelled session are ignored.
+
+Message actions:
+- Replaced the overlapping `-top-2 -left-2` hover-only Copy and Edit
+  buttons on user messages, and the absolute hover-only Regenerate
+  pill on assistant messages, with a single `MessageActionRow`
+  rendered *below* the bubble. It shows `copy / edit / regenerate /
+  fork build` as appropriate, with `aria-label`s, visible focus
+  rings, and `group-hover:opacity-100 group-focus-within:opacity-100`.
+- Copy uses `messageCopyText`, which already concatenates text +
+  visible reasoning + proposal JSON while excluding
+  `provider_opaque_reasoning_state`.
+
+Errors and remediation:
+- New `panelError` state surfaces init / load / delete / send failures
+  as a `ChatErrorBanner` with Retry (init/load) and Dismiss controls.
+  Console-only paths are gone.
+- A dedicated no-provider notice points users at Provider Settings or
+  `local_mock`, and the textarea + Send button are disabled with the
+  same reason inline.
+
+Build retry honesty:
+- Build user-message edit and Build last-assistant Regenerate are
+  disabled in the UI. Build retries route through a new
+  `onForkBuildChat` callback that opens a fresh Build chat with the
+  prompt prefilled, so derived plan state / cost totals / titles are
+  not silently reused. Context chat keeps inline edit / regenerate.
+
+Files touched (frontend only):
+- `src/App.tsx`
+- `src/components/layout/ChatPanel.tsx`
+- `src/components/layout/TopBar.tsx` *(verified, no behavioral change
+  required beyond the new onOpenBuildChat target)*
+- `docs/W28_CHAT_UX_HARDENING.md`
+- `docs/RECONCILIATION_PLAN.md`
+
+Validation:
+- `bun run typecheck` — OK
+- `bun run check:contract` — `Contract check passed: 79 frontend
+  commands match Rust registrations.`
+- `bun run build` — OK (3.87s, no errors; pre-existing
+  500 kB-bundle warning is unrelated).
+- Backend untouched, so `cargo` gates were not re-run.
+
+Residuals:
+- Honest in-session Build retry/edit is still deferred — `truncate_
+  chat_messages` only truncates message history, not derived plan or
+  cost state. Closing that would require a new backend command and
+  is left as a follow-up workstream.
+- Failed/cancelled assistant turns remain in-memory only after
+  reload (same backend contract as before); flagged in
+  `RESIDUAL_BACKLOG.md` if/when durable persistence is taken on.
 
 ## Related
 

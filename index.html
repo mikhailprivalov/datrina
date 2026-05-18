@@ -8,6 +8,37 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
     <title>Datrina The Lenswright</title>
+    <style>
+      /* Pre-paint backstop so the dev-mode CSS bundle injection delay
+         doesn't show a white body frame between HTML parse and the
+         Tailwind body { @apply bg-background } rule. Both selectors get
+         the same colour as `--background` so the cascade is consistent
+         the moment the bundle does take over. */
+      html { background-color: hsl(228 22% 6%); color-scheme: dark; }
+      body { background-color: hsl(228 22% 6%); margin: 0; }
+      html.is-light { background-color: hsl(220 26% 97%); color-scheme: light; }
+      html.is-light body { background-color: hsl(220 26% 97%); }
+    </style>
+    <script>
+      // Apply the stored theme (or OS preference) before first paint so the
+      // window never flashes white between HTML load and React mount.
+      (function () {
+        try {
+          var stored = localStorage.getItem('datrina:theme');
+          var prefersDark = window.matchMedia
+            && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var dark = stored === 'dark' || (stored !== 'light' && prefersDark);
+          var root = document.documentElement;
+          if (dark) {
+            root.classList.add('dark');
+          } else {
+            root.classList.add('is-light');
+          }
+        } catch (e) {
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

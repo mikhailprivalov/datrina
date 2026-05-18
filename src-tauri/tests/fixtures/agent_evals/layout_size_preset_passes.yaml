@@ -1,0 +1,60 @@
+id: layout_size_preset_passes
+description: |
+  W45: well-formed KPI stat using `size_preset: kpi` and `layout_pattern:
+  kpi_row` instead of raw `w`/`h`. The proposal sets no `x`/`y` and no
+  raw `w`/`h`, so the layout gate is silent and the validator returns
+  zero issues once the dry_run evidence is in place.
+
+trace:
+  proposal:
+    id: prop-layout-good
+    title: Active release stat
+    widgets:
+      - widget_type: stat
+        title: Active release
+        data: ""
+        datasource_plan:
+          kind: mcp_tool
+          server_id: example-mcp
+          tool_name: list_releases
+          arguments: { project: example-project }
+          pipeline:
+            - { kind: pick, path: releases }
+            - { kind: filter, field: state, op: eq, value: active }
+            - { kind: length }
+        size_preset: kpi
+        layout_pattern: kpi_row
+  tool_calls:
+    - call_id: call-dry-run-1
+      name: dry_run_widget
+      arguments:
+        proposal:
+          title: Active release
+      result:
+        status: ok
+        value: 3
+  plan:
+    summary: Fetch MCP list_releases, count active, expose as stat with kpi preset.
+    steps:
+      - { id: s1, title: Fetch releases, kind: fetch }
+      - { id: s2, title: Design widget, kind: design }
+      - { id: s3, title: Dry-run, kind: test }
+      - { id: s4, title: Propose, kind: propose }
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 2800
+    completion: 500
+
+assertions:
+  - kind: validator_passes
+  - kind: proposal_widget
+    count: 1
+    widget_type: stat
+    has_datasource_plan: true
+    has_pipeline_step_kind: [pick, length]
+  - kind: tool_called
+    name: dry_run_widget
+    min_count: 1
+  - kind: cost_lt_usd
+    value: 0.20

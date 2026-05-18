@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   debugApi,
+  type PipelineStep,
   type PipelineStepTrace,
   type PipelineTrace,
   type SampleValue,
   type SourceSummary,
   type TraceEntry,
 } from '../../lib/api';
+import { PipelineStudio } from '../pipeline/PipelineStudio';
 
 interface Props {
   dashboardId: string;
@@ -130,6 +132,29 @@ export function PipelineDebugModal({
     return formatAgo(Date.now() - activeTrace.finished_at);
   }, [activeTrace]);
 
+  const [studioOpen, setStudioOpen] = useState(false);
+  const [studioSteps, setStudioSteps] = useState<PipelineStep[]>([]);
+  const openStudio = useCallback(() => {
+    if (!activeTrace) return;
+    setStudioSteps(stepsFromTrace(activeTrace));
+    setStudioOpen(true);
+  }, [activeTrace]);
+  const studioTraceRef = useMemo(() => {
+    if (!activeTrace) return undefined;
+    // `trace_widget_pipeline` does not persist by default; only entries
+    // visible in `history` exist server-side. The studio uses the
+    // captured_at from history when present, otherwise falls back to
+    // an inline sample lifted from the trace's first input.
+    const entry = history.find(h => h.trace.finished_at === activeTrace.finished_at);
+    if (!entry) return undefined;
+    return { widget_id: widgetId, captured_at: entry.captured_at };
+  }, [activeTrace, history, widgetId]);
+  const studioSample = useMemo(() => {
+    if (studioTraceRef || !activeTrace) return undefined;
+    const first = activeTrace.steps[0];
+    return first?.input_sample.preview;
+  }, [studioTraceRef, activeTrace]);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
       <div className="flex max-h-[90vh] w-[min(95vw,64rem)] flex-col rounded-md border border-border bg-card shadow-2xl">
@@ -159,6 +184,14 @@ export function PipelineDebugModal({
               title="Run a one-off traced refresh now"
             >
               {running ? 'Running…' : 'Run with trace'}
+            </button>
+            <button
+              onClick={openStudio}
+              disabled={!activeTrace}
+              className="rounded-md border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs mono uppercase tracking-wider text-accent hover:bg-accent/20 disabled:opacity-50 transition-colors"
+              title="Open the trace's pipeline in the typed Studio editor"
+            >
+              {studioOpen ? 'Hide studio' : 'Open in Studio'}
             </button>
             <button onClick={onClose} className="p-1 rounded hover:bg-muted">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -208,6 +241,25 @@ export function PipelineDebugModal({
                 </ol>
               )}
               <FinalValuePanel value={activeTrace.final_value} />
+              {studioOpen && (
+                <div className="rounded-md border border-accent/40 bg-accent/5 p-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="mono text-[10px] uppercase tracking-wider text-accent">
+                      // Studio (try a fix)
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      Edits stay local. To save, open the bound datasource in the Workbench.
+                    </span>
+                  </div>
+                  <PipelineStudio
+                    steps={studioSteps}
+                    onChange={setStudioSteps}
+                    sample={studioSample}
+                    traceRef={studioTraceRef}
+                    sampleLabel={studioTraceRef ? 'Trace input (server-side)' : 'Trace input (preview)'}
+                  />
+                </div>
+              )}
             </div>
           ) : (
             <div className="flex h-32 items-center justify-center text-xs text-muted-foreground">
@@ -376,6 +428,21 @@ function isEmptySample(sample: SampleValue): boolean {
   if (sample.kind === 'null') return true;
   if (sample.kind === 'array_head' && (sample.size_hint.items ?? 0) === 0) return true;
   return false;
+}
+
+/** W32: lift the original `PipelineStep` list out of a W23 trace. Each
+ *  trace entry stores `config_json` containing the full serialized step
+ *  (with `kind`), so this is a direct cast — invalid entries are
+ *  dropped defensively. */
+function stepsFromTrace(trace: PipelineTrace): PipelineStep[] {
+  const out: PipelineStep[] = [];
+  for (const step of trace.steps) {
+    const cfg = step.config_json;
+    if (cfg && typeof cfg === 'object' && 'kind' in cfg) {
+      out.push(cfg as PipelineStep);
+    }
+  }
+  return out;
 }
 
 function findFirstEmptyStep(trace: PipelineTrace | null): number | null {

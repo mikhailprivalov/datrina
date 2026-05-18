@@ -9,16 +9,38 @@ use crate::models::{
     alert::{AlertEvent, AlertSeverity, WidgetAlert},
     chat::ChatSession,
     dashboard::{Dashboard, DashboardVersion, DashboardVersionSummary, VersionSource},
+    datasource::{DatasourceDefinition, DatasourceHealth},
     mcp::MCPServer,
     memory::{MemoryKind, MemoryRecord, Scope, ToolShape},
     playground::{PlaygroundPreset, PlaygroundToolKind},
     provider::LLMProvider,
+    snapshot::WidgetRuntimeSnapshot,
     workflow::Workflow,
 };
 
 pub struct Storage {
     pool: Pool<Sqlite>,
     app_data_dir: std::path::PathBuf,
+}
+
+/// W51: post-redaction raw artifact record returned by
+/// [`Storage::get_raw_artifact`]. The `payload_json` is the redacted
+/// raw payload — secrets have already been stripped by the
+/// compressor's redaction pass — so this struct is safe to surface in
+/// debug UIs and `inspect_artifact` slices.
+#[derive(Debug, Clone)]
+pub struct RawArtifactRecord {
+    pub id: String,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub profile: String,
+    pub raw_size: usize,
+    pub compact_size: usize,
+    pub checksum: String,
+    pub redaction_version: u32,
+    pub retention_class: String,
+    pub payload_json: String,
+    pub created_at: i64,
 }
 
 /// FTS5 MATCH requires a syntactically valid query. User-typed text often
@@ -44,7 +66,7 @@ fn sanitize_fts_query(input: &str) -> String {
 
 impl Storage {
     #[cfg(test)]
-    async fn new_for_tests() -> Result<Self> {
+    pub(crate) async fn new_for_tests() -> Result<Self> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -139,15 +161,25 @@ impl Storage {
         // W22: per-session token + cost totals + optional budget cap. All
         // updated transactionally by `update_chat_session`. Existing rows
         // start at zero / NULL on first read.
+        // W49: `cost_unknown_turns` counts assistant turns whose tokens
+        // were recorded but pricing was unknown — `total_cost_usd` is a
+        // lower bound when this is positive.
         for stmt in [
             "ALTER TABLE chat_sessions ADD COLUMN total_input_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN total_reasoning_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0.0",
             "ALTER TABLE chat_sessions ADD COLUMN max_cost_usd REAL",
+            "ALTER TABLE chat_sessions ADD COLUMN cost_unknown_turns INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = sqlx::query(stmt).execute(&self.pool).await;
         }
+
+        // W47: per-session assistant language override (JSON-encoded
+        // AssistantLanguagePolicy). Nullable; missing on legacy rows.
+        let _ = sqlx::query("ALTER TABLE chat_sessions ADD COLUMN language_override TEXT")
+            .execute(&self.pool)
+            .await;
 
         // Workflows table
         sqlx::query(
@@ -168,6 +200,22 @@ impl Storage {
         )
         .execute(&self.pool)
         .await?;
+
+        // W50: pause/resume + reason metadata. Distinct from `is_enabled`
+        // so an operator can stop automatic refresh without disabling the
+        // workflow entirely. Errors here are ignored because the column
+        // exists on every freshly migrated DB after the first run.
+        let _ = sqlx::query(
+            "ALTER TABLE workflows ADD COLUMN pause_state TEXT NOT NULL DEFAULT 'active'",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query("ALTER TABLE workflows ADD COLUMN last_paused_at INTEGER")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE workflows ADD COLUMN last_pause_reason TEXT")
+            .execute(&self.pool)
+            .await;
 
         // Providers table
         sqlx::query(
@@ -231,6 +279,16 @@ impl Storage {
                     error TEXT
                 )
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W35: Operations cockpit lists runs filtered by workflow ordered
+        // by start time descending. Without this index every list scan
+        // performs a full-table sort.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS workflow_runs_workflow_idx \
+             ON workflow_runs (workflow_id, started_at DESC)",
         )
         .execute(&self.pool)
         .await?;
@@ -437,12 +495,18 @@ impl Storage {
                     message TEXT NOT NULL,
                     context_json TEXT NOT NULL,
                     acknowledged_at INTEGER,
-                    triggered_session_id TEXT
+                    triggered_session_id TEXT,
+                    workflow_run_id TEXT
                 )
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        // W35: ALTER for databases that pre-date the column.
+        let _ = sqlx::query("ALTER TABLE alert_events ADD COLUMN workflow_run_id TEXT")
+            .execute(&self.pool)
+            .await;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS alert_events_widget_idx \
@@ -496,6 +560,20 @@ impl Storage {
                 .execute(&self.pool)
                 .await;
 
+        // W43: optional dashboard-level default LLM policy for LLM-backed
+        // widgets. Nullable so older rows continue to mean "no policy",
+        // which is the same as having no override at all — the runtime
+        // falls back to the app-level active provider.
+        let _ = sqlx::query("ALTER TABLE dashboards ADD COLUMN model_policy TEXT")
+            .execute(&self.pool)
+            .await;
+
+        // W47: optional dashboard-level assistant language policy.
+        // Nullable; falls back to the app default (then to Auto).
+        let _ = sqlx::query("ALTER TABLE dashboards ADD COLUMN language_policy TEXT")
+            .execute(&self.pool)
+            .await;
+
         sqlx::query(
             r#"
                 CREATE TABLE IF NOT EXISTS dashboard_parameter_values (
@@ -510,7 +588,316 @@ impl Storage {
         .execute(&self.pool)
         .await?;
 
+        // W30: saved datasource definitions surfaced in the Workbench.
+        // Stored as JSON so additive fields don't require schema migrations;
+        // health snapshot is broken out so frequent test-runs only rewrite
+        // the snapshot row.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS datasource_definitions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    server_id TEXT,
+                    tool_name TEXT,
+                    workflow_id TEXT NOT NULL,
+                    definition_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS datasource_definitions_workflow_idx \
+             ON datasource_definitions (workflow_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS datasource_definitions_signature_idx \
+             ON datasource_definitions (kind, server_id, tool_name)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS datasource_health (
+                    datasource_id TEXT PRIMARY KEY,
+                    health_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W36: per-widget runtime snapshot. One row per (dashboard,
+        // widget) — only the latest successful render is kept so the
+        // table stays bounded by the size of the user's dashboard set.
+        // Fingerprints guard against showing stale data after the
+        // widget's binding, pipeline, or parameter values change.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS widget_runtime_snapshots (
+                    dashboard_id TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+                    widget_id TEXT NOT NULL,
+                    widget_kind TEXT NOT NULL,
+                    runtime_data TEXT NOT NULL,
+                    captured_at INTEGER NOT NULL,
+                    workflow_id TEXT,
+                    workflow_run_id TEXT,
+                    datasource_definition_id TEXT,
+                    config_fingerprint TEXT NOT NULL,
+                    parameter_fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (dashboard_id, widget_id)
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS widget_runtime_snapshots_dashboard_idx \
+             ON widget_runtime_snapshots (dashboard_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W37: per-user state for the built-in external source catalog.
+        // The catalog itself is static Rust data; only enablement and
+        // optional credentials live in the DB.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS external_source_state (
+                    source_id TEXT PRIMARY KEY,
+                    is_enabled INTEGER NOT NULL DEFAULT 0,
+                    credential TEXT,
+                    updated_at INTEGER NOT NULL
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // W51: bounded local raw-artifact retention. One row per
+        // compressed provider-visible artifact; the compact summary
+        // that actually shipped is kept on the originating
+        // `ToolResult` / `WidgetTrace` row, while this table holds the
+        // redacted raw payload so debug surfaces and the
+        // `inspect_artifact` tool can return bounded slices later.
+        // `payload_json` is post-redaction — we never persist headers,
+        // API keys, or bearer tokens we wouldn't be willing to copy
+        // into Pipeline Debug.
+        sqlx::query(
+            r#"
+                CREATE TABLE IF NOT EXISTS raw_artifacts (
+                    id TEXT PRIMARY KEY,
+                    owner_kind TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    raw_size INTEGER NOT NULL,
+                    compact_size INTEGER NOT NULL,
+                    checksum TEXT NOT NULL,
+                    redaction_version INTEGER NOT NULL,
+                    retention_class TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS raw_artifacts_owner_idx \
+             ON raw_artifacts (owner_kind, owner_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("✅ Database migrations complete");
+        Ok(())
+    }
+
+    // ─── W51: raw artifact retention ───────────────────────────────────────
+
+    /// Persist the redacted raw payload that backed a compressed
+    /// artifact. Returns the generated id which the caller stashes on
+    /// the `ToolResult` / `WidgetTrace` so the model and the UI can
+    /// reference it later through `inspect_artifact`.
+    ///
+    /// `retention_class` controls cleanup: `"session"` keeps the row
+    /// alive while the session is open, `"ephemeral"` is eligible for
+    /// trim as soon as the per-owner cap kicks in, `"audit"` is kept
+    /// regardless of the cap.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_raw_artifact(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        profile: &str,
+        raw_size: usize,
+        compact_size: usize,
+        checksum: &str,
+        redaction_version: u32,
+        retention_class: &str,
+        payload_json: &str,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"
+                INSERT INTO raw_artifacts (
+                    id, owner_kind, owner_id, profile, raw_size, compact_size,
+                    checksum, redaction_version, retention_class, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(owner_kind)
+        .bind(owner_id)
+        .bind(profile)
+        .bind(raw_size as i64)
+        .bind(compact_size as i64)
+        .bind(checksum)
+        .bind(redaction_version as i64)
+        .bind(retention_class)
+        .bind(payload_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Fetch a raw artifact by id. Returns `None` when the row was
+    /// pruned, never written, or belongs to a different installation.
+    pub async fn get_raw_artifact(&self, id: &str) -> Result<Option<RawArtifactRecord>> {
+        let row = sqlx::query(
+            r#"
+                SELECT id, owner_kind, owner_id, profile, raw_size, compact_size,
+                       checksum, redaction_version, retention_class, payload_json, created_at
+                FROM raw_artifacts
+                WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some(row) => Ok(Some(RawArtifactRecord {
+                id: row.try_get("id")?,
+                owner_kind: row.try_get("owner_kind")?,
+                owner_id: row.try_get("owner_id")?,
+                profile: row.try_get("profile")?,
+                raw_size: row.try_get::<i64, _>("raw_size")? as usize,
+                compact_size: row.try_get::<i64, _>("compact_size")? as usize,
+                checksum: row.try_get("checksum")?,
+                redaction_version: row.try_get::<i64, _>("redaction_version")? as u32,
+                retention_class: row.try_get("retention_class")?,
+                payload_json: row.try_get("payload_json")?,
+                created_at: row.try_get("created_at")?,
+            })),
+        }
+    }
+
+    /// Trim `ephemeral` raw artifacts per owner, keeping the most
+    /// recent `keep_last` rows. `session` / `audit` retention classes
+    /// are exempt — only ephemeral debug captures get bounded here.
+    pub async fn prune_raw_artifacts(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        keep_last: u32,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+                DELETE FROM raw_artifacts
+                WHERE owner_kind = ?
+                  AND owner_id = ?
+                  AND retention_class = 'ephemeral'
+                  AND id NOT IN (
+                      SELECT id FROM raw_artifacts
+                      WHERE owner_kind = ?
+                        AND owner_id = ?
+                        AND retention_class = 'ephemeral'
+                      ORDER BY created_at DESC
+                      LIMIT ?
+                  )
+            "#,
+        )
+        .bind(owner_kind)
+        .bind(owner_id)
+        .bind(owner_kind)
+        .bind(owner_id)
+        .bind(keep_last as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    // ─── W37: external source state ────────────────────────────────────────
+
+    pub async fn get_external_source_state(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<(bool, Option<String>, i64)>> {
+        let row = sqlx::query(
+            "SELECT is_enabled, credential, updated_at FROM external_source_state WHERE source_id = ?",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let enabled: i64 = r.try_get("is_enabled")?;
+                let credential: Option<String> = r.try_get("credential").ok().flatten();
+                let updated_at: i64 = r.try_get("updated_at")?;
+                Ok(Some((enabled != 0, credential, updated_at)))
+            }
+        }
+    }
+
+    pub async fn upsert_external_source_state(
+        &self,
+        source_id: &str,
+        is_enabled: bool,
+        credential: Option<&str>,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+                INSERT INTO external_source_state (source_id, is_enabled, credential, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    is_enabled = excluded.is_enabled,
+                    credential = COALESCE(excluded.credential, external_source_state.credential),
+                    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(source_id)
+        .bind(if is_enabled { 1i64 } else { 0i64 })
+        .bind(credential)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_external_source_credential(&self, source_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE external_source_state SET credential = NULL, updated_at = ? WHERE source_id = ?",
+        )
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -784,9 +1171,17 @@ impl Storage {
     }
 
     pub async fn create_dashboard(&self, dashboard: &Dashboard) -> Result<()> {
+        let model_policy_json = match dashboard.model_policy.as_ref() {
+            Some(policy) => Some(serde_json::to_string(policy)?),
+            None => None,
+        };
+        let language_policy_json = match dashboard.language_policy.as_ref() {
+            Some(policy) => Some(serde_json::to_string(policy)?),
+            None => None,
+        };
         sqlx::query(r#"
-            INSERT INTO dashboards (id, name, description, layout, workflows, is_default, created_at, updated_at, parameters)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dashboards (id, name, description, layout, workflows, is_default, created_at, updated_at, parameters, model_policy, language_policy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#)
         .bind(&dashboard.id)
         .bind(&dashboard.name)
@@ -797,16 +1192,27 @@ impl Storage {
         .bind(dashboard.created_at)
         .bind(dashboard.updated_at)
         .bind(serde_json::to_string(&dashboard.parameters)?)
+        .bind(model_policy_json)
+        .bind(language_policy_json)
         .execute(&self.pool).await?;
 
         Ok(())
     }
 
     pub async fn update_dashboard(&self, dashboard: &Dashboard) -> Result<()> {
+        let model_policy_json = match dashboard.model_policy.as_ref() {
+            Some(policy) => Some(serde_json::to_string(policy)?),
+            None => None,
+        };
+        let language_policy_json = match dashboard.language_policy.as_ref() {
+            Some(policy) => Some(serde_json::to_string(policy)?),
+            None => None,
+        };
         sqlx::query(
             r#"
             UPDATE dashboards SET name = ?, description = ?, layout = ?, workflows = ?,
-            is_default = ?, updated_at = ?, parameters = ? WHERE id = ?
+            is_default = ?, updated_at = ?, parameters = ?, model_policy = ?,
+            language_policy = ? WHERE id = ?
         "#,
         )
         .bind(&dashboard.name)
@@ -816,6 +1222,8 @@ impl Storage {
         .bind(if dashboard.is_default { 1i64 } else { 0i64 })
         .bind(dashboard.updated_at)
         .bind(serde_json::to_string(&dashboard.parameters)?)
+        .bind(model_policy_json)
+        .bind(language_policy_json)
         .bind(&dashboard.id)
         .execute(&self.pool)
         .await?;
@@ -824,11 +1232,101 @@ impl Storage {
     }
 
     pub async fn delete_dashboard(&self, id: &str) -> Result<()> {
+        // FK cascade is declarative only — SQLite needs `PRAGMA
+        // foreign_keys = ON` per connection to enforce it, and the
+        // pool here doesn't set that. Defensive deletes keep child
+        // tables clean even on older databases.
+        sqlx::query("DELETE FROM widget_runtime_snapshots WHERE dashboard_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM dashboards WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    // ─── W36: widget runtime snapshots ──────────────────────────────────────
+
+    pub async fn upsert_widget_snapshot(&self, snapshot: &WidgetRuntimeSnapshot) -> Result<()> {
+        let runtime_json = serde_json::to_string(&snapshot.runtime_data)?;
+        sqlx::query(
+            r#"
+                INSERT INTO widget_runtime_snapshots (
+                    dashboard_id, widget_id, widget_kind, runtime_data,
+                    captured_at, workflow_id, workflow_run_id,
+                    datasource_definition_id, config_fingerprint, parameter_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dashboard_id, widget_id) DO UPDATE SET
+                    widget_kind = excluded.widget_kind,
+                    runtime_data = excluded.runtime_data,
+                    captured_at = excluded.captured_at,
+                    workflow_id = excluded.workflow_id,
+                    workflow_run_id = excluded.workflow_run_id,
+                    datasource_definition_id = excluded.datasource_definition_id,
+                    config_fingerprint = excluded.config_fingerprint,
+                    parameter_fingerprint = excluded.parameter_fingerprint
+            "#,
+        )
+        .bind(&snapshot.dashboard_id)
+        .bind(&snapshot.widget_id)
+        .bind(&snapshot.widget_kind)
+        .bind(runtime_json)
+        .bind(snapshot.captured_at)
+        .bind(snapshot.workflow_id.as_deref())
+        .bind(snapshot.workflow_run_id.as_deref())
+        .bind(snapshot.datasource_definition_id.as_deref())
+        .bind(&snapshot.config_fingerprint)
+        .bind(&snapshot.parameter_fingerprint)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_widget_snapshots(
+        &self,
+        dashboard_id: &str,
+    ) -> Result<Vec<WidgetRuntimeSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT dashboard_id, widget_id, widget_kind, runtime_data, captured_at, \
+             workflow_id, workflow_run_id, datasource_definition_id, \
+             config_fingerprint, parameter_fingerprint \
+             FROM widget_runtime_snapshots WHERE dashboard_id = ?",
+        )
+        .bind(dashboard_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::row_to_widget_snapshot).collect()
+    }
+
+    pub async fn delete_widget_snapshot(&self, dashboard_id: &str, widget_id: &str) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM widget_runtime_snapshots WHERE dashboard_id = ? AND widget_id = ?",
+        )
+        .bind(dashboard_id)
+        .bind(widget_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn row_to_widget_snapshot(row: &sqlx::sqlite::SqliteRow) -> Result<WidgetRuntimeSnapshot> {
+        let runtime_json: String = row.try_get("runtime_data")?;
+        let runtime_data: serde_json::Value =
+            serde_json::from_str(&runtime_json).unwrap_or(serde_json::Value::Null);
+        Ok(WidgetRuntimeSnapshot {
+            dashboard_id: row.try_get("dashboard_id")?,
+            widget_id: row.try_get("widget_id")?,
+            widget_kind: row.try_get("widget_kind")?,
+            runtime_data,
+            captured_at: row.try_get("captured_at")?,
+            workflow_id: row.try_get("workflow_id").ok(),
+            workflow_run_id: row.try_get("workflow_run_id").ok(),
+            datasource_definition_id: row.try_get("datasource_definition_id").ok(),
+            config_fingerprint: row.try_get("config_fingerprint")?,
+            parameter_fingerprint: row.try_get("parameter_fingerprint")?,
+        })
     }
 
     // ─── W25: parameter selections ──────────────────────────────────────────
@@ -910,6 +1408,23 @@ impl Storage {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
 
+        // W43: `model_policy` is another late-ALTER column. Null/missing
+        // means "no dashboard-level policy", which is the same as never
+        // setting one — runtime falls back to the app active provider.
+        let model_policy_json: Option<String> = row.try_get("model_policy").ok().flatten();
+        let model_policy = model_policy_json
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        // W47: dashboard-level assistant language override; same
+        // missing/empty handling as model_policy.
+        let language_policy_json: Option<String> = row.try_get("language_policy").ok().flatten();
+        let language_policy = language_policy_json
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str(s).ok());
+
         Ok(Dashboard {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
@@ -920,6 +1435,8 @@ impl Storage {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             parameters,
+            language_policy,
+            model_policy,
         })
     }
 
@@ -1157,10 +1674,11 @@ impl Storage {
                 id, mode, dashboard_id, widget_id, title, messages,
                 current_plan, plan_status,
                 total_input_tokens, total_output_tokens, total_reasoning_tokens,
-                total_cost_usd, max_cost_usd,
+                total_cost_usd, max_cost_usd, language_override,
+                cost_unknown_turns,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         )
         .bind(&session.id)
@@ -1185,6 +1703,11 @@ impl Storage {
         .bind(session.total_reasoning_tokens as i64)
         .bind(session.total_cost_usd)
         .bind(session.max_cost_usd)
+        .bind(match session.language_override.as_ref() {
+            Some(policy) => Some(serde_json::to_string(policy)?),
+            None => None,
+        })
+        .bind(session.cost_unknown_turns as i64)
         .bind(session.created_at)
         .bind(session.updated_at)
         .execute(&self.pool)
@@ -1200,7 +1723,8 @@ impl Storage {
                 mode = ?, dashboard_id = ?, widget_id = ?, title = ?, messages = ?,
                 current_plan = ?, plan_status = ?,
                 total_input_tokens = ?, total_output_tokens = ?, total_reasoning_tokens = ?,
-                total_cost_usd = ?, max_cost_usd = ?,
+                total_cost_usd = ?, max_cost_usd = ?, language_override = ?,
+                cost_unknown_turns = ?,
                 updated_at = ?
             WHERE id = ?
         "#,
@@ -1226,12 +1750,39 @@ impl Storage {
         .bind(session.total_reasoning_tokens as i64)
         .bind(session.total_cost_usd)
         .bind(session.max_cost_usd)
+        .bind(match session.language_override.as_ref() {
+            Some(policy) => Some(serde_json::to_string(policy)?),
+            None => None,
+        })
+        .bind(session.cost_unknown_turns as i64)
         .bind(session.updated_at)
         .bind(&session.id)
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    /// W47: write the per-session language override and return the
+    /// refreshed session row. Mirrors [`Self::set_session_max_cost`] so
+    /// flipping a language doesn't require re-serialising the whole
+    /// `messages` blob.
+    pub async fn set_session_language_override(
+        &self,
+        session_id: &str,
+        policy: Option<&crate::models::language::AssistantLanguagePolicy>,
+    ) -> Result<Option<ChatSession>> {
+        let payload = match policy {
+            Some(policy) => Some(serde_json::to_string(policy)?),
+            None => None,
+        };
+        sqlx::query("UPDATE chat_sessions SET language_override = ?, updated_at = ? WHERE id = ?")
+            .bind(payload)
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        self.get_chat_session(session_id).await
     }
 
     /// W22: lightweight update path used by the streaming chat command
@@ -1435,6 +1986,15 @@ impl Storage {
             max_cost_usd: row
                 .try_get::<Option<f64>, _>("max_cost_usd")
                 .unwrap_or(None),
+            cost_unknown_turns: row
+                .try_get::<Option<i64>, _>("cost_unknown_turns")
+                .unwrap_or(None)
+                .unwrap_or(0)
+                .max(0) as u32,
+            language_override: row
+                .try_get::<Option<String>, _>("language_override")
+                .unwrap_or(None)
+                .and_then(|json| serde_json::from_str(&json).ok()),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -1498,8 +2058,8 @@ impl Storage {
 
     pub async fn create_workflow(&self, workflow: &Workflow) -> Result<()> {
         sqlx::query(r#"
-            INSERT INTO workflows (id, name, description, nodes, edges, trigger, is_enabled, last_run, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO workflows (id, name, description, nodes, edges, trigger, is_enabled, last_run, created_at, updated_at, pause_state, last_paused_at, last_pause_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#)
         .bind(&workflow.id)
         .bind(&workflow.name)
@@ -1511,6 +2071,9 @@ impl Storage {
         .bind(workflow.last_run.as_ref().map(serde_json::to_string).transpose()?)
         .bind(workflow.created_at)
         .bind(workflow.updated_at)
+        .bind(workflow.pause_state.as_str())
+        .bind(workflow.last_paused_at)
+        .bind(workflow.last_pause_reason.as_deref())
         .execute(&self.pool).await?;
 
         Ok(())
@@ -1563,6 +2126,162 @@ impl Storage {
         Ok(())
     }
 
+    /// W50: persist the pause flag + reason in one round-trip. Returns
+    /// `false` when the workflow id is unknown so callers can surface a
+    /// typed "not found" rather than a silent no-op.
+    pub async fn set_workflow_pause_state(
+        &self,
+        workflow_id: &str,
+        state: crate::models::workflow::SchedulePauseState,
+        reason: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        use crate::models::workflow::SchedulePauseState;
+        let paused_at = if matches!(state, SchedulePauseState::Paused) {
+            Some(now)
+        } else {
+            None
+        };
+        let stored_reason = if matches!(state, SchedulePauseState::Paused) {
+            reason
+        } else {
+            None
+        };
+        let result = sqlx::query(
+            "UPDATE workflows SET pause_state = ?, last_paused_at = ?, \
+             last_pause_reason = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(state.as_str())
+        .bind(paused_at)
+        .bind(stored_reason)
+        .bind(now)
+        .bind(workflow_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// W50: replace the cron trigger config on an existing workflow. When
+    /// `cron` is `None`, the trigger reverts to manual; passing the
+    /// already-normalized cron string switches it to `Cron`. Returns
+    /// `false` when the workflow id is unknown.
+    pub async fn set_workflow_cron(
+        &self,
+        workflow_id: &str,
+        cron: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        use crate::models::workflow::{TriggerConfig, TriggerKind, WorkflowTrigger};
+        let trigger = match cron {
+            Some(value) => WorkflowTrigger {
+                kind: TriggerKind::Cron,
+                config: Some(TriggerConfig {
+                    cron: Some(value.to_string()),
+                    event: None,
+                }),
+            },
+            None => WorkflowTrigger {
+                kind: TriggerKind::Manual,
+                config: None,
+            },
+        };
+        let result = sqlx::query("UPDATE workflows SET trigger = ?, updated_at = ? WHERE id = ?")
+            .bind(serde_json::to_string(&trigger)?)
+            .bind(now)
+            .bind(workflow_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// W35: Operations cockpit list. Cheap row summary that omits the
+    /// potentially-large `node_results` JSON blob. `workflow_id` filters
+    /// to a single workflow's run history; `None` returns all rows
+    /// across workflows.
+    pub async fn list_workflow_run_summaries(
+        &self,
+        workflow_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::models::workflow::WorkflowRunSummary>> {
+        let limit = limit.max(1).min(500);
+        let rows = if let Some(wf) = workflow_id {
+            sqlx::query(
+                "SELECT id, workflow_id, started_at, finished_at, status, error, \
+                 (node_results IS NOT NULL) AS has_node_results \
+                 FROM workflow_runs WHERE workflow_id = ? \
+                 ORDER BY started_at DESC LIMIT ?",
+            )
+            .bind(wf)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, workflow_id, started_at, finished_at, status, error, \
+                 (node_results IS NOT NULL) AS has_node_results \
+                 FROM workflow_runs ORDER BY started_at DESC LIMIT ?",
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        rows.iter().map(Self::row_to_run_summary).collect()
+    }
+
+    /// W35: full run row including `node_results`. Used by the run
+    /// detail view and by `retry_workflow_run` to look up the originating
+    /// workflow id.
+    pub async fn get_workflow_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(String, crate::models::workflow::WorkflowRun)>> {
+        let row = sqlx::query(
+            "SELECT id, workflow_id, started_at, finished_at, status, node_results, error \
+             FROM workflow_runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let workflow_id: String = row.try_get("workflow_id")?;
+        let status_raw: String = row.try_get("status")?;
+        let status = serde_json::from_str(&status_raw)?;
+        let node_results = row
+            .try_get::<Option<String>, _>("node_results")?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?;
+        let run = crate::models::workflow::WorkflowRun {
+            id: row.try_get("id")?,
+            started_at: row.try_get("started_at")?,
+            finished_at: row.try_get("finished_at")?,
+            status,
+            node_results,
+            error: row.try_get("error")?,
+        };
+        Ok(Some((workflow_id, run)))
+    }
+
+    fn row_to_run_summary(
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> Result<crate::models::workflow::WorkflowRunSummary> {
+        let status_raw: String = row.try_get("status")?;
+        let status = serde_json::from_str(&status_raw)?;
+        let started_at: i64 = row.try_get("started_at")?;
+        let finished_at: Option<i64> = row.try_get("finished_at")?;
+        let duration_ms = finished_at.map(|f| f.saturating_sub(started_at));
+        let has_node_results: i64 = row.try_get("has_node_results")?;
+        Ok(crate::models::workflow::WorkflowRunSummary {
+            id: row.try_get("id")?,
+            workflow_id: row.try_get("workflow_id")?,
+            started_at,
+            finished_at,
+            status,
+            duration_ms,
+            error: row.try_get("error")?,
+            has_node_results: has_node_results != 0,
+        })
+    }
+
     /// W19: restore path needs to put a workflow back to a known shape.
     /// We do not have an UPDATE on the full row elsewhere, so this is a
     /// DELETE + INSERT inside one transaction to keep the row atomically
@@ -1577,8 +2296,8 @@ impl Storage {
             r#"
                 INSERT INTO workflows (
                     id, name, description, nodes, edges, trigger, is_enabled, last_run,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, pause_state, last_paused_at, last_pause_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&workflow.id)
@@ -1597,6 +2316,9 @@ impl Storage {
         )
         .bind(workflow.created_at)
         .bind(workflow.updated_at)
+        .bind(workflow.pause_state.as_str())
+        .bind(workflow.last_paused_at)
+        .bind(workflow.last_pause_reason.as_deref())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1604,6 +2326,22 @@ impl Storage {
     }
 
     fn row_to_workflow(row: &sqlx::sqlite::SqliteRow) -> Result<Workflow> {
+        // W50: pause columns are nullable for rows written before the
+        // migration; fall back to defaults so legacy rows hydrate as Active.
+        let pause_state = row
+            .try_get::<Option<String>, _>("pause_state")
+            .ok()
+            .flatten()
+            .map(|raw| crate::models::workflow::SchedulePauseState::parse(&raw))
+            .unwrap_or_default();
+        let last_paused_at = row
+            .try_get::<Option<i64>, _>("last_paused_at")
+            .ok()
+            .flatten();
+        let last_pause_reason = row
+            .try_get::<Option<String>, _>("last_pause_reason")
+            .ok()
+            .flatten();
         Ok(Workflow {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
@@ -1612,6 +2350,9 @@ impl Storage {
             edges: serde_json::from_str(row.try_get::<String, _>("edges")?.as_str())?,
             trigger: serde_json::from_str(row.try_get::<String, _>("trigger")?.as_str())?,
             is_enabled: row.try_get::<i64, _>("is_enabled")? == 1,
+            pause_state,
+            last_paused_at,
+            last_pause_reason,
             last_run: row
                 .try_get::<Option<String>, _>("last_run")?
                 .map(|s| serde_json::from_str(&s))
@@ -1678,15 +2419,40 @@ impl Storage {
     }
 
     fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Result<LLMProvider> {
+        let raw_kind: String = row.try_get("kind")?;
+        let id: String = row.try_get("id")?;
+        let name: String = row.try_get("name")?;
+        let stored_enabled = row.try_get::<i64, _>("is_enabled")? == 1;
+        let (kind, is_unsupported, is_enabled) =
+            match crate::models::provider::LegacyProviderKind::parse(&raw_kind) {
+                crate::models::provider::LegacyProviderKind::Supported(kind) => {
+                    (kind, false, stored_enabled)
+                }
+                crate::models::provider::LegacyProviderKind::Unsupported(legacy_kind) => {
+                    // W29: legacy `local_mock` (or any future unknown
+                    // kind) is migrated to a force-disabled, marked
+                    // `is_unsupported` row so the UI can surface a
+                    // typed "this provider is no longer supported"
+                    // banner without silently flipping it back on or
+                    // letting chat select it.
+                    tracing::warn!(
+                        "provider {} has unsupported legacy kind '{}'; force-disabling and marking unsupported",
+                        id,
+                        legacy_kind
+                    );
+                    (crate::models::provider::ProviderKind::Custom, true, false)
+                }
+            };
         Ok(LLMProvider {
-            id: row.try_get("id")?,
-            name: row.try_get("name")?,
-            kind: serde_json::from_str(row.try_get::<String, _>("kind")?.as_str())?,
+            id,
+            name,
+            kind,
             base_url: row.try_get("base_url")?,
             api_key: row.try_get("api_key")?,
             default_model: row.try_get("default_model")?,
             models: serde_json::from_str(row.try_get::<String, _>("models")?.as_str())?,
-            is_enabled: row.try_get::<i64, _>("is_enabled")? == 1,
+            is_enabled,
+            is_unsupported,
         })
     }
 
@@ -1914,8 +2680,8 @@ impl Storage {
                 INSERT INTO alert_events (
                     id, widget_id, dashboard_id, alert_id, fired_at,
                     severity, message, context_json, acknowledged_at,
-                    triggered_session_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    triggered_session_id, workflow_run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&event.id)
@@ -1928,6 +2694,7 @@ impl Storage {
         .bind(serde_json::to_string(&event.context)?)
         .bind(event.acknowledged_at)
         .bind(event.triggered_session_id.as_deref())
+        .bind(event.workflow_run_id.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1940,12 +2707,14 @@ impl Storage {
     ) -> Result<Vec<AlertEvent>> {
         let sql = if only_unacknowledged {
             "SELECT id, widget_id, dashboard_id, alert_id, fired_at, severity, \
-             message, context_json, acknowledged_at, triggered_session_id \
+             message, context_json, acknowledged_at, triggered_session_id, \
+             workflow_run_id \
              FROM alert_events WHERE acknowledged_at IS NULL \
              ORDER BY fired_at DESC LIMIT ?"
         } else {
             "SELECT id, widget_id, dashboard_id, alert_id, fired_at, severity, \
-             message, context_json, acknowledged_at, triggered_session_id \
+             message, context_json, acknowledged_at, triggered_session_id, \
+             workflow_run_id \
              FROM alert_events ORDER BY fired_at DESC LIMIT ?"
         };
         let rows = sqlx::query(sql)
@@ -2116,7 +2885,169 @@ impl Storage {
             context,
             acknowledged_at: row.try_get("acknowledged_at")?,
             triggered_session_id: row.try_get("triggered_session_id")?,
+            workflow_run_id: row.try_get("workflow_run_id")?,
         })
+    }
+
+    // ─── W30: Datasource definitions ────────────────────────────────────────
+
+    fn row_to_datasource_definition(row: &sqlx::sqlite::SqliteRow) -> Result<DatasourceDefinition> {
+        let definition_json: String = row.try_get("definition_json")?;
+        let mut definition: DatasourceDefinition = serde_json::from_str(&definition_json)?;
+        // Defensive: trust the row id / workflow id over the JSON copy in
+        // case a manual export was re-imported with stale ids.
+        definition.id = row.try_get("id")?;
+        definition.workflow_id = row.try_get("workflow_id")?;
+        definition.created_at = row.try_get("created_at")?;
+        definition.updated_at = row.try_get("updated_at")?;
+        Ok(definition)
+    }
+
+    pub async fn insert_datasource_definition(&self, def: &DatasourceDefinition) -> Result<()> {
+        sqlx::query(
+            r#"
+                INSERT INTO datasource_definitions (
+                    id, name, kind, server_id, tool_name, workflow_id,
+                    definition_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&def.id)
+        .bind(&def.name)
+        .bind(serde_json::to_value(&def.kind)?.as_str().unwrap_or(""))
+        .bind(def.server_id.as_deref())
+        .bind(def.tool_name.as_deref())
+        .bind(&def.workflow_id)
+        .bind(serde_json::to_string(def)?)
+        .bind(def.created_at)
+        .bind(def.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_datasource_definition(&self, def: &DatasourceDefinition) -> Result<()> {
+        sqlx::query(
+            r#"
+                UPDATE datasource_definitions
+                SET name = ?, kind = ?, server_id = ?, tool_name = ?,
+                    workflow_id = ?, definition_json = ?, updated_at = ?
+                WHERE id = ?
+            "#,
+        )
+        .bind(&def.name)
+        .bind(serde_json::to_value(&def.kind)?.as_str().unwrap_or(""))
+        .bind(def.server_id.as_deref())
+        .bind(def.tool_name.as_deref())
+        .bind(&def.workflow_id)
+        .bind(serde_json::to_string(def)?)
+        .bind(def.updated_at)
+        .bind(&def.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_datasource_definition(&self, id: &str) -> Result<bool> {
+        // Health row is deleted alongside the definition; the backing
+        // workflow row is dropped by the caller via the standard
+        // `delete_workflow` path so the scheduler can also unhook the cron.
+        sqlx::query("DELETE FROM datasource_health WHERE datasource_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        let result = sqlx::query("DELETE FROM datasource_definitions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn get_datasource_definition(
+        &self,
+        id: &str,
+    ) -> Result<Option<DatasourceDefinition>> {
+        let row = sqlx::query(
+            "SELECT id, workflow_id, definition_json, created_at, updated_at \
+             FROM datasource_definitions WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let mut def = Self::row_to_datasource_definition(&row)?;
+        def.health = self.get_datasource_health(id).await?;
+        Ok(Some(def))
+    }
+
+    pub async fn list_datasource_definitions(&self) -> Result<Vec<DatasourceDefinition>> {
+        let rows = sqlx::query(
+            "SELECT id, workflow_id, definition_json, created_at, updated_at \
+             FROM datasource_definitions ORDER BY updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut defs: Vec<DatasourceDefinition> = rows
+            .iter()
+            .map(Self::row_to_datasource_definition)
+            .collect::<Result<_>>()?;
+        for def in defs.iter_mut() {
+            def.health = self.get_datasource_health(&def.id).await?;
+        }
+        Ok(defs)
+    }
+
+    pub async fn get_datasource_by_workflow_id(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<DatasourceDefinition>> {
+        let row = sqlx::query(
+            "SELECT id, workflow_id, definition_json, created_at, updated_at \
+             FROM datasource_definitions WHERE workflow_id = ?",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let mut def = Self::row_to_datasource_definition(&row)?;
+        def.health = self.get_datasource_health(&def.id).await?;
+        Ok(Some(def))
+    }
+
+    pub async fn get_datasource_health(&self, id: &str) -> Result<Option<DatasourceHealth>> {
+        let row = sqlx::query("SELECT health_json FROM datasource_health WHERE datasource_id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let health_json: String = row.try_get("health_json")?;
+                Ok(serde_json::from_str(&health_json).ok())
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn upsert_datasource_health(
+        &self,
+        datasource_id: &str,
+        health: &DatasourceHealth,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+                INSERT INTO datasource_health (datasource_id, health_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(datasource_id) DO UPDATE SET
+                    health_json = excluded.health_json,
+                    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(datasource_id)
+        .bind(serde_json::to_string(health)?)
+        .bind(health.last_run_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -2129,6 +3060,63 @@ mod tests {
     use crate::models::provider::{LLMProvider, ProviderKind};
     use crate::models::workflow::{RunStatus, TriggerKind, Workflow, WorkflowRun, WorkflowTrigger};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn external_source_state_credential_round_trip() -> Result<()> {
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // Default-empty case.
+        assert!(storage
+            .get_external_source_state("brave_search_web")
+            .await?
+            .is_none());
+
+        // Enable with no credential.
+        storage
+            .upsert_external_source_state("brave_search_web", true, None, now)
+            .await?;
+        let (enabled, credential, _) = storage
+            .get_external_source_state("brave_search_web")
+            .await?
+            .unwrap();
+        assert!(enabled);
+        assert!(credential.is_none());
+
+        // Set a credential and verify enablement is preserved.
+        storage
+            .upsert_external_source_state("brave_search_web", true, Some("k1"), now + 1)
+            .await?;
+        let (enabled, credential, _) = storage
+            .get_external_source_state("brave_search_web")
+            .await?
+            .unwrap();
+        assert!(enabled);
+        assert_eq!(credential.as_deref(), Some("k1"));
+
+        // Calling upsert with credential=None must NOT wipe an existing
+        // credential — that flow is for set_enabled. Use the dedicated
+        // clear method to remove credentials.
+        storage
+            .upsert_external_source_state("brave_search_web", false, None, now + 2)
+            .await?;
+        let (enabled, credential, _) = storage
+            .get_external_source_state("brave_search_web")
+            .await?
+            .unwrap();
+        assert!(!enabled);
+        assert_eq!(credential.as_deref(), Some("k1"));
+
+        storage
+            .clear_external_source_credential("brave_search_web")
+            .await?;
+        let (_, credential, _) = storage
+            .get_external_source_state("brave_search_web")
+            .await?
+            .unwrap();
+        assert!(credential.is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn agent_memory_fts_retrieval_round_trip() -> Result<()> {
@@ -2203,6 +3191,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             parameters: Vec::new(),
+            model_policy: None,
+            language_policy: None,
         };
         storage.create_dashboard(&dashboard).await?;
         assert_eq!(storage.get_dashboard("dash-1").await?.unwrap().name, "Ops");
@@ -2221,6 +3211,7 @@ mod tests {
             default_model: "mock".into(),
             models: vec!["mock".into()],
             is_enabled: true,
+            is_unsupported: false,
         };
         storage.save_provider(&provider).await?;
         assert_eq!(
@@ -2261,6 +3252,9 @@ mod tests {
                 config: None,
             },
             is_enabled: true,
+            pause_state: Default::default(),
+            last_paused_at: None,
+            last_pause_reason: None,
             last_run: None,
             created_at: now,
             updated_at: now,
@@ -2308,6 +3302,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             parameters: Vec::new(),
+            model_policy: None,
+            language_policy: None,
         };
         storage.create_dashboard(&dashboard).await?;
 
@@ -2339,6 +3335,515 @@ mod tests {
         assert_eq!(full.source, VersionSource::AgentApply);
         assert_eq!(full.source_session_id.as_deref(), Some("sess-1"));
 
+        Ok(())
+    }
+
+    /// W30: datasource definition CRUD + health upsert. Verifies that the
+    /// list endpoint reflects the latest health snapshot without rewriting
+    /// the definition row.
+    #[tokio::test]
+    async fn datasource_definition_crud_and_health_round_trip() -> Result<()> {
+        use crate::models::dashboard::BuildDatasourcePlanKind;
+        use crate::models::datasource::{
+            DatasourceDefinition, DatasourceHealth, DatasourceHealthStatus,
+        };
+        use crate::models::pipeline::PipelineStep;
+
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let def = DatasourceDefinition {
+            id: "ds-1".into(),
+            name: "issues".into(),
+            description: Some("Open GitHub issues".into()),
+            kind: BuildDatasourcePlanKind::McpTool,
+            tool_name: Some("list_issues".into()),
+            server_id: Some("gh-mcp".into()),
+            arguments: Some(serde_json::json!({"repo": "foo/bar"})),
+            prompt: None,
+            pipeline: vec![PipelineStep::Limit { count: 5 }],
+            refresh_cron: Some("0 */5 * * * *".into()),
+            workflow_id: "wf-ds-1".into(),
+            created_at: now,
+            updated_at: now,
+            health: None,
+            originated_external_source_id: None,
+        };
+        storage.insert_datasource_definition(&def).await?;
+        let fetched = storage
+            .get_datasource_definition("ds-1")
+            .await?
+            .expect("definition stored");
+        assert_eq!(fetched.name, "issues");
+        assert_eq!(fetched.pipeline.len(), 1);
+        assert!(fetched.health.is_none());
+
+        // List includes the row even before health exists.
+        let listing = storage.list_datasource_definitions().await?;
+        assert_eq!(listing.len(), 1);
+
+        // Upsert health, then re-read; the health snapshot must round-trip.
+        let health = DatasourceHealth {
+            last_run_at: now + 1_000,
+            last_status: DatasourceHealthStatus::Ok,
+            last_error: None,
+            last_duration_ms: 42,
+            sample_preview: Some(serde_json::json!({"count": 3})),
+            consumer_count: 2,
+        };
+        storage.upsert_datasource_health("ds-1", &health).await?;
+        let with_health = storage
+            .get_datasource_definition("ds-1")
+            .await?
+            .expect("definition stored");
+        let stored_health = with_health.health.clone().expect("health snapshot");
+        assert_eq!(stored_health.last_duration_ms, 42);
+        assert_eq!(stored_health.consumer_count, 2);
+
+        // Update (replace) re-writes the definition without dropping health.
+        let mut updated = with_health.clone();
+        updated.health = None;
+        updated.name = "issues_renamed".into();
+        updated.updated_at = now + 2_000;
+        storage.update_datasource_definition(&updated).await?;
+        let after_update = storage
+            .get_datasource_definition("ds-1")
+            .await?
+            .expect("definition stored");
+        assert_eq!(after_update.name, "issues_renamed");
+        assert!(
+            after_update.health.is_some(),
+            "health should survive a definition update"
+        );
+
+        // Lookup by workflow id is used by the consumer-scan command.
+        let by_workflow = storage
+            .get_datasource_by_workflow_id("wf-ds-1")
+            .await?
+            .expect("workflow lookup");
+        assert_eq!(by_workflow.id, "ds-1");
+
+        // Delete removes both the definition row and the health row.
+        assert!(storage.delete_datasource_definition("ds-1").await?);
+        assert!(storage.get_datasource_definition("ds-1").await?.is_none());
+        assert!(storage.get_datasource_health("ds-1").await?.is_none());
+        Ok(())
+    }
+
+    /// W31: a [`DatasourceConfig`] that carries an explicit
+    /// `datasource_definition_id` plus provenance must round-trip
+    /// through the dashboard JSON column without losing fields. Legacy
+    /// rows (no W31 fields) must still deserialize.
+    #[tokio::test]
+    async fn datasource_config_w31_binding_round_trip() -> Result<()> {
+        use crate::models::dashboard::Dashboard;
+        use crate::models::widget::{
+            ChartConfig, ChartKind, DatasourceBindingSource, DatasourceConfig, Widget,
+        };
+
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let widget = Widget::Chart {
+            id: "w1".into(),
+            title: "Issues".into(),
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 4,
+            config: ChartConfig {
+                kind: ChartKind::Bar,
+                x_axis: None,
+                y_axis: None,
+                colors: None,
+                stacked: false,
+                show_legend: true,
+            },
+            datasource: Some(DatasourceConfig {
+                workflow_id: "wf-1".into(),
+                output_key: "output.data".into(),
+                post_process: None,
+                capture_traces: false,
+                datasource_definition_id: Some("ds-explicit".into()),
+                binding_source: Some(DatasourceBindingSource::BuildChat),
+                bound_at: Some(now),
+                tail_pipeline: vec![],
+                model_override: None,
+            }),
+            refresh_interval: None,
+        };
+        let dashboard = Dashboard {
+            id: "d1".into(),
+            name: "d".into(),
+            description: None,
+            layout: vec![widget],
+            workflows: vec![],
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+            parameters: vec![],
+            model_policy: None,
+            language_policy: None,
+        };
+        storage.create_dashboard(&dashboard).await?;
+        let fetched = storage
+            .get_dashboard("d1")
+            .await?
+            .expect("dashboard stored");
+        let Widget::Chart { datasource, .. } = &fetched.layout[0] else {
+            panic!("expected chart");
+        };
+        let cfg = datasource.as_ref().expect("datasource present");
+        assert_eq!(cfg.datasource_definition_id.as_deref(), Some("ds-explicit"));
+        assert_eq!(cfg.binding_source, Some(DatasourceBindingSource::BuildChat));
+        assert_eq!(cfg.bound_at, Some(now));
+
+        // Legacy DatasourceConfig (W30 shape, no W31 fields) must still
+        // deserialize cleanly into the extended struct.
+        let legacy_json = serde_json::json!({
+            "workflow_id": "wf-legacy",
+            "output_key": "output.data",
+        });
+        let legacy: DatasourceConfig = serde_json::from_value(legacy_json)?;
+        assert!(legacy.datasource_definition_id.is_none());
+        assert!(legacy.binding_source.is_none());
+        assert!(legacy.bound_at.is_none());
+        Ok(())
+    }
+
+    /// W31: signature comparison must reject mismatched arguments and
+    /// accept identical kind+tool+args+pipeline+prompt. Drives
+    /// Build-apply reuse so that fresh proposals targeting an existing
+    /// catalog entry bind to it instead of minting a duplicate.
+    #[test]
+    fn shared_matches_definition_signature() {
+        use crate::commands::dashboard::shared_matches_definition;
+        use crate::models::dashboard::{BuildDatasourcePlanKind, SharedDatasource};
+        use crate::models::datasource::DatasourceDefinition;
+        use crate::models::pipeline::PipelineStep;
+
+        let shared = SharedDatasource {
+            key: "issues".into(),
+            kind: BuildDatasourcePlanKind::McpTool,
+            tool_name: Some("list_issues".into()),
+            server_id: Some("gh".into()),
+            arguments: Some(serde_json::json!({"repo": "foo/bar"})),
+            prompt: None,
+            pipeline: vec![PipelineStep::Limit { count: 5 }],
+            refresh_cron: Some("0 */5 * * * *".into()),
+            label: Some("issues feed".into()),
+        };
+        let def = DatasourceDefinition {
+            id: "ds".into(),
+            name: "open_issues".into(),
+            description: None,
+            kind: BuildDatasourcePlanKind::McpTool,
+            tool_name: Some("list_issues".into()),
+            server_id: Some("gh".into()),
+            arguments: Some(serde_json::json!({"repo": "foo/bar"})),
+            prompt: None,
+            pipeline: vec![PipelineStep::Limit { count: 5 }],
+            refresh_cron: None,
+            workflow_id: "wf".into(),
+            created_at: 0,
+            updated_at: 0,
+            health: None,
+            originated_external_source_id: None,
+        };
+        assert!(shared_matches_definition(&shared, &def));
+
+        let mut other = shared.clone();
+        other.arguments = Some(serde_json::json!({"repo": "different"}));
+        assert!(
+            !shared_matches_definition(&other, &def),
+            "different arguments should not match"
+        );
+
+        let mut other = shared.clone();
+        other.pipeline = vec![PipelineStep::Limit { count: 10 }];
+        assert!(
+            !shared_matches_definition(&other, &def),
+            "different pipeline should not match"
+        );
+    }
+
+    /// W31.1: tail_pipeline must round-trip in DatasourceConfig — empty
+    /// vec (default) AND non-empty steps both deserialize and survive
+    /// dashboard JSON storage.
+    #[tokio::test]
+    async fn datasource_config_w31_tail_pipeline_round_trip() -> Result<()> {
+        use crate::models::dashboard::Dashboard;
+        use crate::models::pipeline::PipelineStep;
+        use crate::models::widget::{
+            ChartConfig, ChartKind, DatasourceBindingSource, DatasourceConfig, Widget,
+        };
+
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let widget = Widget::Chart {
+            id: "w1".into(),
+            title: "Issues".into(),
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 4,
+            config: ChartConfig {
+                kind: ChartKind::Bar,
+                x_axis: None,
+                y_axis: None,
+                colors: None,
+                stacked: false,
+                show_legend: true,
+            },
+            datasource: Some(DatasourceConfig {
+                workflow_id: "wf-1".into(),
+                output_key: "output.data".into(),
+                post_process: None,
+                capture_traces: false,
+                datasource_definition_id: Some("ds-1".into()),
+                binding_source: Some(DatasourceBindingSource::BuildChat),
+                bound_at: Some(now),
+                tail_pipeline: vec![
+                    PipelineStep::Pick {
+                        path: "items".into(),
+                    },
+                    PipelineStep::Limit { count: 5 },
+                ],
+                model_override: None,
+            }),
+            refresh_interval: None,
+        };
+        let dashboard = Dashboard {
+            id: "d1".into(),
+            name: "d".into(),
+            description: None,
+            layout: vec![widget],
+            workflows: vec![],
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+            parameters: vec![],
+            model_policy: None,
+            language_policy: None,
+        };
+        storage.create_dashboard(&dashboard).await?;
+        let fetched = storage
+            .get_dashboard("d1")
+            .await?
+            .expect("dashboard stored");
+        let Widget::Chart { datasource, .. } = &fetched.layout[0] else {
+            panic!("expected chart");
+        };
+        let cfg = datasource.as_ref().expect("datasource present");
+        assert_eq!(cfg.tail_pipeline.len(), 2);
+        match &cfg.tail_pipeline[0] {
+            PipelineStep::Pick { path } => assert_eq!(path, "items"),
+            _ => panic!("expected Pick step"),
+        }
+
+        // Backward compat: legacy JSON without tail_pipeline still
+        // deserializes with an empty tail.
+        let legacy_json = serde_json::json!({
+            "workflow_id": "wf-legacy",
+            "output_key": "output.data",
+        });
+        let legacy: DatasourceConfig = serde_json::from_value(legacy_json)?;
+        assert!(legacy.tail_pipeline.is_empty());
+        Ok(())
+    }
+
+    /// W35: AlertEvent persists `workflow_run_id` and surfaces it on
+    /// read. `None` round-trips as `None`; existing tooling that builds
+    /// events with no run id keeps working.
+    #[tokio::test]
+    async fn alert_event_workflow_run_id_round_trip() -> Result<()> {
+        use crate::models::alert::{AlertEvent, AlertSeverity};
+
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let with_run = AlertEvent {
+            id: "evt-1".into(),
+            widget_id: "w-1".into(),
+            dashboard_id: "d-1".into(),
+            alert_id: "a-1".into(),
+            fired_at: now,
+            severity: AlertSeverity::Warning,
+            message: "tripped".into(),
+            context: serde_json::json!({ "value": 42 }),
+            acknowledged_at: None,
+            triggered_session_id: None,
+            workflow_run_id: Some("run-xyz".into()),
+        };
+        let without_run = AlertEvent {
+            id: "evt-2".into(),
+            workflow_run_id: None,
+            ..with_run.clone()
+        };
+        storage.insert_alert_event(&with_run).await?;
+        storage.insert_alert_event(&without_run).await?;
+        let events = storage.list_alert_events(false, 10).await?;
+        let by_id: std::collections::HashMap<_, _> =
+            events.into_iter().map(|e| (e.id.clone(), e)).collect();
+        assert_eq!(
+            by_id.get("evt-1").unwrap().workflow_run_id.as_deref(),
+            Some("run-xyz")
+        );
+        assert!(by_id.get("evt-2").unwrap().workflow_run_id.is_none());
+        Ok(())
+    }
+
+    /// W35: run summaries skip node_results, return rows ordered by
+    /// most recent first, and respect the `workflow_id` filter. Detail
+    /// lookup returns the originating workflow id alongside the full
+    /// run row.
+    #[tokio::test]
+    async fn workflow_run_summaries_and_detail_round_trip() -> Result<()> {
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let workflow_a = Workflow {
+            id: "wf-a".into(),
+            name: "Workflow A".into(),
+            description: None,
+            nodes: vec![],
+            edges: vec![],
+            trigger: WorkflowTrigger {
+                kind: TriggerKind::Manual,
+                config: None,
+            },
+            is_enabled: true,
+            pause_state: Default::default(),
+            last_paused_at: None,
+            last_pause_reason: None,
+            last_run: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let workflow_b = Workflow {
+            id: "wf-b".into(),
+            name: "Workflow B".into(),
+            ..workflow_a.clone()
+        };
+        storage.create_workflow(&workflow_a).await?;
+        storage.create_workflow(&workflow_b).await?;
+
+        for (workflow_id, run_id, started, status, error) in [
+            ("wf-a", "run-a-1", now, RunStatus::Success, None::<String>),
+            (
+                "wf-a",
+                "run-a-2",
+                now + 1_000,
+                RunStatus::Error,
+                Some("boom".into()),
+            ),
+            ("wf-b", "run-b-1", now + 2_000, RunStatus::Success, None),
+        ] {
+            let run = WorkflowRun {
+                id: run_id.into(),
+                started_at: started,
+                finished_at: Some(started + 50),
+                status,
+                node_results: Some(serde_json::json!({ "k": "v" })),
+                error,
+            };
+            storage.save_workflow_run(workflow_id, &run).await?;
+        }
+
+        let summaries_a = storage
+            .list_workflow_run_summaries(Some("wf-a"), 10)
+            .await?;
+        assert_eq!(summaries_a.len(), 2);
+        assert_eq!(summaries_a[0].id, "run-a-2");
+        assert!(summaries_a[0].duration_ms.unwrap_or_default() >= 0);
+        assert!(summaries_a[0].has_node_results);
+        assert!(matches!(summaries_a[0].status, RunStatus::Error));
+        assert_eq!(summaries_a[0].error.as_deref(), Some("boom"));
+
+        let summaries_all = storage.list_workflow_run_summaries(None, 10).await?;
+        assert_eq!(summaries_all.len(), 3);
+        assert_eq!(summaries_all[0].id, "run-b-1");
+
+        let (workflow_id, run) = storage
+            .get_workflow_run("run-a-1")
+            .await?
+            .expect("run stored");
+        assert_eq!(workflow_id, "wf-a");
+        assert!(matches!(run.status, RunStatus::Success));
+        assert!(run.node_results.is_some());
+
+        assert!(storage.get_workflow_run("missing").await?.is_none());
+        Ok(())
+    }
+
+    /// W36: snapshots round-trip through upsert/list, the conflict
+    /// resolution updates the existing row in place (no duplicates),
+    /// and deleting the owning dashboard wipes the snapshots so the
+    /// table stays bounded by the user's actual dashboard set.
+    #[tokio::test]
+    async fn widget_runtime_snapshot_round_trip_and_dashboard_delete() -> Result<()> {
+        let storage = Storage::new_for_tests().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let dashboard = Dashboard {
+            id: "dash-snap".into(),
+            name: "Snap".into(),
+            description: None,
+            layout: vec![],
+            workflows: vec![],
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+            parameters: Vec::new(),
+            model_policy: None,
+            language_policy: None,
+        };
+        storage.create_dashboard(&dashboard).await?;
+
+        let snap = WidgetRuntimeSnapshot {
+            dashboard_id: "dash-snap".into(),
+            widget_id: "w1".into(),
+            widget_kind: "gauge".into(),
+            runtime_data: serde_json::json!({"kind": "gauge", "value": 42.0}),
+            captured_at: now,
+            workflow_id: Some("wf-1".into()),
+            workflow_run_id: Some("run-1".into()),
+            datasource_definition_id: None,
+            config_fingerprint: "cfg-fp-original".into(),
+            parameter_fingerprint: "param-fp-original".into(),
+        };
+        storage.upsert_widget_snapshot(&snap).await?;
+
+        let listed = storage.list_widget_snapshots("dash-snap").await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].widget_id, "w1");
+        assert_eq!(
+            listed[0].runtime_data["value"].as_f64(),
+            Some(42.0),
+            "runtime_data must survive the JSON round-trip"
+        );
+
+        // Upserting the same (dashboard, widget) replaces in place —
+        // no second row, and the new fingerprint/data win.
+        let snap_v2 = WidgetRuntimeSnapshot {
+            runtime_data: serde_json::json!({"kind": "gauge", "value": 77.0}),
+            captured_at: now + 1_000,
+            config_fingerprint: "cfg-fp-v2".into(),
+            ..snap.clone()
+        };
+        storage.upsert_widget_snapshot(&snap_v2).await?;
+        let listed = storage.list_widget_snapshots("dash-snap").await?;
+        assert_eq!(listed.len(), 1, "upsert must not insert a second row");
+        assert_eq!(listed[0].runtime_data["value"].as_f64(), Some(77.0));
+        assert_eq!(listed[0].config_fingerprint, "cfg-fp-v2");
+        assert_eq!(listed[0].captured_at, now + 1_000);
+
+        storage.delete_widget_snapshot("dash-snap", "w1").await?;
+        assert!(storage.list_widget_snapshots("dash-snap").await?.is_empty());
+
+        // Cascade: deleting the dashboard wipes any remaining
+        // snapshots so the orphan-free invariant holds even when the
+        // user deletes a dashboard with cached widgets.
+        storage.upsert_widget_snapshot(&snap).await?;
+        assert_eq!(storage.list_widget_snapshots("dash-snap").await?.len(), 1);
+        storage.delete_dashboard("dash-snap").await?;
+        assert!(storage.list_widget_snapshots("dash-snap").await?.is_empty());
         Ok(())
     }
 }

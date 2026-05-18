@@ -1378,6 +1378,76 @@ Current dedicated workstream index:
   `docs/W27_CYBERPUNK_REDESIGN.md`.
 - `W28` - Chat UX Hardening And Regression Pass:
   `docs/W28_CHAT_UX_HARDENING.md`.
+- `W29` - Real Provider Runtime And Honest Failure Gate:
+  `docs/W29_REAL_PROVIDER_RUNTIME_GATE.md`.
+- `W30` - Datasource And Pipeline Workbench:
+  `docs/W30_DATASOURCE_PIPELINE_WORKBENCH.md`.
+- `W31` - Datasource Identity, Binding, And Provenance:
+  `docs/W31_DATASOURCE_IDENTITY_BINDING_PROVENANCE.md`.
+- `W32` - Typed Pipeline Studio:
+  `docs/W32_TYPED_PIPELINE_STUDIO.md`.
+- `W33` - Real Provider Acceptance And Agent Eval V2:
+  `docs/W33_REAL_PROVIDER_ACCEPTANCE_AND_AGENT_EVAL_V2.md`.
+- `W34` - Parameterized Datasource Options:
+  `docs/W34_PARAMETERIZED_DATASOURCE_OPTIONS.md`.
+- `W35` - Workflow Operations Cockpit (shipped — Operations route, run
+  history with filters, retry, honest "cancel unsupported" outcome,
+  scheduler health warnings):
+  `docs/W35_WORKFLOW_OPERATIONS_COCKPIT.md`.
+- `W36` - Widget Runtime Snapshots:
+  `docs/W36_WIDGET_RUNTIME_SNAPSHOTS.md`.
+- `W37` - External Open Source And Free-Use Source Catalog:
+  `docs/W37_EXTERNAL_OPEN_SOURCE_CATALOG.md`.
+- `W38` - Build Chat Widget Mentions (shipped — typed `WidgetMention`
+  bundle on `SendMessageRequest`, `@`-picker in Build composer scoped to
+  the active dashboard, targeted-edit system prompt block, validator
+  `OffTargetWidgetReplace` / `OffTargetWidgetRemove` gates, mention chips
+  persisted as a `widget_mentions` part on the user message):
+  `docs/W38_BUILD_CHAT_WIDGET_MENTIONS.md`.
+- `W39` - Automatic Datasource Materialization (shipped — Build apply
+  auto-creates / reuses `DatasourceDefinition` rows via canonical
+  signature, `http_request` validated as a first-class kind,
+  `preview_proposal_materialization` exposes the per-source plan in the
+  proposal preview; compose/output_path/inputs still fall back to
+  per-widget workflows): `docs/W39_AUTOMATIC_DATASOURCE_MATERIALIZATION.md`.
+- `W40` - Widget Runtime Performance (shipped — batched
+  `refresh_dashboard_widgets` command dedupes by `workflow_id`, runs
+  independent workflows with a bounded concurrency cap, frontend
+  supersede tokens drop stale results, memoised `WidgetCell` keeps
+  unrelated widgets stable across refresh ticks):
+  `docs/W40_WIDGET_RUNTIME_PERFORMANCE.md`.
+- `W41` - Widget Execution Observability And LLM Provenance (shipped —
+  `get_widget_provenance` command, typed `WidgetProvenance` envelope with
+  redacted source/argument previews, `llm_participation` enum, inspector
+  panel with Workbench/Operations/Pipeline Debug deep links, and
+  reflection-prompt provenance feed). Details in
+  `docs/W41_WIDGET_EXECUTION_OBSERVABILITY.md`.
+- `W42` - Text Widget Streaming And Reasoning State (shipped v1 —
+  `widget:stream` Tauri channel with typed `WidgetStreamEnvelope`,
+  per-refresh `WidgetStreamContext` + supersede registry on
+  `AppState`, streaming-aware tail-pipeline runner that taps the
+  terminal `llm_postprocess` text step, and a TextWidget that paints
+  partial provider output behind a "streaming"/"reasoning" badge while
+  the committed runtime value remains the source of truth):
+  `docs/W42_WIDGET_STREAMING_REASONING.md`.
+- `W43` - Dashboard And Widget Model Selection:
+  `docs/W43_DASHBOARD_WIDGET_MODEL_SELECTION.md`.
+- `W44` - Image Fullscreen And Gallery Widget:
+  `docs/W44_IMAGE_FULLSCREEN_GALLERY_WIDGET.md`.
+- `W45` - Layout System Simplification And Build Layout Playbook:
+  `docs/W45_LAYOUT_SYSTEM_SIMPLIFICATION.md`.
+- `W46` - Dashboard Header Resilience:
+  `docs/W46_DASHBOARD_HEADER_RESILIENCE.md`.
+- `W47` - LLM Conversation Language Settings:
+  `docs/W47_LLM_CONVERSATION_LANGUAGE_SETTINGS.md`.
+- `W48` - Build Chat Source Mentions And Multi-Source Composition:
+  `docs/W48_BUILD_CHAT_SOURCE_MENTIONS_AND_MULTI_SOURCE_COMPOSITION.md`.
+- `W49` - Chat Context Economy And Cost Accounting Repair:
+  `docs/W49_CHAT_CONTEXT_ECONOMY_AND_COST_ACCOUNTING_REPAIR.md`.
+- `W50` - Dashboard Refresh Pause And Schedule Controls:
+  `docs/W50_DASHBOARD_REFRESH_PAUSE_AND_SCHEDULE_CONTROLS.md`.
+- `W51` - Provider Context Compression And Raw Artifact Retention:
+  `docs/W51_PROVIDER_CONTEXT_COMPRESSION_AND_RAW_ARTIFACT_RETENTION.md`.
 
 ## Parallelization Model
 
@@ -1418,6 +1488,189 @@ Recommended agent queue:
     up copy/edit/regenerate affordances, add visible cancellation/error/retry
     states, preserve drafts/scroll behavior, and only cross into backend/API
     scope for explicitly accepted durable lifecycle fixes.
+16. Run W29 as the no-fake-success runtime gate after W28: remove LocalMock from
+    product provider paths, migrate existing local mock rows to visible
+    unsupported state, make no-provider chat fail closed with typed remediation,
+    block apply of validation-failed Build proposals, and prove one real-provider
+    Context/Build acceptance lane when credentials or a reachable local provider
+    are available.
+17. Run W30 as the operations-grade datasource/pipeline workbench after W29:
+    promote existing datasource plans, shared fan-out, Playground samples,
+    parameters, traces, and pipeline DSL into first-class reusable datasource
+    definitions with inspect/edit/test/save UI, while keeping the existing Rust
+    workflow engine as the only execution engine. **2026-05-17 status:** v1 of
+    the Workbench shipped — saved `DatasourceDefinition` model + SQLite tables,
+    10 Tauri commands (CRUD/test-run/list-consumers/import/export), TypeScript
+    bindings, `#/workbench` panel reachable from the sidebar, and Build Chat
+    catalog injection so the agent reuses saved sources. Contract checker also
+    grew a generic `PipelineStep` / `ValidationIssue` parity gate. Residuals:
+    typed pipeline step editor, apply-time signature reuse (promote a matching
+    `shared_datasources` entry into a binding on the saved definition rather
+    than minting a fresh workflow), per-widget tail pipelines through the
+    Workbench, W23 edit-test-save loop, and Playground "Save as datasource".
+    See `docs/W30_DATASOURCE_PIPELINE_WORKBENCH.md`.
+18. Run W31 after W30 closeout as the datasource identity stream: make saved
+    datasource definitions explicit widget/proposal/version/export identities,
+    bind Build Chat proposals to existing definitions instead of duplicating
+    hidden workflows, and surface provenance plus impact preview in the
+    Workbench.
+19. Run W32 after W31 as the typed pipeline studio stream: replace default JSON
+    pipeline editing with typed step forms, replay traces/samples before save,
+    and keep JSON as an advanced validated escape hatch.
+    **2026-05-17 status:** v1 shipped — `replay_pipeline` Tauri command
+    (deterministic; refuses `llm_postprocess` / `mcp_call`), TS step
+    registry at `src/lib/pipeline/registry.ts`, Studio components at
+    `src/components/pipeline/{PipelineStudio,StepEditor}.tsx`,
+    Workbench's JSON textarea replaced with the Studio (seeded from
+    last test-run's raw source), PipelineDebugModal grew an
+    "Open in Studio" mode that replays via `from_widget_trace` (or
+    inline sample fallback), and W18 reflection now embeds
+    `trace_summary_for_reflection` so the agent can anchor fix-ups on
+    a concrete step. Residuals: save-from-Debug, step-level proposal
+    diffs from reflection/Build Chat, drag-and-drop reorder.
+    See `docs/W32_TYPED_PIPELINE_STUDIO.md`.
+20. Run W33 after W31 or in parallel with W32 only if command/model ownership is
+    serialized: extract the test-only provider abstraction, add recorded/full
+    loop evals, add the live-provider acceptance lane, and centralize strict
+    structured-output capability handling.
+    Shipped 2026-05-17: `AIProvider` trait + `RecordedProvider`,
+    `replay_loop_passes` assertion, `StructuredOutputCapability`
+    capability map, `bun run acceptance` runner, and
+    `--features expensive_evals` live lane behind explicit env vars.
+    See `docs/W33_REAL_PROVIDER_ACCEPTANCE_AND_AGENT_EVAL_V2.md`.
+21. Run W34 after W31 and preferably after W32: make query-backed dashboard
+    parameters resolve real MCP/HTTP/datasource option lists, support dependent
+    controls, and sync same-profile parameter state through the URL hash.
+22. Run W35 after W31: add the workflow operations cockpit over existing
+    scheduler/workflow runs so operators can inspect health, errors, schedules,
+    retries, and owner links without adding a second workflow engine.
+23. Run W36 after W31 and preferably near W35: persist last successful rendered
+    widget runtime snapshots so dashboards can paint immediately after app
+    restart, mark cached data as stale, then replace it through the normal live
+    refresh path without treating cache as datasource health evidence.
+24. Run W37 after W31 and preferably after W35: add the researched MCP/source
+    shortlist from `docs/W37_EXTERNAL_OPEN_SOURCE_CATALOG.md` as a curated
+    catalog of license/terms-reviewed open-source or free-use external sources:
+    Brave Search, Fetch, CoinGecko, DefiLlama, GitHub, arXiv, MediaWiki,
+    RSS/Atom, Hacker News, and SearXNG candidates. Users can enable/disable
+    sources in UX, save them as datasources, and expose enabled sources as
+    dashboard-scoped chat tools so chat can analyze dashboard data and call
+    external sources for clarification without bypassing validation, provenance,
+    or explicit apply confirmation.
+25. Run W38 after W31 and preferably after W32/W36: add Build Chat widget
+    mentions for existing dashboards. Users can mention one or more current
+    widgets from the composer, send stable `widget_id` targets with compact
+    typed widget context, and have Build proposals update/replace/remove only
+    those mentioned widgets unless broader edits were explicitly requested.
+    Proposal validation, preview, and explicit apply confirmation remain the
+    enforcement boundary. See `docs/W38_BUILD_CHAT_WIDGET_MENTIONS.md`.
+26. Run W39 after W31 and preferably after W32/W37: remove the manual
+    datasource setup requirement from the normal Build/Playground happy path.
+    Build Chat and Playground-created HTTP/MCP/provider sources should
+    automatically materialize into saved `DatasourceDefinition` objects on
+    confirmed apply/save, reuse existing matching definitions by canonical
+    signature, bind widgets through `datasource_definition_id`, and keep
+    Workbench as the inspect/edit/debug surface rather than a required setup
+    step. Explicit preview/apply confirmation, validation, provenance,
+    Rust-owned secrets, and W29 no-fake-success behavior remain mandatory. See
+    `docs/W39_AUTOMATIC_DATASOURCE_MATERIALIZATION.md`.
+27. Run W40 after W36 and preferably after W39: make widgets feel immediate by
+    profiling refresh/render latency, eliminating redundant datasource and
+    pipeline work, adding bounded concurrency/cache rules, and proving the
+    dashboard paints quickly without fake/stale success. See
+    `docs/W40_WIDGET_RUNTIME_PERFORMANCE.md`.
+28. Run W41 after W31/W35 and preferably after W23/W39: expose each widget's
+    execution provenance in details, including datasource/workflow identity,
+    tool/provider calls, arguments with secret redaction, timings, latest run
+    status, and whether an LLM/provider step participates in the widget. See
+    `docs/W41_WIDGET_EXECUTION_OBSERVABILITY.md`.
+29. Run W42 after W41 and after the chat streaming substrate from W14/W15:
+    support streaming updates for text-like widget refreshes, surface visible
+    "LLM reasoning in progress" state when a provider step is active, and keep
+    partial output honest until the final runtime value is committed.
+    **2026-05-17 status:** v1 shipped — new `widget:stream` Tauri event
+    channel; typed `WidgetStreamEnvelope` with `refresh_run_id` +
+    `sequence`; per-widget `WidgetStreamContext` on `AppState`
+    (`widget_refresh_runs`) drops emissions from superseded refreshes
+    server-side and the React reducer drops stale deltas client-side;
+    `run_pipeline_with_streaming` taps the terminal `llm_postprocess Text`
+    step on Text widgets and fan-outs provider reasoning/text deltas;
+    `TextWidget` paints partial output (animated caret) and a
+    "thinking…" placeholder while reasoning is the only signal so far,
+    with a destructive ring for partial-on-failure. Residuals: streaming
+    for chart/table data, persisting reasoning summaries, applying
+    streamed proposals without confirmation.
+    See `docs/W42_WIDGET_STREAMING_REASONING.md`.
+30. Run W43 after W29/W33 and before broad widget streaming rollout where
+    possible: let users choose default LLM/model policy at dashboard scope and
+    override it per eligible widget, while preserving provider capability,
+    cost, no-fake-success, and Rust-owned secret boundaries. See
+    `docs/W43_DASHBOARD_WIDGET_MODEL_SELECTION.md`.
+31. Run W44 after the widget runtime data contracts are stable: add a
+    fullscreen image viewer and a first-class gallery widget with datasource
+    pipeline-backed image items, keyboard navigation, loading/error states, and
+    no hardcoded demo images. Shipped v1: `Widget::Gallery` +
+    `BuildWidgetType::Gallery`, runtime coercion accepting string/object/
+    envelope shapes with broken-image fallback, `HardcodedGalleryItems`
+    validation gate, reusable `ImageLightbox` (focus trap, keyboard nav,
+    cycle fit), Build Chat prompt update + Wikipedia gallery template.
+    See `docs/W44_IMAGE_FULLSCREEN_GALLERY_WIDGET.md`.
+32. Run W45 after W38/W39 and preferably before more Build Chat layout features:
+    simplify dashboard layout semantics, keep row-first 12-column auto-pack as
+    the default, and teach the LLM a small set of reusable layout patterns
+    instead of letting it generate arbitrary random placements. Shipped v1:
+    typed `SizePreset` (kpi/half_width/wide_chart/full_width/table/text_panel/
+    gallery) and `LayoutPattern` on `BuildWidgetProposal`; apply path drops
+    explicit `x`/`y` for new widgets and resolves presets to (w, h); validator
+    gates `ProposedExplicitCoordinates` and `ConflictingLayoutFields`; Build
+    system prompt now documents the playbook; eval fixtures cover both happy
+    path and rejection. See `docs/W45_LAYOUT_SYSTEM_SIMPLIFICATION.md`.
+33. Run W46 as a narrow frontend hardening pass after W27 and before another
+    visual redesign: fix dashboard header layout so titles, actions, provider
+    status, parameters, and responsive controls wrap or collapse predictably
+    instead of clipping important text. Shipped v1: title area owns flex
+    space with truncate + native tooltip; provider chip collapses model
+    suffix below `xl` and name max-width capped; dashboard Model policy
+    chip now shows real provider name (not a UUID prefix) with truncation;
+    ParameterBar selects cap at `max-w-[16rem]` so a long option label
+    cannot blow out the sticky row. See
+    `docs/W46_DASHBOARD_HEADER_RESILIENCE.md`.
+34. Run W47 after W43 and preferably after W46: add explicit assistant language
+    settings for GPT/Claude/Kimi-backed chat, Build Chat, and LLM-backed widget
+    text paths. The task should provide an auto/follow-user mode plus a curated
+    major-language catalog, persist the selected BCP-47 language policy without
+    storing secrets, inject the language requirement into Rust-owned provider
+    prompts, and prove that unsupported or low-confidence provider behavior is
+    shown honestly rather than faked. See
+    `docs/W47_LLM_CONVERSATION_LANGUAGE_SETTINGS.md`.
+35. Run W48 after W31/W39 and preferably after W38/W41: add typed Build Chat
+    source mentions and multi-source composition. Users should be able to
+    mention one or more datasource/workflow/source-backed widget inputs, send
+    compact typed source context, and create or replace widgets that genuinely
+    use every mentioned input. Validation must reject proposals that ignore a
+    mentioned source or fake multi-source output. See
+    `docs/W48_BUILD_CHAT_SOURCE_MENTIONS_AND_MULTI_SOURCE_COMPOSITION.md`.
+36. Run W49 after W22/W29/W33 and preferably before more live-provider
+    acceptance expansion: repair cost accounting so real provider usage does
+    not show as zero cost, add explicit unknown-cost states when pricing is
+    missing, and reduce provider-visible context by compacting older turns and
+    bulky tool results while preserving local traces. See
+    `docs/W49_CHAT_CONTEXT_ECONOMY_AND_COST_ACCOUNTING_REPAIR.md`.
+37. Run W50 after W35 and preferably after W40/W41: add first-class pause/resume
+    and schedule controls for dashboard refresh. Users should be able to pause
+    automatic refresh without disabling manual refresh, choose common intervals
+    from the UI, edit advanced cron with validation, persist pause/cadence across
+    restart, and see honest automatic/manual/paused/invalid/running state in the
+    dashboard header, Workbench, and Operations surfaces. See
+    `docs/W50_DASHBOARD_REFRESH_PAUSE_AND_SCHEDULE_CONTROLS.md`.
+38. Run W51 after W49 and preferably before broad multi-source/streaming
+    provider rollout: add a Rust-owned, RTK-class provider-context compression
+    layer for bulky tool, MCP, HTTP, datasource, pipeline, and intermediate
+    provider outputs. The goal is 60-90% provider-visible reduction on
+    representative large-output scenarios without losing answer quality,
+    validation quality, provenance, errors, or local raw-artifact
+    inspectability. See
+    `docs/W51_PROVIDER_CONTEXT_COMPRESSION_AND_RAW_ARTIFACT_RETENTION.md`.
 
 Do not give two agents simultaneous ownership of `src/lib/api.ts`, `src-tauri/src/models/*`, or command request/response shapes. Contract drift is already the main risk.
 

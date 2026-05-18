@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::models::mcp::{ConnectionStatus, MCPServer, MCPServerStatus, MCPTool, MCPTransport};
 use crate::models::Id;
+use crate::modules::tool_engine::DEFAULT_USER_AGENT;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -252,10 +253,14 @@ impl MCPManager {
 
         let client = reqwest::Client::builder()
             .timeout(CALL_TIMEOUT)
+            .user_agent(DEFAULT_USER_AGENT)
             .build()
             .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?;
 
-        info!("🚀 MCP server '{}' (http) connecting to {}", server.name, url);
+        info!(
+            "🚀 MCP server '{}' (http) connecting to {}",
+            server.name, url
+        );
 
         // initialize
         let init_body = json!({
@@ -328,7 +333,9 @@ impl MCPManager {
         if let Some(conn) = connections.remove(server_id) {
             match conn {
                 MCPConnection::Stdio {
-                    server, mut process, ..
+                    server,
+                    mut process,
+                    ..
                 } => {
                     let shutdown = json!({
                         "jsonrpc": "2.0",
@@ -552,7 +559,10 @@ async fn http_rpc(
 ) -> Result<(Value, Option<String>)> {
     let mut req = client
         .post(url)
-        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&body);
     if let Some(sid) = session_id {
@@ -595,8 +605,13 @@ async fn http_rpc(
         let envelope = parse_sse_envelope(&text)?;
         Ok((envelope, session_out))
     } else {
-        let envelope: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("Failed to parse MCP response as JSON: {}; body: {}", e, text))?;
+        let envelope: Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow!(
+                "Failed to parse MCP response as JSON: {}; body: {}",
+                e,
+                text
+            )
+        })?;
         Ok((envelope, session_out))
     }
 }

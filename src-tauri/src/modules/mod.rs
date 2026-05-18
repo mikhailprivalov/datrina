@@ -1,8 +1,13 @@
 pub mod ai;
 pub mod alert_engine;
+pub mod context_budget;
+pub mod context_compressor;
+pub mod datasource_signature;
+pub mod external_source_catalog;
 pub mod mcp_manager;
 pub mod memory;
 pub mod parameter_engine;
+pub mod parameter_options;
 pub mod scheduler;
 pub mod storage;
 pub mod tool_engine;

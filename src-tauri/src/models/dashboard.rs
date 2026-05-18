@@ -20,6 +20,34 @@ pub struct Dashboard {
     /// the parameter engine before workflow execution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<DashboardParameter>,
+    /// W43: optional default LLM policy for LLM-backed widgets on this
+    /// dashboard. Overridable per widget via
+    /// [`crate::models::widget::DatasourceConfig::model_override`]. When
+    /// `None`, eligible widgets resolve to the app-level active provider
+    /// only (no dashboard-level override).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<DashboardModelPolicy>,
+    /// W47: optional dashboard-level assistant language policy. When set,
+    /// it overrides the app default for chat sessions scoped to this
+    /// dashboard and for LLM-backed pipeline steps on this dashboard's
+    /// widgets. `None` falls back to the app default (then to `Auto`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_policy: Option<crate::models::language::AssistantLanguagePolicy>,
+}
+
+/// W43: dashboard-level default for LLM-backed widget runs. Credentials
+/// are intentionally absent — only `provider_id` is stored; the api key
+/// is loaded from the matching provider row at runtime. `required_caps`
+/// is empty by default; callers may pin a capability (e.g. structured
+/// JSON output for a Chart widget that asks the LLM to emit data points)
+/// and the runtime fails closed with a typed error when the resolved
+/// model cannot satisfy it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashboardModelPolicy {
+    pub provider_id: Id,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_caps: Vec<crate::models::provider::WidgetCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +76,37 @@ pub struct UpdateDashboardRequest {
     pub layout: Option<Vec<Widget>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflows: Option<Vec<Workflow>>,
+}
+
+/// W43: dedicated request for the dashboard-level default model. Kept
+/// off `UpdateDashboardRequest` so the caller can clear the policy by
+/// sending `policy: null` without having to fetch and round-trip the
+/// whole dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetDashboardModelPolicyRequest {
+    pub dashboard_id: Id,
+    /// `None` clears the dashboard default and falls back to the app
+    /// active provider for eligible widgets.
+    pub policy: Option<DashboardModelPolicy>,
+}
+
+/// W47: dedicated request for the dashboard-level assistant language
+/// policy. `policy: None` clears the override and falls back to the app
+/// default (then to `Auto`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetDashboardLanguagePolicyRequest {
+    pub dashboard_id: Id,
+    pub policy: Option<crate::models::language::AssistantLanguagePolicy>,
+}
+
+/// W43: dedicated request for a single widget's LLM override. `policy:
+/// None` clears the override, falling back to the dashboard default
+/// (and then to the app active provider).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetWidgetModelOverrideRequest {
+    pub dashboard_id: Id,
+    pub widget_id: Id,
+    pub policy: Option<crate::models::widget::WidgetModelOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +237,134 @@ pub struct BuildWidgetProposal {
     pub h: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replace_widget_id: Option<Id>,
+    /// W45: named size preset. When set, the apply path resolves the
+    /// preset against the widget kind to derive (w, h); any explicit
+    /// `w`/`h` on this widget is treated as a conflict and rejected by
+    /// the validator. Apply also ignores `x`/`y` for new widgets per the
+    /// 12-col auto-pack invariant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_preset: Option<SizePreset>,
+    /// W45: layout pattern hint at the widget level. The apply path uses
+    /// the pattern only for grouping / preset fallback; row breaks come
+    /// from widget order and the 12-col packer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_pattern: Option<LayoutPattern>,
+}
+
+/// W45: named layout pattern the agent chose for this widget. The apply
+/// path treats it as a soft size hint (when `size_preset` is missing)
+/// and as a grouping signal — it does NOT translate to explicit
+/// coordinates, since auto-pack still wins on the 12-col grid.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutPattern {
+    /// 3–6 stat widgets across the top row.
+    KpiRow,
+    /// One wide chart spanning most of the row.
+    TrendChartRow,
+    /// Full-width operations table.
+    OperationsTable,
+    /// Datasource health / overview cards.
+    DatasourceOverview,
+    /// Image gallery / media board.
+    MediaBoard,
+    /// Markdown text panel + supporting metrics.
+    TextPanel,
+}
+
+/// W45: discrete size preset. Resolved against the widget kind at apply
+/// time to produce a (w, h) on the 12-col grid. Preferred over raw
+/// `w`/`h` because it survives copy-paste between widget kinds and
+/// stays predictable across refactors.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SizePreset {
+    /// KPI card. w 3, h 2 (4 per row).
+    Kpi,
+    /// Half-width panel. w 6.
+    HalfWidth,
+    /// Wide chart / bar_gauge. w 8.
+    WideChart,
+    /// Full-width chart or heatmap. w 12, modest height.
+    FullWidth,
+    /// Full-width table or logs. w 12, tall.
+    Table,
+    /// Text / markdown panel. w 6, h 4.
+    TextPanel,
+    /// Gallery / image. w 8, h 6.
+    Gallery,
+}
+
+impl SizePreset {
+    /// Resolve to (w, h) on the 12-col grid given the widget kind. The
+    /// mapping is intentionally a small, complete table — adding a new
+    /// widget kind requires extending this match.
+    pub fn resolve(self, kind: &BuildWidgetType) -> (i32, i32) {
+        use BuildWidgetType as K;
+        use SizePreset as P;
+        match (self, kind) {
+            (P::Kpi, K::Stat) => (3, 2),
+            (P::Kpi, K::Gauge) => (3, 3),
+            (P::Kpi, K::BarGauge) => (4, 3),
+            (P::Kpi, _) => (3, 2),
+
+            (P::HalfWidth, K::Chart) => (6, 5),
+            (P::HalfWidth, K::Table) => (6, 6),
+            (P::HalfWidth, K::Logs) => (6, 6),
+            (P::HalfWidth, K::BarGauge) => (6, 5),
+            (P::HalfWidth, K::StatusGrid) => (6, 4),
+            (P::HalfWidth, K::Text) => (6, 4),
+            (P::HalfWidth, K::Heatmap) => (6, 6),
+            (P::HalfWidth, K::Image) => (6, 4),
+            (P::HalfWidth, K::Gallery) => (6, 5),
+            (P::HalfWidth, _) => (6, 4),
+
+            (P::WideChart, K::Chart) => (8, 5),
+            (P::WideChart, K::BarGauge) => (8, 5),
+            (P::WideChart, K::Heatmap) => (8, 6),
+            (P::WideChart, K::StatusGrid) => (8, 5),
+            (P::WideChart, _) => (8, 5),
+
+            (P::FullWidth, K::Chart) => (12, 6),
+            (P::FullWidth, K::Heatmap) => (12, 6),
+            (P::FullWidth, K::Logs) => (12, 6),
+            (P::FullWidth, K::BarGauge) => (12, 5),
+            (P::FullWidth, K::Gallery) => (12, 6),
+            (P::FullWidth, _) => (12, 5),
+
+            (P::Table, K::Table) => (12, 8),
+            (P::Table, K::Logs) => (12, 7),
+            (P::Table, _) => (12, 6),
+
+            (P::TextPanel, K::Text) => (6, 4),
+            (P::TextPanel, _) => (6, 4),
+
+            (P::Gallery, K::Gallery) => (8, 6),
+            (P::Gallery, K::Image) => (8, 6),
+            (P::Gallery, _) => (8, 6),
+        }
+    }
+}
+
+impl BuildWidgetType {
+    /// Canonical lower-snake-case name. Used by validation messages and
+    /// the Build prompt so widget kind strings stay consistent across
+    /// Rust, TypeScript, and prompt text.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BuildWidgetType::Chart => "chart",
+            BuildWidgetType::Text => "text",
+            BuildWidgetType::Table => "table",
+            BuildWidgetType::Image => "image",
+            BuildWidgetType::Gauge => "gauge",
+            BuildWidgetType::Stat => "stat",
+            BuildWidgetType::Logs => "logs",
+            BuildWidgetType::BarGauge => "bar_gauge",
+            BuildWidgetType::StatusGrid => "status_grid",
+            BuildWidgetType::Heatmap => "heatmap",
+            BuildWidgetType::Gallery => "gallery",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +380,8 @@ pub enum BuildWidgetType {
     BarGauge,
     StatusGrid,
     Heatmap,
+    /// W44: datasource-backed image gallery widget.
+    Gallery,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +413,14 @@ pub struct BuildDatasourcePlan {
     /// (applied AFTER the shared base pipeline) is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_key: Option<String>,
+    /// For `kind: "compose"` plans, the named inputs that should be fetched
+    /// and exposed to the widget's `pipeline` as a single object
+    /// `{ name1: <input1 output>, name2: <input2 output>, ... }`. Each
+    /// inner plan is a regular `BuildDatasourcePlan` (mcp_tool, http_tool /
+    /// builtin_tool, provider_prompt, or shared). Nested compose is not
+    /// supported and is rejected at workflow build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<std::collections::BTreeMap<String, BuildDatasourcePlan>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +434,13 @@ pub enum BuildDatasourcePlanKind {
     /// tail.
     Shared,
     ProviderPrompt,
+    /// Combine N independent inner plans into one widget. Each inner plan
+    /// is fetched + shaped independently, then the results are merged into
+    /// a single object keyed by `inputs` name, and the outer `pipeline` /
+    /// `output_path` operate on that combined value. Lets a single widget
+    /// pull from multiple sources (weather + air quality, releases +
+    /// incidents, etc.) without fan-out workflows.
+    Compose,
 }
 
 // ─── W19: Dashboard versions / undo ─────────────────────────────────────────
@@ -324,6 +528,17 @@ pub struct WidgetDiff {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_changes: Vec<JsonPathChange>,
     pub datasource_plan_changed: bool,
+    /// W31: `true` when the datasource identity changed — either the
+    /// bound `datasource_definition_id`, the backing `workflow_id`, or
+    /// `output_key`. Separated from `datasource_plan_changed` so the UI
+    /// can highlight rebindings independently of per-widget tail edits.
+    #[serde(default)]
+    pub binding_changed: bool,
+    /// W31: `true` when only the per-widget tail (post_process,
+    /// capture_traces, binding_source/bound_at) changed without the
+    /// identity moving.
+    #[serde(default)]
+    pub tail_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +620,15 @@ pub enum DashboardParameterKind {
         headers: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         body: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pipeline: Vec<crate::models::pipeline::PipelineStep>,
+    },
+    /// W34: pull options from a saved `DatasourceDefinition` and reshape
+    /// its output with an optional parameter-specific tail pipeline that
+    /// must produce a list of `{ label, value }` (or scalars, which are
+    /// auto-doubled into label+value).
+    DatasourceQuery {
+        datasource_id: Id,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pipeline: Vec<crate::models::pipeline::PipelineStep>,
     },

@@ -1,7 +1,9 @@
 # W24 Agent Eval Suite
 
-Status: shipped v1 (replay-mode assertions). Live-mode + full
-agent-loop replay deferred to v2 — see "v2 deferrals" below.
+Status: shipped v1 (replay-mode assertions, 2026-05-17). v2 deferrals
+closed by W33 — see `docs/W33_REAL_PROVIDER_ACCEPTANCE_AND_AGENT_EVAL_V2.md`
+for the `AIProvider` trait, recorded-replay harness, live-mode lane,
+and acceptance runner.
 
 Date: 2026-05-16 (v1 landed 2026-05-17)
 
@@ -35,23 +37,23 @@ runtime heuristic diverges from the mirror, the affected scenario
 fails with a clear diff, which is exactly the regression signal the
 suite exists to provide.
 
-## v2 deferrals
+## v2 status (closed by W33)
 
-Driving the full `send_message_stream_inner` agent loop from a
-captured-chunk `MockProvider` requires extracting an `AIProvider` trait
-out of `AIEngine` and threading `&dyn AIProvider` through chat.rs (4.6k
-lines). That refactor is the prerequisite for:
+W33 extracted the `AIProvider` trait, added a `RecordedProvider` that
+implements it, and wired a deterministic full-loop replay harness +
+`replay_loop_passes` assertion alongside the existing v1 assertions.
+The `--features expensive_evals` live lane is now a real
+credentials-gated test, not a placeholder. See
+`docs/W33_REAL_PROVIDER_ACCEPTANCE_AND_AGENT_EVAL_V2.md` for the
+shipped surfaces (trait, recorded provider, capability map,
+acceptance runner).
 
-* Recorded SSE replay (the `record_eval` example).
-* Live-mode evals against real OpenRouter behind `--features
-  expensive_evals`.
-* HTML drift report (`target/eval_report.html`).
-* Asserting iteration counts and the full tool-loop sequence.
+Still deferred:
 
-The v1 assertion surface already catches the regressions the suite was
-created for today (prompt drift breaking the validator, anti-hardcode
-rule decay, pipeline schema rot, cost spikes, loop-detection drift).
-v2 lands when the chat-loop extraction is independently motivated.
+* Recorded SSE chunk replay (the `record_eval` example) — the W33
+  harness uses non-streaming `complete()` only.
+* HTML drift report (`target/eval_report.html`) — the W33 acceptance
+  runner writes JSON; HTML rendering is downstream.
 
 ## Original plan
 

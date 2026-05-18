@@ -55,11 +55,22 @@ pub struct ChatSession {
     pub total_reasoning_tokens: u64,
     #[serde(default)]
     pub total_cost_usd: f64,
+    /// W49: number of assistant turns whose tokens were counted but
+    /// pricing was unknown. `total_cost_usd` is a lower bound when this
+    /// counter is positive; UI surfaces `≥ $X.XXXX (N turns unpriced)`
+    /// rather than implying the unpriced calls were free.
+    #[serde(default)]
+    pub cost_unknown_turns: u32,
     /// W22: optional per-session budget cap in USD. When `total_cost_usd`
     /// would exceed this, the next provider request is denied with a
     /// `budget_exceeded` error. `None` == no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// W47: per-session assistant language override. Takes precedence
+    /// over both the dashboard and app defaults. `None` falls back to
+    /// the dashboard / app stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_override: Option<crate::models::language::AssistantLanguagePolicy>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -150,6 +161,9 @@ pub enum ChatMessagePart {
         result_preview: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// W51: mirrored compression telemetry, see [`ToolResultCompression`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compression: Option<ToolResultCompression>,
     },
     BuildProposal {
         proposal: BuildProposal,
@@ -173,6 +187,32 @@ pub enum ChatMessagePart {
     /// rather than a fresh user-driven proposal.
     ReflectionMeta {
         widget_ids: Vec<Id>,
+    },
+    /// W38: typed mention bundle attached to the user turn that named
+    /// existing widgets. Validation + prompt construction both scope to
+    /// these ids; the UI renders them as chips above / inside the user
+    /// bubble.
+    WidgetMentions {
+        mentions: Vec<WidgetMention>,
+    },
+    /// W48: typed mention bundle for existing data sources the user
+    /// pointed Build chat at. Resolved against
+    /// `DatasourceDefinition`/workflow rows on the backend; validation +
+    /// compose-plan generation use these to make sure every named source
+    /// actually feeds the proposed widget. UI renders them as chips
+    /// alongside [`WidgetMentions`].
+    SourceMentions {
+        mentions: Vec<SourceMention>,
+    },
+    /// Persisted validator outcome. Mirrors the live
+    /// `AgentEvent::ProposalValidationResult` event so a reloaded session
+    /// still shows the validation tile that explains why a proposal was
+    /// (or wasn't) applied.
+    ProposalValidation {
+        status: AgentPhaseStatus,
+        issues: Vec<ValidationIssue>,
+        retried: bool,
+        updated_at: Timestamp,
     },
 }
 
@@ -206,6 +246,30 @@ pub struct ToolResult {
     pub result: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// W51: typed compression telemetry. When present, `result` already
+    /// holds the compact payload produced by
+    /// [`crate::modules::context_compressor`] and the raw payload is
+    /// retained locally via `raw_artifact_id`. UI surfaces (chat trace,
+    /// Pipeline Debug) read this to show "raw 87 KB → 2.1 KB sent" and
+    /// to offer a "view raw locally" affordance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<ToolResultCompression>,
+}
+
+/// W51: per-`ToolResult` compression metadata. Mirrors the typed
+/// [`crate::modules::context_compressor::CompressedArtifact`] but is
+/// trimmed to what the UI + tool loop actually need so the persisted
+/// chat session stays small.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultCompression {
+    pub profile: String,
+    pub raw_bytes: usize,
+    pub compact_bytes: usize,
+    pub estimated_tokens_saved: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncation_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,9 +288,17 @@ pub struct MessageMetadata {
     pub reasoning: Option<String>,
     /// W22: resolved cost in USD for this single assistant turn. Computed
     /// at persist time from `tokens` and the pricing table so a later
-    /// override edit doesn't silently rewrite history.
+    /// override edit doesn't silently rewrite history. `None` paired with
+    /// `cost_source = unknown_pricing` means "tokens spent but USD
+    /// undefined" — UI renders this as `unknown cost`, never as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// W49: provenance of `cost_usd` (`provider_total` / `pricing_table`
+    /// / `unknown_pricing`). Persisted so operators can tell at a glance
+    /// whether the displayed cost came from the upstream provider's own
+    /// billing field or from the local pricing table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<crate::models::pricing::CostSource>,
 }
 
 /// W22: token usage as parsed from the provider's `usage` chunk. Reasoning
@@ -238,6 +310,11 @@ pub struct TokenUsage {
     pub completion: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u32>,
+    /// W49: provider-reported total cost in USD when available (OpenRouter
+    /// surfaces this as `usage.cost` when `include_usage: true`). When
+    /// present, accounting prefers this over the local pricing table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_cost_usd: Option<f64>,
 }
 
 /// W22: per-session entry returned by the top-sessions cost view.
@@ -264,9 +341,87 @@ pub struct CreateSessionRequest {
     pub widget_id: Option<Id>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     pub content: String,
+    /// W38: ordered list of widgets the user mentioned in the composer.
+    /// In Build mode the agent is constrained to replace/remove only
+    /// these widget ids unless the user explicitly asks for broader
+    /// changes. UI-side labels are display-only — `widget_id` is the
+    /// stable reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widget_mentions: Vec<WidgetMention>,
+    /// W48: ordered list of datasources / workflows / source-backed
+    /// widgets the user named in the composer. Build chat resolves
+    /// these into a compact prompt block and the validator enforces
+    /// that every mentioned source is actually consumed by the next
+    /// proposal. Display labels are not authoritative — at least one of
+    /// `datasource_definition_id`, `workflow_id`, or `widget_id` must
+    /// resolve on the backend for the mention to count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_mentions: Vec<SourceMention>,
+}
+
+/// W38: typed widget mention as captured from the Build chat composer.
+/// Title is presentation only; `widget_id` is what every backend lookup
+/// (validation, prompt build, retry) keys off so duplicate-title widgets
+/// stay distinct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetMention {
+    pub widget_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_id: Option<Id>,
+    pub label: String,
+    /// snake_case widget kind (`stat`, `chart`, `text`, ...) so the
+    /// agent prompt can include it without re-deriving from the
+    /// dashboard snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget_kind: Option<String>,
+}
+
+/// W48: kind of source the user mentioned. Mirrors the existing source
+/// taxonomy so the agent + validator can reason about provenance
+/// without re-deriving it from the resolved entry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMentionKind {
+    /// Saved `DatasourceDefinition` row (W30).
+    Datasource,
+    /// Legacy workflow row without an explicit definition — typically
+    /// an older Build proposal that hasn't been materialized via W39.
+    Workflow,
+    /// Widget on the active dashboard whose backing source the user
+    /// wants reused. Resolves to its `DatasourceConfig` and, when
+    /// available, the `DatasourceDefinition` it points at.
+    Widget,
+}
+
+/// W48: typed source mention as captured from the Build chat composer.
+/// At least one identifier must be present; backend resolution prefers
+/// `datasource_definition_id` and falls back to `workflow_id`/`widget_id`.
+/// Labels are display-only, kept here so the prompt + UI chips never
+/// have to re-query while the user is typing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceMention {
+    pub kind: SourceMentionKind,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datasource_definition_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget_id: Option<Id>,
+    /// Active dashboard id at mention time — only meaningful for
+    /// `kind == Widget` mentions, but echoed back so the validator can
+    /// reject cross-dashboard widget references without re-loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_id: Option<Id>,
+    /// Suggested compose-input alias (`forecast`, `air_quality`, ...).
+    /// Frontend derives a snake_case slug from the label; backend uses
+    /// it as a hint for prompt clarity and as the preferred key when
+    /// generating compose plans, but uniqueness is enforced server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_alias: Option<String>,
 }
 
 // ─── Streaming Events ────────────────────────────────────────────────────────
@@ -369,6 +524,12 @@ pub enum AgentEvent {
         result_preview: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// W51: optional compression telemetry mirrored from the
+        /// underlying `ToolResult.compression`. Surfaces in chat trace
+        /// + Pipeline Debug so the user can see "raw 87 KB → 2.1 KB
+        /// sent" and click through to the raw artifact.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compression: Option<ToolResultCompression>,
     },
     BuildProposal {
         proposal: BuildProposal,
@@ -460,6 +621,12 @@ pub struct ToolResultTrace {
     pub result_preview: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// W51: streaming chat-event mirror of [`ToolResultCompression`].
+    /// Allows the React chat panel to show compression telemetry as
+    /// soon as the tool result lands, without waiting for the final
+    /// persisted message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<ToolResultCompression>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

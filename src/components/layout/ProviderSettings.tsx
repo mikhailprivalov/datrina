@@ -1,7 +1,14 @@
-import { useMemo, useState } from 'react';
-import type { CreateProviderRequest, LLMProvider, ProviderTestResult, UpdateProviderRequest } from '../../lib/api';
-
-type ProviderKind = LLMProvider['kind'];
+import { useEffect, useMemo, useState } from 'react';
+import {
+  type AssistantLanguagePolicy,
+  type CreateProviderRequest,
+  type LLMProvider,
+  languageApi,
+  type ProviderKind,
+  type ProviderTestResult,
+  type UpdateProviderRequest,
+} from '../../lib/api';
+import { AssistantLanguagePicker } from '../settings/AssistantLanguagePicker';
 
 interface Props {
   providers: LLMProvider[];
@@ -18,14 +25,11 @@ interface Props {
   onTestProvider: (id: string) => Promise<ProviderTestResult>;
 }
 
+// W29: production templates only — `local_mock` was removed. The
+// fallback dev provider is gone; the operator must configure a real
+// provider (OpenRouter with key, reachable Ollama, or a custom
+// OpenAI-compatible endpoint).
 const PROVIDER_TEMPLATES: Record<ProviderKind, CreateProviderRequest> = {
-  local_mock: {
-    name: 'Local mock dev/test',
-    kind: 'local_mock',
-    base_url: 'local://mock',
-    default_model: 'local_mock',
-    models: ['local_mock'],
-  },
   openrouter: {
     name: 'OpenRouter',
     kind: 'openrouter',
@@ -49,6 +53,8 @@ const PROVIDER_TEMPLATES: Record<ProviderKind, CreateProviderRequest> = {
   },
 };
 
+const DEFAULT_KIND: ProviderKind = 'openrouter';
+
 export function ProviderSettings({
   providers,
   activeProviderId,
@@ -63,12 +69,37 @@ export function ProviderSettings({
   onSetActiveProvider,
   onTestProvider,
 }: Props) {
-  const [draft, setDraft] = useState<CreateProviderRequest>(PROVIDER_TEMPLATES.local_mock);
+  const [draft, setDraft] = useState<CreateProviderRequest>(PROVIDER_TEMPLATES[DEFAULT_KIND]);
   const [apiKey, setApiKey] = useState('');
-  const [modelsText, setModelsText] = useState(PROVIDER_TEMPLATES.local_mock.models?.join(', ') ?? '');
+  const [modelsText, setModelsText] = useState(PROVIDER_TEMPLATES[DEFAULT_KIND].models?.join(', ') ?? '');
   const [editingProviderId, setEditingProviderId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  // W47: app-level default language policy. Loaded once when the
+  // settings panel opens; mutations round-trip through the Tauri
+  // command so a reload picks up the same value.
+  const [appLanguage, setAppLanguage] = useState<AssistantLanguagePolicy | null>(null);
+  const [languageError, setLanguageError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    languageApi
+      .getAppPolicy()
+      .then(policy => {
+        if (!cancelled) {
+          setAppLanguage(policy);
+          setLanguageError(null);
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          setLanguageError(err instanceof Error ? err.message : String(err));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const activeProvider = useMemo(
     () => providers.find(provider => provider.id === activeProviderId) ?? null,
@@ -101,9 +132,9 @@ export function ProviderSettings({
 
   const resetDraft = () => {
     setEditingProviderId(null);
-    setDraft(PROVIDER_TEMPLATES.local_mock);
+    setDraft(PROVIDER_TEMPLATES[DEFAULT_KIND]);
     setApiKey('');
-    setModelsText(PROVIDER_TEMPLATES.local_mock.models?.join(', ') ?? '');
+    setModelsText(PROVIDER_TEMPLATES[DEFAULT_KIND].models?.join(', ') ?? '');
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
@@ -114,7 +145,7 @@ export function ProviderSettings({
     const trimmedApiKey = apiKey.trim();
     const models = modelsText
       .split(',')
-      .map(model => model.trim())
+      .map((model: string) => model.trim())
       .filter(Boolean);
 
     try {
@@ -150,9 +181,7 @@ export function ProviderSettings({
     }
   };
 
-  const canSubmit = !isBusy && draft.name.trim() && draft.default_model.trim() && (
-    draft.kind === 'local_mock' || draft.base_url.trim()
-  );
+  const canSubmit = !isBusy && draft.name.trim() && draft.default_model.trim() && draft.base_url.trim();
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/85 p-4 backdrop-blur-sm">
@@ -176,8 +205,8 @@ export function ProviderSettings({
 
         <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[minmax(0,1fr)_360px]">
           <form onSubmit={handleSubmit} className="space-y-5 border-b border-border p-5 md:border-b-0 md:border-r">
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              {(['local_mock', 'openrouter', 'ollama', 'custom'] as ProviderKind[]).map(kind => (
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              {(['openrouter', 'ollama', 'custom'] as ProviderKind[]).map(kind => (
                 <button
                   key={kind}
                   type="button"
@@ -218,7 +247,6 @@ export function ProviderSettings({
               <input
                 value={draft.base_url}
                 onChange={event => setDraft(prev => ({ ...prev, base_url: event.target.value }))}
-                disabled={draft.kind === 'local_mock'}
                 className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none disabled:opacity-60 focus:ring-2 focus:ring-primary/30"
               />
             </label>
@@ -278,22 +306,41 @@ export function ProviderSettings({
                   Cancel edit
                 </button>
               )}
-              {initialSetup && draft.kind !== 'local_mock' && (
-                <button
-                  type="button"
-                  onClick={() => selectKind('local_mock')}
-                  className="rounded-lg border border-border px-4 py-2 text-sm transition-colors hover:bg-muted"
-                >
-                  Use local mock dev/test
-                </button>
-              )}
             </div>
           </form>
 
           <div className="space-y-4 p-5">
+            <div className="space-y-2 rounded-md border border-border bg-background/60 p-3">
+              <div>
+                <h3 className="text-sm font-medium">Assistant language</h3>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Applies to chat, Build chat, and LLM-backed widgets / pipelines.
+                  Dashboard and chat-session overrides take precedence.
+                </p>
+              </div>
+              <AssistantLanguagePicker
+                value={appLanguage}
+                label="App default"
+                hint="Schema keys, tool names, ids, and validation codes are never translated."
+                onChange={async next => {
+                  const policy = next ?? { mode: 'auto' };
+                  try {
+                    const persisted = await languageApi.setAppPolicy(policy);
+                    setAppLanguage(persisted);
+                    setLanguageError(null);
+                  } catch (err) {
+                    setLanguageError(err instanceof Error ? err.message : String(err));
+                  }
+                }}
+              />
+              {languageError && (
+                <p className="text-[11px] text-destructive">{languageError}</p>
+              )}
+            </div>
+
             <div>
               <h3 className="text-sm font-medium">Providers</h3>
-              <p className="mt-1 text-xs text-muted-foreground">Chat uses the selected enabled provider.</p>
+              <p className="mt-1 text-xs text-muted-foreground">Chat uses the selected active provider.</p>
             </div>
 
             {providers.length === 0 ? (
@@ -302,65 +349,84 @@ export function ProviderSettings({
               </div>
             ) : (
               <div className="space-y-2">
-                {providers.map(provider => (
-                  <div key={provider.id} className="rounded-lg border border-border bg-background/60 p-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate text-sm font-medium">{provider.name}</span>
-                          {provider.id === activeProviderId && (
-                            <span className="rounded-sm border border-neon-lime/40 bg-neon-lime/15 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider font-semibold text-neon-lime">active</span>
+                {providers.map(provider => {
+                  const isActive = provider.id === activeProviderId;
+                  const unsupported = provider.is_unsupported === true;
+                  return (
+                    <div
+                      key={provider.id}
+                      className={`rounded-lg border p-3 ${
+                        unsupported
+                          ? 'border-destructive/40 bg-destructive/5'
+                          : 'border-border bg-background/60'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="truncate text-sm font-medium">{provider.name}</span>
+                            {isActive && !unsupported && (
+                              <span className="rounded-sm border border-neon-lime/40 bg-neon-lime/15 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider font-semibold text-neon-lime">active</span>
+                            )}
+                            {unsupported && (
+                              <span className="rounded-sm border border-destructive/40 bg-destructive/15 px-1.5 py-0.5 text-[9px] mono uppercase tracking-wider font-semibold text-destructive">unsupported</span>
+                            )}
+                          </div>
+                          <p className="mt-1 truncate text-xs text-muted-foreground">
+                            {labelForKind(provider.kind)} - {provider.default_model}
+                          </p>
+                          {unsupported && (
+                            <p className="mt-1 text-[11px] text-destructive">
+                              Legacy provider kind (e.g. <code className="rounded bg-foreground/10 px-1">local_mock</code>) is no longer supported. Edit it to OpenRouter, Ollama, or Custom — or remove it.
+                            </p>
                           )}
                         </div>
-                        <p className="mt-1 truncate text-xs text-muted-foreground">
-                          {labelForKind(provider.kind)} - {provider.default_model}
-                        </p>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => onSetActiveProvider(provider.id)}
+                          disabled={isActive || isBusy || unsupported || !provider.is_enabled}
+                          className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Set active
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => runTest(provider)}
+                          disabled={isBusy || unsupported}
+                          className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Test
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => editProvider(provider)}
+                          disabled={isBusy}
+                          className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onSetProviderEnabled(provider.id, !provider.is_enabled)}
+                          disabled={isBusy || (unsupported && !provider.is_enabled)}
+                          className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {provider.is_enabled ? 'Disable' : 'Enable'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onRemoveProvider(provider.id)}
+                          disabled={isBusy}
+                          className="rounded-md border border-destructive/30 px-2.5 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Remove
+                        </button>
                       </div>
                     </div>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => onSetActiveProvider(provider.id)}
-                        disabled={provider.id === activeProviderId || isBusy}
-                        className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        Set active
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => runTest(provider)}
-                        disabled={isBusy}
-                        className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        Test
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => editProvider(provider)}
-                        disabled={isBusy}
-                        className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onSetProviderEnabled(provider.id, !provider.is_enabled)}
-                        disabled={isBusy}
-                        className="rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {provider.is_enabled ? 'Disable' : 'Enable'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onRemoveProvider(provider.id)}
-                        disabled={isBusy}
-                        className="rounded-md border border-destructive/30 px-2.5 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -372,8 +438,6 @@ export function ProviderSettings({
 
 function labelForKind(kind: ProviderKind) {
   switch (kind) {
-    case 'local_mock':
-      return 'Local mock dev/test';
     case 'openrouter':
       return 'OpenRouter';
     case 'ollama':

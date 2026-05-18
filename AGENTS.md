@@ -68,11 +68,17 @@ Default order:
    product work beyond the accepted reconciliation slice.
 10. Later `W11+` product-readiness and runtime streams follow
     `docs/RECONCILIATION_PLAN.md` in order. Active product backlog as of
-    2026-05-17: `W16`–`W28` have dedicated `docs/W<N>_*.md` records, with
-    `W27` as the frontend-only Cyberpunk UI Redesign stream and `W28` as the
-    chat UX hardening stream. New W tasks must ship a doc in `docs/` with the
-    same `Status / Context / Goal / Approach / Files / Validation / Out of
-    scope / Related` shape.
+    2026-05-17: `W16`–`W47` have dedicated `docs/W<N>_*.md` records, with
+    `W29` as the real-provider/no-fake-success runtime gate, `W30` as the
+    datasource and pipeline workbench stream, `W31`–`W39` as post-W30
+    datasource identity, pipeline studio, real-provider eval, parameter
+    options, workflow operations, widget runtime snapshot, external source
+    catalog, Build Chat widget mentions, and automatic datasource
+    materialization, and `W40`–`W47` as widget performance, observability,
+    streaming/reasoning, model selection, image/gallery, layout, and header
+    resilience, and LLM conversation language settings streams. New W tasks
+    must ship a doc in `docs/` with the same `Status / Context / Goal /
+    Approach / Files / Validation / Out of scope / Related` shape.
 
 When multiple agents are used, split by ownership paths from the plan. Do not
 run concurrent agents over `src/lib/api.ts`, `src-tauri/src/models/*`, or
@@ -91,6 +97,9 @@ directory include:
 - `bun run build`
 - `cargo fmt --all --check`
 - `cargo check --workspace --all-targets`
+- `bun run eval` — replay-mode agent eval suite (W24, extended by W33).
+- `bun run acceptance` — W33 acceptance runner: static gates + replay
+  eval. `--include-live` opts into the credentials-gated live lane.
 
 If dependencies or toolchains are missing, record the exact blocker. Do not
 claim acceptance checks passed when they were not run.

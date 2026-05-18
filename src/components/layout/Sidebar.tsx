@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { DatrinaLogo } from '../branding/DatrinaLogo';
 import type { Dashboard } from '../../lib/api';
 
 const DASHBOARD_ICONS = [
@@ -39,6 +40,16 @@ interface Props {
   isPlaygroundActive?: boolean;
   onOpenAlerts?: () => void;
   isAlertsActive?: boolean;
+  onOpenWorkbench?: () => void;
+  isWorkbenchActive?: boolean;
+  /** W37: external open-source / free-use source catalog. */
+  onOpenSources?: () => void;
+  isSourcesActive?: boolean;
+  /** W35: workflow operations cockpit. */
+  onOpenOperations?: () => void;
+  isOperationsActive?: boolean;
+  /** W35: badge count of scheduler health warnings + recent failed runs. */
+  operationsAlertCount?: number;
   unacknowledgedAlertCount?: number;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
@@ -46,7 +57,7 @@ interface Props {
   onToggleTheme: () => void;
 }
 
-export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFromTemplate, onDelete, onOpenSettings, onOpenMcpSettings, onOpenMemorySettings, onOpenCostsView, onOpenPlayground, isPlaygroundActive, onOpenAlerts, isAlertsActive, unacknowledgedAlertCount = 0, isCollapsed, onToggleCollapse, theme, onToggleTheme }: Props) {
+export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFromTemplate, onDelete, onOpenSettings, onOpenMcpSettings, onOpenMemorySettings, onOpenCostsView, onOpenPlayground, isPlaygroundActive, onOpenAlerts, isAlertsActive, onOpenWorkbench, isWorkbenchActive, onOpenSources, isSourcesActive, onOpenOperations, isOperationsActive, operationsAlertCount = 0, unacknowledgedAlertCount = 0, isCollapsed, onToggleCollapse, theme, onToggleTheme }: Props) {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; id: string } | null>(null);
 
   const handleContextMenu = (e: React.MouseEvent, id: string) => {
@@ -68,9 +79,7 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
         {!isCollapsed && (
           <div className="flex items-center gap-2 min-w-0">
             <div className="w-7 h-7 rounded-md bg-gradient-to-br from-primary to-accent flex items-center justify-center flex-shrink-0 glow-primary">
-              <svg className="w-4 h-4 text-primary-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-              </svg>
+              <DatrinaLogo alt="" className="h-6 w-6 rounded-[4px] bg-background/70" imageClassName="scale-110" />
             </div>
             <div className="flex flex-col min-w-0">
               <span className="font-semibold text-sm leading-none tracking-tight">DATRINA</span>
@@ -144,6 +153,50 @@ export function Sidebar({ dashboards, activeId, onSelect, onCreate, onCreateFrom
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
             </svg>
             {!isCollapsed && <span>Playground</span>}
+          </button>
+        )}
+        {onOpenWorkbench && (
+          <button
+            onClick={onOpenWorkbench}
+            title="Datasource Workbench"
+            className={`${navButton(!!isWorkbenchActive)} ${isCollapsed ? 'justify-center' : ''}`}
+          >
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 7h16M4 12h10M4 17h7m6-5l3 3m0 0l3-3m-3 3V8" />
+            </svg>
+            {!isCollapsed && <span>Workbench</span>}
+          </button>
+        )}
+        {onOpenSources && (
+          <button
+            onClick={onOpenSources}
+            title="External Source Catalog"
+            className={`${navButton(!!isSourcesActive)} ${isCollapsed ? 'justify-center' : ''}`}
+          >
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 21a9 9 0 100-18 9 9 0 000 18zm0 0c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3 7.5 7.03 7.5 12s2.015 9 4.5 9zM3 12h18" />
+            </svg>
+            {!isCollapsed && <span>Sources</span>}
+          </button>
+        )}
+        {onOpenOperations && (
+          <button
+            onClick={onOpenOperations}
+            title="Workflow Operations"
+            className={`relative ${navButton(!!isOperationsActive)} ${isCollapsed ? 'justify-center' : ''}`}
+          >
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 4h13M3 9h9M3 14h9M3 19h13M17 8l4 4-4 4" />
+            </svg>
+            {!isCollapsed && <span className="flex-1 text-left">Operations</span>}
+            {operationsAlertCount > 0 && !isCollapsed && (
+              <span className="min-w-[1.25rem] rounded-full bg-amber-500/80 px-1.5 text-center text-[10px] mono font-semibold text-background">
+                {operationsAlertCount > 99 ? '99+' : operationsAlertCount}
+              </span>
+            )}
+            {operationsAlertCount > 0 && isCollapsed && (
+              <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-amber-500/80" aria-hidden />
+            )}
           </button>
         )}
         {onOpenAlerts && (

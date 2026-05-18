@@ -116,6 +116,20 @@ pub enum Widget {
         #[serde(skip_serializing_if = "Option::is_none")]
         datasource: Option<DatasourceConfig>,
     },
+    /// W44: datasource-backed gallery of image items. Runtime data must
+    /// be an array of `GalleryItemRuntime` produced by the workflow
+    /// pipeline — hardcoded `data` arrays are rejected by the validator.
+    Gallery {
+        id: Id,
+        title: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        config: GalleryConfig,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        datasource: Option<DatasourceConfig>,
+    },
 }
 
 impl Widget {
@@ -131,6 +145,7 @@ impl Widget {
             Widget::BarGauge { id, .. } => id,
             Widget::StatusGrid { id, .. } => id,
             Widget::Heatmap { id, .. } => id,
+            Widget::Gallery { id, .. } => id,
         }
     }
 
@@ -146,6 +161,7 @@ impl Widget {
             Widget::BarGauge { title, .. } => title,
             Widget::StatusGrid { title, .. } => title,
             Widget::Heatmap { title, .. } => title,
+            Widget::Gallery { title, .. } => title,
         }
     }
 }
@@ -444,9 +460,57 @@ fn default_heatmap_scheme() -> HeatmapColorScheme {
     HeatmapColorScheme::Viridis
 }
 
-// ─── Datasource ──────────────────────────────────────────────────────────────
+// ─── Gallery (W44) ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GalleryConfig {
+    #[serde(default)]
+    pub layout: GalleryLayout,
+    #[serde(default = "default_gallery_aspect")]
+    pub thumbnail_aspect: GalleryAspect,
+    #[serde(default = "default_gallery_max_items")]
+    pub max_visible_items: u32,
+    #[serde(default = "default_true")]
+    pub show_caption: bool,
+    #[serde(default)]
+    pub show_source: bool,
+    #[serde(default = "default_true")]
+    pub fullscreen_enabled: bool,
+    #[serde(default = "default_image_fit")]
+    pub fit: ImageFit,
+    #[serde(default = "default_border_radius")]
+    pub border_radius: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryLayout {
+    #[default]
+    Grid,
+    Row,
+    Masonry,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryAspect {
+    Square,
+    Landscape,
+    Portrait,
+    Original,
+}
+
+fn default_gallery_aspect() -> GalleryAspect {
+    GalleryAspect::Landscape
+}
+
+fn default_gallery_max_items() -> u32 {
+    24
+}
+
+// ─── Datasource ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatasourceConfig {
     pub workflow_id: Id,
     pub output_key: String,
@@ -457,6 +521,62 @@ pub struct DatasourceConfig {
     /// visible without manual intervention.
     #[serde(default, skip_serializing_if = "is_false")]
     pub capture_traces: bool,
+    /// W31: explicit binding to a saved [`DatasourceDefinition`]. When
+    /// present, the widget is owned by the saved catalog entry — the
+    /// Workbench can list it as a consumer, edits propagate, and Build
+    /// proposals can re-bind to an existing definition instead of
+    /// minting a duplicate workflow. Legacy widgets still refresh via
+    /// `workflow_id` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datasource_definition_id: Option<Id>,
+    /// W31: which surface last wrote this binding. Surfaced in the
+    /// Workbench consumers view so operators can tell apart Build Chat
+    /// vs. Workbench vs. manual edits when something looks wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_source: Option<DatasourceBindingSource>,
+    /// W31: timestamp of the last binding change (definition id or
+    /// workflow id flipped). Helps the impact preview rank stale
+    /// consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_at: Option<i64>,
+    /// W31.1: per-widget typed pipeline applied AFTER the saved
+    /// datasource workflow output. Lets multiple consumers reuse the
+    /// same backing source while shaping the value differently. Empty
+    /// vector = no tail (default). Reused as the substrate for Build
+    /// Chat's shared_datasources per-consumer tails so we no longer
+    /// need fan-out workflows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail_pipeline: Vec<crate::models::pipeline::PipelineStep>,
+    /// W43: per-widget LLM override. Wins over
+    /// [`crate::models::dashboard::DashboardModelPolicy`] when set; the
+    /// app-level active provider is the final fallback. Credentials are
+    /// never stored here — only the target `provider_id`/`model` — so
+    /// the widget JSON stays safe to surface in version diffs and
+    /// reflection prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<WidgetModelOverride>,
+}
+
+/// W43: per-widget override. `required_caps` lets a single LLM-backed
+/// widget pin a capability stricter than the dashboard default — e.g. a
+/// stat widget needs structured JSON to emit a numeric value reliably,
+/// even when the dashboard default only asks for plain text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WidgetModelOverride {
+    pub provider_id: Id,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_caps: Vec<crate::models::provider::WidgetCapability>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DatasourceBindingSource {
+    BuildChat,
+    Workbench,
+    Playground,
+    Import,
+    Manual,
 }
 
 fn is_false(b: &bool) -> bool {

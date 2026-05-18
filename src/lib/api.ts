@@ -23,7 +23,85 @@ export interface Dashboard {
   updated_at: number;
   /** W25: Grafana-style template variables. */
   parameters?: DashboardParameter[];
+  /** W43: dashboard-level default LLM policy for LLM-backed widgets. */
+  model_policy?: DashboardModelPolicy | null;
+  /** W47: dashboard-level assistant language policy override. */
+  language_policy?: AssistantLanguagePolicy | null;
 }
+
+// ─── W47: Assistant language policy ─────────────────────────────────────────
+
+/** Per-scope language policy. `auto` follows the user's natural language;
+ *  `explicit` pins a curated BCP-47 tag from `listAssistantLanguages`. */
+export type AssistantLanguagePolicy =
+  | { mode: 'auto' }
+  | { mode: 'explicit'; tag: string };
+
+export type AssistantLanguageDirection = 'ltr' | 'rtl';
+
+export type AssistantLanguageSource =
+  | 'auto'
+  | 'app_default'
+  | 'dashboard_override'
+  | 'session_override';
+
+export interface AssistantLanguageProviderSupport {
+  provider: string;
+  prompt_supported: boolean;
+  notes?: string | null;
+}
+
+export interface AssistantLanguageOption {
+  tag: string;
+  label: string;
+  native_label: string;
+  direction: AssistantLanguageDirection;
+  prompt_name: string;
+  provider_support: AssistantLanguageProviderSupport[];
+}
+
+export interface AssistantLanguageCatalog {
+  options: AssistantLanguageOption[];
+}
+
+export interface EffectiveAssistantLanguage {
+  source: AssistantLanguageSource;
+  option?: AssistantLanguageOption | null;
+}
+
+/** W43: capability tag pinned by dashboard/widget model policy. */
+export type WidgetCapability =
+  | 'structured_json_object'
+  | 'streaming'
+  | 'tool_calling';
+
+/** W43: which surface chose the resolved provider/model. */
+export type WidgetModelSource =
+  | 'widget_override'
+  | 'dashboard_default'
+  | 'app_active_provider';
+
+export interface DashboardModelPolicy {
+  provider_id: string;
+  model: string;
+  required_caps?: WidgetCapability[];
+}
+
+export interface WidgetModelOverride {
+  provider_id: string;
+  model: string;
+  required_caps?: WidgetCapability[];
+}
+
+/** W43: typed error returned by `set_dashboard_model_policy` /
+ * `set_widget_model_override` / refresh when the policy can't be honoured.
+ * Surfaced through `ApiResponse.error` as a JSON-encoded message; callers
+ * may match on the `code` prefix (`widget_model_*`). */
+export type WidgetModelErrorCode =
+  | 'widget_model_provider_missing'
+  | 'widget_model_provider_disabled'
+  | 'widget_model_provider_invalid_config'
+  | 'widget_model_capability_unsupported';
 
 // ─── W25: Dashboard parameters ──────────────────────────────────────────────
 
@@ -59,6 +137,11 @@ export type DashboardParameterKind =
       body?: unknown;
       pipeline?: unknown[];
     }
+  | {
+      kind: 'datasource_query';
+      datasource_id: string;
+      pipeline?: unknown[];
+    }
   | { kind: 'constant'; value: ParameterValue };
 
 export type DashboardParameter = {
@@ -81,6 +164,8 @@ export interface DashboardParameterState {
 
 export interface SetDashboardParameterResult {
   affected_widget_ids: string[];
+  /** W34: dependent parameters re-resolved server-side using the new value. */
+  downstream?: DashboardParameterState[];
 }
 
 export interface ResolveDashboardParametersResult {
@@ -88,7 +173,7 @@ export interface ResolveDashboardParametersResult {
   cycle?: string[];
 }
 
-export type WidgetType = 'chart' | 'text' | 'table' | 'image' | 'gauge' | 'stat' | 'logs' | 'bar_gauge' | 'status_grid' | 'heatmap';
+export type WidgetType = 'chart' | 'text' | 'table' | 'image' | 'gauge' | 'stat' | 'logs' | 'bar_gauge' | 'status_grid' | 'heatmap' | 'gallery';
 
 export interface WidgetBase {
   id: string;
@@ -151,6 +236,11 @@ export interface HeatmapWidget extends WidgetBase {
   config: HeatmapConfig;
 }
 
+export interface GalleryWidget extends WidgetBase {
+  type: 'gallery';
+  config: GalleryConfig;
+}
+
 export type Widget =
   | ChartWidget
   | TextWidget
@@ -161,7 +251,8 @@ export type Widget =
   | LogsWidget
   | BarGaugeWidget
   | StatusGridWidget
-  | HeatmapWidget;
+  | HeatmapWidget
+  | GalleryWidget;
 
 export type WidgetRuntimeData =
   | ChartWidgetRuntimeData
@@ -173,7 +264,8 @@ export type WidgetRuntimeData =
   | LogsWidgetRuntimeData
   | BarGaugeWidgetRuntimeData
   | StatusGridWidgetRuntimeData
-  | HeatmapWidgetRuntimeData;
+  | HeatmapWidgetRuntimeData
+  | GalleryWidgetRuntimeData;
 
 export interface ChartWidgetRuntimeData {
   kind: 'chart';
@@ -255,11 +347,61 @@ export interface HeatmapWidgetRuntimeData {
   cells: HeatmapCell[];
 }
 
+export interface GalleryItem {
+  src: string;
+  title?: string;
+  caption?: string;
+  alt?: string;
+  source?: string;
+  link?: string;
+  id?: string;
+}
+
+export interface GalleryWidgetRuntimeData {
+  kind: 'gallery';
+  items: GalleryItem[];
+}
+
 export interface WidgetRefreshResult {
   status: 'ok' | 'unsupported' | 'not_implemented' | 'error' | string;
   workflow_run_id?: string;
   data?: WidgetRuntimeData;
   error?: string;
+}
+
+/**
+ * W40: one entry per refreshable widget returned by the batched
+ * `refresh_dashboard_widgets` command. Mirrors
+ * `src-tauri/src/commands/dashboard.rs::DashboardWidgetRefreshResult`.
+ * Widgets without a datasource are silently omitted by the backend, so
+ * the result vector only carries widgets the loop actually touched.
+ */
+export interface DashboardWidgetRefreshResult {
+  widget_id: string;
+  status: 'ok' | 'error' | string;
+  workflow_run_id?: string;
+  data?: WidgetRuntimeData;
+  error?: string;
+}
+
+/**
+ * W36: cached last-known-good runtime value for one widget. Mirrors
+ * `src-tauri/src/models/snapshot.rs::WidgetRuntimeSnapshot`. Returned
+ * by `list_widget_snapshots` after the backend has already pruned
+ * fingerprint-mismatched entries — incompatible snapshots never reach
+ * the UI.
+ */
+export interface WidgetRuntimeSnapshot {
+  dashboard_id: string;
+  widget_id: string;
+  widget_kind: string;
+  runtime_data: WidgetRuntimeData;
+  captured_at: number;
+  workflow_id?: string;
+  workflow_run_id?: string;
+  datasource_definition_id?: string;
+  config_fingerprint: string;
+  parameter_fingerprint: string;
 }
 
 export interface WorkflowEventEnvelope {
@@ -394,13 +536,41 @@ export interface HeatmapConfig {
   log_scale?: boolean;
 }
 
+export interface GalleryConfig {
+  layout?: 'grid' | 'row' | 'masonry';
+  thumbnail_aspect?: 'square' | 'landscape' | 'portrait' | 'original';
+  max_visible_items?: number;
+  show_caption?: boolean;
+  show_source?: boolean;
+  fullscreen_enabled?: boolean;
+  fit?: 'cover' | 'contain' | 'fill';
+  border_radius?: number;
+}
+
 export interface DatasourceConfig {
   workflow_id: string;
   output_key: string;
   post_process?: PostProcessStep[];
   /** W23: opt-in pipeline trace capture on every refresh. */
   capture_traces?: boolean;
+  /** W31: optional saved-datasource identity bound to this widget. */
+  datasource_definition_id?: string;
+  /** W31: which surface last wrote this binding. */
+  binding_source?: DatasourceBindingSource;
+  /** W31: timestamp of the last binding change. */
+  bound_at?: number;
+  /** W31.1: per-widget tail pipeline applied after the workflow output. */
+  tail_pipeline?: PipelineStep[];
+  /** W43: per-widget LLM override. Wins over dashboard default. */
+  model_override?: WidgetModelOverride | null;
 }
+
+export type DatasourceBindingSource =
+  | 'build_chat'
+  | 'workbench'
+  | 'playground'
+  | 'import'
+  | 'manual';
 
 export interface PostProcessStep {
   kind: 'llm_analyze' | 'filter' | 'aggregate' | 'transform' | 'sort' | 'limit';
@@ -465,6 +635,9 @@ export interface ChatSession {
   total_cost_usd?: number;
   /** W22: optional per-session USD budget cap. Null/undefined == no cap. */
   max_cost_usd?: number | null;
+  /** W47: per-session assistant language override. Wins over dashboard
+   *  and app defaults. Null/undefined falls back to the wider scope. */
+  language_override?: AssistantLanguagePolicy | null;
   created_at: number;
   updated_at: number;
 }
@@ -522,6 +695,8 @@ export type ChatMessagePart =
       status: 'requested' | 'running' | 'success' | 'error';
       result_preview?: unknown;
       error?: string;
+      /** W51: compression telemetry surfaced on the chat trace part. */
+      compression?: ToolResultCompression;
     }
   | { type: 'build_proposal'; proposal: BuildProposal }
   | { type: 'error'; message: string; recoverable: boolean }
@@ -539,7 +714,9 @@ export type ChatMessagePart =
       plan: PlanArtifact;
       status: Record<string, PlanStepStatus>;
     }
-  | { type: 'reflection_meta'; widget_ids: string[] };
+  | { type: 'reflection_meta'; widget_ids: string[] }
+  | { type: 'widget_mentions'; mentions: WidgetMention[] }
+  | { type: 'source_mentions'; mentions: SourceMention[] };
 
 export interface AgentPhaseEntry {
   key: string;
@@ -561,17 +738,61 @@ export interface ToolResult {
   name: string;
   result: unknown;
   error?: string;
+  /** W51: when present, `result` already carries the compressor's
+   *  compact payload and the raw redacted payload lives in the local
+   *  `raw_artifacts` table. UI reads this to render a `87 KB → 2.1 KB
+   *  sent (~96% saved)` badge and offer the "view raw locally" button. */
+  compression?: ToolResultCompression;
+}
+
+/** W51: per-tool-result compression telemetry mirrored from the Rust
+ *  `ToolResultCompression` struct. `raw_artifact_id` is the lookup key
+ *  for `debugApi.getRawArtifact`; `truncation_paths` are the JSON
+ *  pointers the model can quote when calling `inspect_artifact`. */
+export interface ToolResultCompression {
+  profile: string;
+  raw_bytes: number;
+  compact_bytes: number;
+  estimated_tokens_saved: number;
+  raw_artifact_id?: string;
+  truncation_paths: string[];
+}
+
+/** W51: payload behind a `raw_artifact_id`. Already post-redaction —
+ *  the compressor strips secrets before persisting — so it is safe to
+ *  render inline in debug surfaces. */
+export interface RawArtifactPayload {
+  id: string;
+  owner_kind: string;
+  owner_id: string;
+  profile: string;
+  raw_size: number;
+  compact_size: number;
+  checksum: string;
+  redaction_version: number;
+  retention_class: string;
+  payload_json: string;
+  created_at: number;
 }
 
 export interface MessageMetadata {
   model?: string;
   provider?: string;
-  tokens?: { prompt: number; completion: number; reasoning?: number };
+  tokens?: {
+    prompt: number;
+    completion: number;
+    reasoning?: number;
+    /** W49: provider-reported total cost for the turn, when available
+     *  (OpenRouter returns this as `usage.cost`). */
+    provider_cost_usd?: number;
+  };
   latency_ms?: number;
   build_proposal?: BuildProposal;
   reasoning?: string;
   /** W22: resolved USD cost for this single assistant turn. */
   cost_usd?: number;
+  /** W49: provenance of `cost_usd`. */
+  cost_source?: CostSource;
 }
 
 export type ChatEventKind =
@@ -643,7 +864,94 @@ export type ValidationIssue =
       widget_title: string;
       error: string;
     }
-  | { kind: 'duplicate_shared_key'; key: string };
+  | { kind: 'duplicate_shared_key'; key: string }
+  | {
+      kind: 'unknown_parameter_reference';
+      widget_index: number;
+      widget_title: string;
+      param_name: string;
+    }
+  | { kind: 'parameter_cycle'; cycle: string[] }
+  | {
+      /** W38: Build proposal mutated a widget that was not in the mention
+       *  target set. Allowed targets travel in `target_widget_ids`. */
+      kind: 'off_target_widget_replace';
+      widget_index: number;
+      widget_title: string;
+      replace_widget_id: string;
+    }
+  | {
+      kind: 'off_target_widget_remove';
+      remove_widget_id: string;
+    }
+  | {
+      /** W39: an http_request datasource (inline or shared) failed the
+       *  safety gate before apply (bad method/scheme/host/headers). */
+      kind: 'unsafe_http_datasource';
+      widget_index: number;
+      widget_title: string;
+      source_kind: string;
+      reason: string;
+    }
+  | {
+      /** W44: gallery widget bakes a hardcoded image array in `data`
+       *  without a pipeline producing items. */
+      kind: 'hardcoded_gallery_items';
+      widget_index: number;
+      widget_title: string;
+      item_count: number;
+    }
+  | {
+      /** W45: agent set explicit x/y on a new widget. Auto-pack owns
+       *  placement; explicit coordinates are always wrong. */
+      kind: 'proposed_explicit_coordinates';
+      widget_index: number;
+      widget_title: string;
+    }
+  | {
+      /** W45: widget declares both size_preset and raw w/h. Force the
+       *  agent to pick one. */
+      kind: 'conflicting_layout_fields';
+      widget_index: number;
+      widget_title: string;
+    }
+  | {
+      /** W48: Build proposal failed to reference one or more sources the
+       *  user named with `@source`. The agent must rerun and produce a
+       *  widget whose datasource_plan consumes every missing entry. */
+      kind: 'unused_source_mention';
+      missing: Array<{
+        label: string;
+        datasource_definition_id?: string;
+        workflow_id?: string;
+      }>;
+    };
+
+/** W38: typed mention of an existing widget captured in the Build chat
+ *  composer. Stays on the SendMessageRequest so the agent + validator can
+ *  scope edits to the user-named targets. */
+export interface WidgetMention {
+  widget_id: string;
+  dashboard_id?: string;
+  label: string;
+  widget_kind?: string;
+}
+
+/** W48: typed mention of an existing data source captured in the Build
+ *  chat composer. Resolved on the backend against DatasourceDefinition
+ *  rows + legacy workflows + widget bindings. At least one of the three
+ *  id fields must be set; labels are presentation only. */
+export type SourceMentionKind = 'datasource' | 'workflow' | 'widget';
+
+export interface SourceMention {
+  kind: SourceMentionKind;
+  label: string;
+  datasource_definition_id?: string;
+  workflow_id?: string;
+  widget_id?: string;
+  dashboard_id?: string;
+  input_alias?: string;
+}
 
 export type AgentEvent =
   | { type: 'run_started' }
@@ -675,6 +983,8 @@ export type AgentEvent =
       status: 'requested' | 'running' | 'success' | 'error';
       result_preview?: unknown;
       error?: string;
+      /** W51: compression telemetry surfaced on the chat trace part. */
+      compression?: ToolResultCompression;
     }
   | { type: 'build_proposal'; proposal: BuildProposal }
   | { type: 'abort_cancel'; reason: string }
@@ -731,6 +1041,8 @@ export interface ToolResultTrace {
   status: 'requested' | 'running' | 'success' | 'error';
   result_preview?: unknown;
   error?: string;
+  /** W51: streaming-event compression telemetry. */
+  compression?: ToolResultCompression;
 }
 
 export interface WidgetDryRunResult {
@@ -780,10 +1092,35 @@ export interface BuildWidgetProposal {
   w?: number;
   h?: number;
   replace_widget_id?: string;
+  /** W45: named size preset, resolved against the widget kind to (w, h).
+   *  Mutually exclusive with raw `w`/`h` (validator rejects both). */
+  size_preset?: SizePreset;
+  /** W45: layout pattern hint at the widget level. Soft hint only —
+   *  packer still places row-first by array order. */
+  layout_pattern?: LayoutPattern;
 }
 
+/** W45: small set of named size presets resolved at apply time. */
+export type SizePreset =
+  | 'kpi'
+  | 'half_width'
+  | 'wide_chart'
+  | 'full_width'
+  | 'table'
+  | 'text_panel'
+  | 'gallery';
+
+/** W45: named layout pattern intent for a widget. */
+export type LayoutPattern =
+  | 'kpi_row'
+  | 'trend_chart_row'
+  | 'operations_table'
+  | 'datasource_overview'
+  | 'media_board'
+  | 'text_panel';
+
 export interface BuildDatasourcePlan {
-  kind: 'builtin_tool' | 'mcp_tool' | 'provider_prompt' | 'shared';
+  kind: 'builtin_tool' | 'mcp_tool' | 'provider_prompt' | 'shared' | 'compose';
   tool_name?: string;
   server_id?: string;
   arguments?: Record<string, unknown>;
@@ -792,6 +1129,7 @@ export interface BuildDatasourcePlan {
   refresh_cron?: string;
   pipeline?: PipelineStep[];
   source_key?: string;
+  inputs?: Record<string, BuildDatasourcePlan>;
 }
 
 export type FilterOp =
@@ -830,22 +1168,38 @@ export type PipelineStep =
   | { kind: 'unique'; by?: string }
   | { kind: 'format'; template: string; output_key?: string }
   | { kind: 'coerce'; to: CoerceTarget }
-  | { kind: 'llm_postprocess'; prompt: string; expect?: 'text' | 'json' };
+  | { kind: 'llm_postprocess'; prompt: string; expect?: 'text' | 'json' }
+  | {
+      kind: 'mcp_call';
+      server_id: string;
+      tool_name: string;
+      arguments?: unknown;
+    };
+
+/**
+ * W29: production provider kinds. `local_mock` was removed; existing
+ * persisted rows are normalised by the backend to `is_unsupported: true`
+ * and surfaced to the UI as a force-disabled row carrying a remediation
+ * message. New providers can never be created with that kind.
+ */
+export type ProviderKind = 'openrouter' | 'ollama' | 'custom';
 
 export interface LLMProvider {
   id: string;
   name: string;
-  kind: 'openrouter' | 'ollama' | 'custom' | 'local_mock';
+  kind: ProviderKind;
   base_url: string;
   api_key?: string;
   default_model: string;
   models: string[];
   is_enabled: boolean;
+  /** W29: row's stored kind is not a supported product kind anymore. */
+  is_unsupported?: boolean;
 }
 
 export interface CreateProviderRequest {
   name: string;
-  kind: LLMProvider['kind'];
+  kind: ProviderKind;
   base_url: string;
   api_key?: string;
   default_model: string;
@@ -854,7 +1208,7 @@ export interface CreateProviderRequest {
 
 export interface UpdateProviderRequest {
   name?: string;
-  kind?: LLMProvider['kind'];
+  kind?: ProviderKind;
   base_url?: string;
   api_key?: string;
   default_model?: string;
@@ -869,6 +1223,47 @@ export interface ProviderTestResult {
   model: string;
   error?: string;
   checked_at: number;
+}
+
+/**
+ * W29: typed remediation surfaces for chat / build send paths. Mirrors
+ * `models::provider::ProviderSetupError` in Rust. The Tauri command
+ * still returns a string error today; UI parses the leading
+ * `code: …` prefix to route to the right CTA.
+ */
+export type ProviderSetupErrorCode =
+  | 'no_active_provider'
+  | 'active_provider_missing'
+  | 'active_provider_disabled'
+  | 'provider_invalid_config'
+  | 'provider_unsupported'
+  | 'provider_unavailable';
+
+export interface ProviderSetupErrorInfo {
+  code: ProviderSetupErrorCode;
+  message: string;
+}
+
+const SETUP_ERROR_CODES: ProviderSetupErrorCode[] = [
+  'no_active_provider',
+  'active_provider_missing',
+  'active_provider_disabled',
+  'provider_invalid_config',
+  'provider_unsupported',
+  'provider_unavailable',
+];
+
+/**
+ * W29: parse the typed prefix from a backend send error so the UI can
+ * branch on the remediation code. Returns `null` for non-setup errors.
+ */
+export function parseProviderSetupError(message: string): ProviderSetupErrorInfo | null {
+  for (const code of SETUP_ERROR_CODES) {
+    if (message.startsWith(`${code}:`)) {
+      return { code, message };
+    }
+  }
+  return null;
 }
 
 export interface MCPServer {
@@ -955,6 +1350,10 @@ export interface WidgetDiff {
   title_changed?: [string, string];
   config_changes: JsonPathChange[];
   datasource_plan_changed: boolean;
+  /** W31: datasource identity (workflow_id / definition_id / output_key) changed. */
+  binding_changed?: boolean;
+  /** W31: per-widget tail (post_process, capture_traces, provenance) changed. */
+  tail_changed?: boolean;
 }
 
 export interface DashboardDiff {
@@ -966,6 +1365,32 @@ export interface DashboardDiff {
   name_changed?: [string, string];
   description_changed?: [string | null, string | null];
   layout_changed: boolean;
+}
+
+// ─── W39: proposal materialization preview ──────────────────────────────────
+
+export interface MaterializationEntry {
+  widget_title: string;
+  source_kind: string;
+  label: string;
+  origin: string;
+  datasource_definition_id?: string;
+  workflow_id?: string;
+}
+
+export interface MaterializationReject {
+  widget_title: string;
+  source_kind: string;
+  origin: string;
+  reason: string;
+}
+
+export interface ProposalMaterializationPreview {
+  creates: MaterializationEntry[];
+  reuses: MaterializationEntry[];
+  rejects: MaterializationReject[];
+  passthrough: MaterializationEntry[];
+  total_widgets: number;
 }
 
 export const dashboardApi = {
@@ -994,11 +1419,57 @@ export const dashboardApi = {
     confirmed: boolean;
     session_id?: string;
   }) => call<Dashboard>('apply_build_proposal', { req }),
+  /** W43: write the dashboard-level default LLM policy. `policy: null`
+   *  clears the default — eligible widgets then fall back to the app
+   *  active provider. Server-side validation runs the resolver against
+   *  the live provider list and rejects bad policies up front. */
+  setModelPolicy: (dashboardId: string, policy: DashboardModelPolicy | null) =>
+    call<Dashboard>('set_dashboard_model_policy', {
+      req: { dashboard_id: dashboardId, policy },
+    }),
+  /** W43: write a per-widget LLM override. `policy: null` clears it. */
+  setWidgetModelOverride: (
+    dashboardId: string,
+    widgetId: string,
+    policy: WidgetModelOverride | null,
+  ) =>
+    call<Dashboard>('set_widget_model_override', {
+      req: { dashboard_id: dashboardId, widget_id: widgetId, policy },
+    }),
+  /** W47: write the dashboard-level assistant language policy.
+   *  `policy: null` clears it; the dashboard then falls back to the app
+   *  default (and then to `auto`). */
+  setLanguagePolicy: (dashboardId: string, policy: AssistantLanguagePolicy | null) =>
+    call<Dashboard>('set_dashboard_language_policy', {
+      req: { dashboard_id: dashboardId, policy },
+    }),
+  /** W39: per-source resolution preview (create / reuse / reject /
+   *  passthrough). Read-only — mirrors apply's materialization logic. */
+  previewProposalMaterialization: (proposal: BuildProposal) =>
+    call<ProposalMaterializationPreview>('preview_proposal_materialization', {
+      req: { proposal },
+    }),
   dryRunWidget: (proposal: BuildWidgetProposal, sharedDatasources?: SharedDatasource[]) =>
     call<WidgetDryRunResult>('dry_run_widget', { proposal, sharedDatasources }),
   delete: (id: string) => call<boolean>('delete_dashboard', { id }),
   refreshWidget: (dashboardId: string, widgetId: string) =>
     call<WidgetRefreshResult>('refresh_widget', { dashboardId, widgetId }),
+  /**
+   * W40: refresh several widgets on a dashboard in one Tauri call.
+   * Widgets sharing a `workflow_id` execute the shared workflow exactly
+   * once and their per-widget tail pipelines run against the shared
+   * output. Independent workflows run concurrently with a bounded cap
+   * so one slow upstream call does not block the rest of the grid.
+   * `widgetIds = undefined` refreshes every refreshable widget.
+   */
+  refreshDashboardWidgets: (dashboardId: string, widgetIds?: string[]) =>
+    call<DashboardWidgetRefreshResult[]>('refresh_dashboard_widgets', {
+      dashboardId,
+      widgetIds,
+    }),
+  // W36: hydrate cached widget data before live refresh paints
+  listWidgetSnapshots: (dashboardId: string) =>
+    call<WidgetRuntimeSnapshot[]>('list_widget_snapshots', { dashboardId }),
   listVersions: (dashboardId: string) =>
     call<DashboardVersionSummary[]>('list_dashboard_versions', { dashboardId }),
   getVersion: (versionId: string) =>
@@ -1020,6 +1491,12 @@ export const dashboardApi = {
     }),
   resolveParameters: (dashboardId: string) =>
     call<ResolveDashboardParametersResult>('resolve_dashboard_parameters', { dashboardId }),
+  // W34: refresh query-backed options for one parameter
+  refreshParameterOptions: (dashboardId: string, paramName: string) =>
+    call<DashboardParameterState>('refresh_dashboard_parameter_options', {
+      dashboardId,
+      paramName,
+    }),
 };
 
 // ─── W23: Pipeline Debug API ────────────────────────────────────────────────
@@ -1078,6 +1555,430 @@ export const debugApi = {
     call<PipelineTrace | null>('get_widget_trace', { widgetId, capturedAt }),
   setCaptureTraces: (dashboardId: string, widgetId: string, capture: boolean) =>
     call<boolean>('set_widget_capture_traces', { dashboardId, widgetId, capture }),
+  /** W51: fetch the redacted raw payload behind a compressed tool
+   *  result. Returns `null` when the artifact id is unknown or has
+   *  been pruned. */
+  getRawArtifact: (artifactId: string) =>
+    callNullable<RawArtifactPayload>('get_raw_artifact', { artifactId }),
+  /** W32: replay a candidate pipeline against an inline sample or a
+   *  stored W23 trace. Deterministic-only — Studio replay rejects
+   *  `llm_postprocess` and `mcp_call` so previews never trigger
+   *  network calls. Run a full traced refresh through `traceWidget`
+   *  if you need the provider/MCP-aware path. */
+  replayPipeline: (req: ReplayPipelineRequest) =>
+    call<PipelineReplayResult>('replay_pipeline', { req }),
+};
+
+export interface ReplayPipelineRequest {
+  steps: PipelineStep[];
+  sample?: unknown;
+  from_widget_trace?: { widget_id: string; captured_at: number };
+}
+
+export interface PipelineReplayResult {
+  started_at: number;
+  finished_at: number;
+  initial_value?: unknown;
+  steps: PipelineStepTrace[];
+  final_value?: unknown;
+  error?: string;
+  /** 0-based index of the first failed / empty step, or undefined. */
+  first_empty_step_index?: number;
+}
+
+// ─── W41: Widget Execution Observability ────────────────────────────────────
+
+export type LlmParticipation =
+  | 'none'
+  | 'provider_source'
+  | 'llm_postprocess'
+  | 'widget_text_generation'
+  | 'unknown';
+
+export type ProvenanceSource =
+  | { kind: 'mcp_tool'; server_id: string; tool_name: string; arguments_preview?: unknown }
+  | { kind: 'builtin_tool'; tool_name: string; arguments_preview?: unknown }
+  | { kind: 'provider_prompt'; prompt_preview: string }
+  | { kind: 'compose'; inputs: ProvenanceComposeInput[] }
+  | { kind: 'unknown' }
+  | { kind: 'missing'; workflow_id: string };
+
+export interface ProvenanceComposeInput {
+  name: string;
+  source: ProvenanceSource;
+}
+
+export interface DatasourceProvenance {
+  workflow_id: string;
+  output_key: string;
+  datasource_definition_id?: string;
+  datasource_name?: string;
+  binding_source?: DatasourceBindingSource;
+  bound_at?: number;
+  source: ProvenanceSource;
+  trigger?: 'cron' | 'event' | 'manual';
+  refresh_cron?: string;
+  /** W50: user pause state on the backing workflow. `paused` means
+   *  automatic refresh is intentionally off — manual refresh still works. */
+  pause_state?: SchedulePauseState;
+}
+
+export interface ProviderProvenance {
+  provider_id: string;
+  provider_name: string;
+  provider_kind: string;
+  model: string;
+  is_active_provider: boolean;
+  /** W43: inheritance source for the model badge. */
+  model_source?: WidgetModelSource;
+  /** W43: capabilities the resolved policy pinned. */
+  required_caps?: WidgetCapability[];
+}
+
+export interface ProvenanceTailSummary {
+  step_count: number;
+  has_llm_postprocess: boolean;
+  has_mcp_call: boolean;
+  kinds?: string[];
+}
+
+export interface ProvenanceLastRun {
+  run_id: string;
+  status: 'idle' | 'running' | 'success' | 'error' | 'skipped';
+  started_at: number;
+  finished_at?: number;
+  duration_ms?: number;
+  error?: string;
+}
+
+export interface ProvenanceLinks {
+  workflow_id?: string;
+  datasource_definition_id?: string;
+  has_pipeline_traces: boolean;
+}
+
+export interface WidgetProvenance {
+  dashboard_id: string;
+  widget_id: string;
+  widget_title: string;
+  widget_kind: string;
+  llm_participation: LlmParticipation;
+  datasource?: DatasourceProvenance;
+  provider?: ProviderProvenance;
+  tail: ProvenanceTailSummary;
+  last_run?: ProvenanceLastRun;
+  links: ProvenanceLinks;
+  redacted_summary: string;
+}
+
+export const provenanceApi = {
+  getWidget: (dashboardId: string, widgetId: string) =>
+    call<WidgetProvenance>('get_widget_provenance', { dashboardId, widgetId }),
+};
+
+// ─── W30: Datasource Workbench API ──────────────────────────────────────────
+
+export type DatasourceDefinitionKind =
+  | 'builtin_tool'
+  | 'mcp_tool'
+  | 'provider_prompt';
+
+export type DatasourceHealthStatus = 'ok' | 'error';
+
+export interface DatasourceHealth {
+  last_run_at: number;
+  last_status: DatasourceHealthStatus;
+  last_error?: string;
+  last_duration_ms: number;
+  sample_preview?: unknown;
+  consumer_count?: number;
+}
+
+export interface DatasourceDefinition {
+  id: string;
+  name: string;
+  description?: string;
+  kind: DatasourceDefinitionKind;
+  tool_name?: string;
+  server_id?: string;
+  arguments?: unknown;
+  prompt?: string;
+  pipeline?: PipelineStep[];
+  refresh_cron?: string;
+  workflow_id: string;
+  created_at: number;
+  updated_at: number;
+  health?: DatasourceHealth;
+  /** W37: catalog id this definition was created from, if any. */
+  originated_external_source_id?: string;
+}
+
+export interface CreateDatasourceRequest {
+  name: string;
+  description?: string;
+  kind: DatasourceDefinitionKind;
+  tool_name?: string;
+  server_id?: string;
+  arguments?: unknown;
+  prompt?: string;
+  pipeline?: PipelineStep[];
+  refresh_cron?: string;
+}
+
+export interface UpdateDatasourceRequest {
+  name?: string;
+  description?: string;
+  tool_name?: string;
+  server_id?: string;
+  arguments?: unknown;
+  prompt?: string;
+  pipeline?: PipelineStep[];
+  refresh_cron?: string;
+}
+
+export interface DatasourceConsumer {
+  dashboard_id: string;
+  dashboard_name: string;
+  widget_id: string;
+  widget_title: string;
+  widget_kind: string;
+  output_key: string;
+  /** W31: `true` when the widget carries an explicit datasource_definition_id. */
+  explicit_binding?: boolean;
+  /** W31: surface that last wrote the binding, if known. */
+  binding_source?: DatasourceBindingSource;
+  /** W31: timestamp of the last binding change. */
+  bound_at?: number;
+  /** W31.1: number of per-widget tail pipeline steps. */
+  tail_step_count?: number;
+}
+
+export interface DatasourceImpactPreview {
+  datasource_id: string;
+  datasource_name: string;
+  workflow_id: string;
+  consumers: DatasourceConsumer[];
+  legacy_consumer_count: number;
+  has_explicit_consumers: boolean;
+}
+
+export interface DatasourceBindingChange {
+  dashboard_id: string;
+  widget_id: string;
+  datasource_definition_id?: string;
+  workflow_id?: string;
+  binding_source?: DatasourceBindingSource;
+  previous_workflow_id?: string;
+  previous_datasource_definition_id?: string;
+}
+
+export interface DatasourceRunResult {
+  status: DatasourceHealthStatus;
+  duration_ms: number;
+  error?: string;
+  raw_source?: unknown;
+  final_value?: unknown;
+  pipeline_steps: number;
+  workflow_node_ids: string[];
+}
+
+export interface DatasourceExportBundle {
+  version: number;
+  exported_at: number;
+  definitions: DatasourceDefinition[];
+}
+
+export interface ImportDatasourcesResult {
+  imported: number;
+  skipped: number;
+  overwritten: number;
+  errors: string[];
+}
+
+export const datasourceApi = {
+  list: () => call<DatasourceDefinition[]>('list_datasource_definitions'),
+  get: (id: string) => call<DatasourceDefinition>('get_datasource_definition', { id }),
+  create: (req: CreateDatasourceRequest) =>
+    call<DatasourceDefinition>('create_datasource_definition', { req }),
+  update: (id: string, req: UpdateDatasourceRequest) =>
+    call<DatasourceDefinition>('update_datasource_definition', { id, req }),
+  remove: (id: string) => call<boolean>('delete_datasource_definition', { id }),
+  duplicate: (id: string) =>
+    call<DatasourceDefinition>('duplicate_datasource_definition', { id }),
+  run: (id: string) => call<DatasourceRunResult>('run_datasource_definition', { id }),
+  listConsumers: (id: string) =>
+    call<DatasourceConsumer[]>('list_datasource_consumers', { id }),
+  previewImpact: (id: string) =>
+    call<DatasourceImpactPreview>('preview_datasource_impact', { id }),
+  bindWidget: (req: {
+    dashboard_id: string;
+    widget_id: string;
+    datasource_definition_id: string;
+    output_key?: string;
+    binding_source?: DatasourceBindingSource;
+  }) => call<DatasourceBindingChange>('bind_widget_to_datasource', { req }),
+  unbindWidget: (req: {
+    dashboard_id: string;
+    widget_id: string;
+    drop_datasource?: boolean;
+  }) => call<DatasourceBindingChange>('unbind_widget_from_datasource', { req }),
+  export: (ids: string[] = []) =>
+    call<DatasourceExportBundle>('export_datasource_definitions', { req: { ids } }),
+  import: (bundle: DatasourceExportBundle, overwrite = false) =>
+    call<ImportDatasourcesResult>('import_datasource_definitions', {
+      req: { bundle, overwrite },
+    }),
+};
+
+// ─── W37: External Source Catalog API ───────────────────────────────────────
+
+export type ExternalSourceReviewStatus =
+  | 'allowed'
+  | 'allowed_with_conditions'
+  | 'needs_review'
+  | 'blocked';
+
+export type ExternalSourceAdapter = 'http_json' | 'web_fetch' | 'mcp_recommended';
+
+export type ExternalSourceDomain =
+  | 'web_search'
+  | 'web_fetch'
+  | 'knowledge_base'
+  | 'crypto_market'
+  | 'developer_data'
+  | 'news'
+  | 'mcp_recommended';
+
+export type ExternalSourceCredentialPolicy = 'none' | 'optional' | 'required';
+
+export interface ExternalSourceRateLimit {
+  plan_name: string;
+  free_quota: string;
+  paid_tier?: string;
+  queries_per_second?: number;
+  attribution_required: boolean;
+  storage_rights_required: boolean;
+}
+
+export interface McpInstallEnvHint {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+export interface McpInstallRecommendation {
+  command: string;
+  args: string[];
+  env_hints: McpInstallEnvHint[];
+  package_kind: string;
+  package_name: string;
+}
+
+export interface ExternalSourceParam {
+  name: string;
+  description: string;
+  schema?: unknown;
+  required: boolean;
+  default?: unknown;
+}
+
+export interface ExternalSourceHttpRequest {
+  method: string;
+  url: string;
+  query?: Record<string, string>;
+  headers?: Record<string, string>;
+  credential_header?: string;
+  credential_prefix?: string;
+  body_params?: string[];
+}
+
+export interface ExternalSource {
+  id: string;
+  display_name: string;
+  description: string;
+  domain: ExternalSourceDomain;
+  adapter: ExternalSourceAdapter;
+  review_status: ExternalSourceReviewStatus;
+  review_date: string;
+  adapter_license: string;
+  terms_url: string;
+  review_notes: string;
+  attribution?: string;
+  credential_policy: ExternalSourceCredentialPolicy;
+  credential_help?: string;
+  http: ExternalSourceHttpRequest;
+  params: ExternalSourceParam[];
+  default_pipeline?: PipelineStep[];
+  /** W37++: published plan/rate metadata for the UI. */
+  rate_limit?: ExternalSourceRateLimit;
+  /** W37++: install metadata for recommended MCP servers. */
+  mcp_install?: McpInstallRecommendation;
+}
+
+export interface ExternalSourceState {
+  source_id: string;
+  is_enabled: boolean;
+  has_credential: boolean;
+  updated_at: number;
+}
+
+export interface ExternalSourceWithState extends ExternalSource {
+  state: ExternalSourceState;
+  is_runnable: boolean;
+  blocked_reason?: string;
+}
+
+export interface ExternalSourceTestResult {
+  source_id: string;
+  duration_ms: number;
+  raw_response: unknown;
+  final_value: unknown;
+  pipeline_steps: number;
+  effective_url: string;
+}
+
+export interface SaveExternalSourceResult {
+  source_id: string;
+  datasource_id: string;
+  workflow_id: string;
+}
+
+export interface OriginatingDatasource {
+  datasource_id: string;
+  name: string;
+  workflow_id: string;
+}
+
+export interface ExternalSourceImpactPreview {
+  source_id: string;
+  originating_datasources: OriginatingDatasource[];
+  has_credential: boolean;
+}
+
+export const externalSourceApi = {
+  list: () => call<ExternalSourceWithState[]>('list_external_sources'),
+  setEnabled: (sourceId: string, enabled: boolean) =>
+    call<ExternalSourceWithState>('set_external_source_enabled', {
+      sourceId,
+      enabled,
+    }),
+  setCredential: (sourceId: string, credential: string | null) =>
+    call<ExternalSourceWithState>('set_external_source_credential', {
+      sourceId,
+      credential,
+    }),
+  test: (sourceId: string, args: Record<string, unknown> = {}) =>
+    call<ExternalSourceTestResult>('test_external_source', {
+      req: { source_id: sourceId, arguments: args },
+    }),
+  saveAsDatasource: (req: {
+    source_id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+    refresh_cron?: string;
+  }) => call<SaveExternalSourceResult>('save_external_source_as_datasource', { req }),
+  previewImpact: (sourceId: string) =>
+    call<ExternalSourceImpactPreview>('preview_external_source_impact', { sourceId }),
 };
 
 // ─── Chat API ────────────────────────────────────────────────────────────────
@@ -1100,10 +2001,34 @@ export const chatApi = {
   getSession: (id: string) => call<ChatSession>('get_session', { id }),
   createSession: (mode: 'build' | 'context', dashboardId?: string) =>
     call<ChatSession>('create_session', { req: { mode, dashboard_id: dashboardId } }),
-  sendMessage: (sessionId: string, content: string) =>
-    call<ChatMessage>('send_message', { sessionId, req: { content } }),
-  sendMessageStream: (sessionId: string, content: string) =>
-    call<ChatMessage>('send_message_stream', { sessionId, req: { content } }),
+  sendMessage: (
+    sessionId: string,
+    content: string,
+    widgetMentions?: WidgetMention[],
+    sourceMentions?: SourceMention[],
+  ) =>
+    call<ChatMessage>('send_message', {
+      sessionId,
+      req: {
+        content,
+        widget_mentions: widgetMentions ?? [],
+        source_mentions: sourceMentions ?? [],
+      },
+    }),
+  sendMessageStream: (
+    sessionId: string,
+    content: string,
+    widgetMentions?: WidgetMention[],
+    sourceMentions?: SourceMention[],
+  ) =>
+    call<ChatMessage>('send_message_stream', {
+      sessionId,
+      req: {
+        content,
+        widget_mentions: widgetMentions ?? [],
+        source_mentions: sourceMentions ?? [],
+      },
+    }),
   cancelResponse: (sessionId: string) =>
     call<boolean>('cancel_chat_response', { sessionId }),
   truncateMessages: (sessionId: string, beforeMessageId: string) =>
@@ -1149,6 +2074,177 @@ export const workflowApi = {
   delete: (id: string) => call<boolean>('delete_workflow', { id }),
 };
 
+// ─── Workflow Operations Cockpit (W35) ───────────────────────────────────────
+
+export type RunStatusValue = 'idle' | 'running' | 'success' | 'error' | 'skipped';
+
+export interface WorkflowRunSummary {
+  id: string;
+  workflow_id: string;
+  started_at: number;
+  finished_at?: number;
+  status: RunStatusValue;
+  duration_ms?: number;
+  error?: string;
+  has_node_results: boolean;
+}
+
+export interface WorkflowRunFilter {
+  workflow_id?: string;
+  dashboard_id?: string;
+  widget_id?: string;
+  datasource_definition_id?: string;
+  status?: RunStatusValue;
+  limit?: number;
+}
+
+export interface WorkflowOwnerWidget {
+  widget_id: string;
+  widget_title: string;
+  widget_kind: string;
+  output_key: string;
+  explicit_binding: boolean;
+}
+
+export interface WorkflowOwnerDashboard {
+  dashboard_id: string;
+  dashboard_name: string;
+  widgets: WorkflowOwnerWidget[];
+}
+
+export interface WorkflowOwnerRef {
+  datasource_definition_id?: string;
+  datasource_name?: string;
+  dashboards: WorkflowOwnerDashboard[];
+}
+
+/** W50: user-controlled pause flag. Independent of `is_enabled` so an
+ *  operator can stop automatic refresh without disabling the workflow. */
+export type SchedulePauseState = 'active' | 'paused';
+
+/** W50: single label the UI surfaces. Rust is the source of truth — do
+ *  not recompute the value on the React side. */
+export type ScheduleDisplayState =
+  | 'active'
+  | 'paused_by_user'
+  | 'manual_only'
+  | 'invalid'
+  | 'disabled'
+  | 'not_scheduled';
+
+export interface WorkflowScheduleSummary {
+  is_scheduled: boolean;
+  cron?: string;
+  cron_normalized?: string;
+  cron_is_valid: boolean;
+  trigger_kind?: 'cron' | 'event' | 'manual';
+  /** W50: user-paused vs ticking. */
+  pause_state: SchedulePauseState;
+  last_paused_at?: number;
+  last_pause_reason?: string;
+  /** W50: rendered label, derived on the Rust side. */
+  display_state: ScheduleDisplayState;
+}
+
+export interface WorkflowSummary {
+  id: string;
+  name: string;
+  description?: string;
+  is_enabled: boolean;
+  trigger: WorkflowTrigger;
+  schedule: WorkflowScheduleSummary;
+  last_run?: WorkflowRunSummary;
+  owner: WorkflowOwnerRef;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface WorkflowRunDetail {
+  run: WorkflowRun;
+  workflow_id: string;
+  workflow_name: string;
+  owner: WorkflowOwnerRef;
+}
+
+export interface WorkflowRunCancelOutcome {
+  cancelled: boolean;
+  reason: string;
+  run_id: string;
+  run_status?: RunStatusValue;
+}
+
+export type SchedulerWarningKind =
+  | 'invalid_cron'
+  | 'cron_trigger_disabled'
+  | 'scheduled_but_disabled'
+  | 'enabled_but_not_scheduled';
+
+export interface SchedulerWarning {
+  workflow_id: string;
+  workflow_name: string;
+  kind: SchedulerWarningKind;
+  message: string;
+}
+
+export interface SchedulerHealth {
+  scheduler_started: boolean;
+  scheduled_workflow_ids: string[];
+  warnings: SchedulerWarning[];
+}
+
+export const operationsApi = {
+  listWorkflowSummaries: () =>
+    call<WorkflowSummary[]>('list_workflow_summaries'),
+  listRuns: (filter?: WorkflowRunFilter) =>
+    call<WorkflowRunSummary[]>('list_workflow_runs', { filter }),
+  getRunDetail: (runId: string) =>
+    call<WorkflowRunDetail>('get_workflow_run_detail', { runId }),
+  retryRun: (runId: string) =>
+    call<WorkflowRun>('retry_workflow_run', { runId }),
+  cancelRun: (runId: string) =>
+    call<WorkflowRunCancelOutcome>('cancel_workflow_run', { runId }),
+  schedulerHealth: () => call<SchedulerHealth>('get_scheduler_health'),
+};
+
+// ─── W50: schedule pause + cadence controls ────────────────────────────────
+
+export const scheduleApi = {
+  /** Pause automatic refresh for a single workflow. Manual refresh still
+   *  works. Returns the updated summary so the UI does not re-fetch. */
+  pauseWorkflow: (workflowId: string, reason?: string) =>
+    call<WorkflowSummary>('pause_workflow_schedule', { workflowId, reason }),
+  /** Resume automatic refresh. Re-registers the cron job only when the
+   *  cron expression is still valid. */
+  resumeWorkflow: (workflowId: string) =>
+    call<WorkflowSummary>('resume_workflow_schedule', { workflowId }),
+  /** Update / clear the cron expression on an existing workflow. Pass
+   *  `null` to revert the trigger to manual. */
+  setWorkflowCron: (workflowId: string, cron: string | null) =>
+    call<WorkflowSummary>('set_workflow_schedule', { workflowId, cron }),
+  /** Pause every distinct workflow referenced by the dashboard's
+   *  widgets. */
+  pauseDashboard: (dashboardId: string, reason?: string) =>
+    call<WorkflowSummary[]>('pause_dashboard_schedules', { dashboardId, reason }),
+  resumeDashboard: (dashboardId: string) =>
+    call<WorkflowSummary[]>('resume_dashboard_schedules', { dashboardId }),
+};
+
+/** W50: friendly cadence presets shared by every schedule editor. The
+ *  `cron` field is the 6-field form expected by `tokio_cron_scheduler`. */
+export interface SchedulePreset {
+  id: string;
+  label: string;
+  cron: string | null;
+}
+
+export const SCHEDULE_PRESETS: SchedulePreset[] = [
+  { id: 'manual', label: 'Manual only', cron: null },
+  { id: 'every_1m', label: 'Every 1 minute', cron: '0 * * * * *' },
+  { id: 'every_5m', label: 'Every 5 minutes', cron: '0 */5 * * * *' },
+  { id: 'every_15m', label: 'Every 15 minutes', cron: '0 */15 * * * *' },
+  { id: 'every_60m', label: 'Every hour', cron: '0 0 * * * *' },
+];
+
 // ─── Tool API ────────────────────────────────────────────────────────────────
 
 export interface HttpRequestArgs {
@@ -1168,6 +2264,9 @@ export const toolApi = {
   executeCurl: (args: string[]) => call<unknown>('execute_curl', { args }),
   executeHttpRequest: (req: HttpRequestArgs) =>
     call<HttpRequestResponse>('execute_http_request', { req }),
+  getHttpUserAgent: () => call<string>('get_http_user_agent'),
+  setHttpUserAgent: (userAgent: string) =>
+    call<string>('set_http_user_agent', { userAgent }),
 };
 
 // ─── Config API ──────────────────────────────────────────────────────────────
@@ -1175,6 +2274,30 @@ export const toolApi = {
 export const configApi = {
   get: (key: string) => callNullable<string>('get_config', { key }),
   set: (key: string, value: string) => call<boolean>('set_config', { key, value }),
+};
+
+// ─── W47: Assistant language API ────────────────────────────────────────────
+
+export const languageApi = {
+  /** Curated BCP-47 catalog with provider support hints. Static, served
+   *  from Rust so the Rust-side resolver and the React selector cannot
+   *  drift. */
+  list: () => call<AssistantLanguageCatalog>('list_assistant_languages'),
+  /** App-level default policy. `auto` is the factory default. */
+  getAppPolicy: () => call<AssistantLanguagePolicy>('get_app_assistant_language'),
+  setAppPolicy: (policy: AssistantLanguagePolicy) =>
+    call<AssistantLanguagePolicy>('set_app_assistant_language', { policy }),
+  /** Per-session override; takes precedence over dashboard + app. */
+  setSessionPolicy: (sessionId: string, policy: AssistantLanguagePolicy | null) =>
+    call<ChatSession>('set_session_language_policy', {
+      req: { session_id: sessionId, policy },
+    }),
+  /** Resolve the effective language for a given scope. Returns the
+   *  source surface ("session_override" / "dashboard_override" /
+   *  "app_default" / "auto") plus the catalog option (or `null` for
+   *  auto). */
+  resolve: (scope: { dashboard_id?: string; session_id?: string } = {}) =>
+    call<EffectiveAssistantLanguage>('resolve_assistant_language', { req: scope }),
 };
 
 // ─── System API ──────────────────────────────────────────────────────────────
@@ -1279,6 +2402,50 @@ export const playgroundApi = {
   deletePreset: (id: string) => call<boolean>('delete_playground_preset', { id }),
 };
 
+// ─── Widget streaming events (W42) ───────────────────────────────────────────
+
+export const WIDGET_STREAM_EVENT_CHANNEL = 'widget:stream';
+
+export type WidgetStreamKind =
+  | 'refresh_started'
+  | 'reasoning_delta'
+  | 'text_delta'
+  | 'status'
+  | 'final'
+  | 'failed'
+  | 'superseded';
+
+export interface WidgetStreamEnvelope {
+  dashboard_id: string;
+  widget_id: string;
+  refresh_run_id: string;
+  sequence: number;
+  kind: WidgetStreamKind;
+  text?: string;
+  final_data?: WidgetRuntimeData;
+  partial_text?: string;
+  error?: string;
+  status?: string;
+  workflow_run_id?: string;
+  emitted_at: number;
+}
+
+/**
+ * W42: live streaming state for a single widget refresh as reconciled
+ * by the UI. Lives in `api.ts` so widget components and DashboardGrid
+ * can import it without pulling in the whole `App.tsx` module graph.
+ */
+export interface WidgetStreamState {
+  runId: string;
+  status: 'starting' | 'reasoning' | 'streaming' | 'waiting' | 'failed';
+  partialText: string;
+  reasoningText: string;
+  hasReasoning: boolean;
+  statusHint?: string;
+  error?: string;
+  partialOnFail?: string;
+}
+
 // ─── Alert API (W21) ─────────────────────────────────────────────────────────
 
 export const ALERT_EVENT_CHANNEL = 'alert:event';
@@ -1326,6 +2493,10 @@ export interface AlertEvent {
   context: { value?: unknown; path?: string; threshold?: unknown };
   acknowledged_at?: number | null;
   triggered_session_id?: string | null;
+  /** W35: id of the workflow run that produced the value this alert
+   * fired on. Populated for alerts evaluated post-refresh; `null` for
+   * legacy rows. Click → Operations cockpit with the run preselected. */
+  workflow_run_id?: string | null;
 }
 
 export interface SetWidgetAlertsRequest {
@@ -1356,6 +2527,14 @@ export const alertApi = {
 
 // ─── Cost API (W22) ──────────────────────────────────────────────────────────
 
+/**
+ * W49: provenance of a single turn's cost figure. Surfaced on the
+ * footer so operators can tell whether the number came from the
+ * upstream provider's own billing field or from the local pricing
+ * table, and whether the session has any unpriced turns.
+ */
+export type CostSource = 'provider_total' | 'pricing_table' | 'unknown_pricing';
+
 export interface SessionCostSnapshot {
   session_id: string;
   model?: string;
@@ -1365,6 +2544,11 @@ export interface SessionCostSnapshot {
   cost_usd: number;
   max_cost_usd?: number | null;
   today_cost_usd: number;
+  /** W49: number of assistant turns whose tokens were recorded but
+   *  pricing was unknown. When > 0, `cost_usd` is a lower bound. */
+  cost_unknown_turns?: number;
+  /** W49: provenance of the most recent assistant turn's cost. */
+  latest_cost_source?: CostSource;
 }
 
 export interface DailyCostBucket {
@@ -1391,7 +2575,7 @@ export interface CostSummary {
 
 export interface ModelPricingOverride {
   model_pattern: string;
-  provider_kind?: 'openrouter' | 'ollama' | 'custom' | 'local_mock';
+  provider_kind?: ProviderKind;
   input_usd_per_1m: number;
   output_usd_per_1m: number;
   reasoning_usd_per_1m?: number;

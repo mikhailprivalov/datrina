@@ -74,6 +74,52 @@ pub async fn set_widget_capture_traces(
     )
 }
 
+/// W51: hand the chat trace / Pipeline Debug UI the redacted raw
+/// payload behind a `raw_artifact_id` so the user can see the full
+/// local artifact that backed a compressed tool result. Returns the
+/// post-redaction `payload_json` plus retention metadata; never echoes
+/// secrets.
+#[tauri::command]
+pub async fn get_raw_artifact(
+    state: State<'_, AppState>,
+    artifact_id: String,
+) -> Result<ApiResult<Option<RawArtifactPayload>>, String> {
+    match state.storage.get_raw_artifact(&artifact_id).await {
+        Ok(None) => Ok(ApiResult::ok(None)),
+        Ok(Some(record)) => Ok(ApiResult::ok(Some(RawArtifactPayload {
+            id: record.id,
+            owner_kind: record.owner_kind,
+            owner_id: record.owner_id,
+            profile: record.profile,
+            raw_size: record.raw_size,
+            compact_size: record.compact_size,
+            checksum: record.checksum,
+            redaction_version: record.redaction_version,
+            retention_class: record.retention_class,
+            payload_json: record.payload_json,
+            created_at: record.created_at,
+        }))),
+        Err(e) => Ok(ApiResult::err(e.to_string())),
+    }
+}
+
+/// W51: typed wire shape for `get_raw_artifact`. The TS side renders
+/// this in the "raw local artifact" panel beside the compact view.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RawArtifactPayload {
+    pub id: String,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub profile: String,
+    pub raw_size: usize,
+    pub compact_size: usize,
+    pub checksum: String,
+    pub redaction_version: u32,
+    pub retention_class: String,
+    pub payload_json: String,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TraceEntry {
     pub captured_at: i64,
@@ -112,12 +158,24 @@ pub(crate) async fn trace_widget_pipeline_inner(
 
     let source_summary = derive_source_summary(&workflow);
 
+    // W47: live trace run inherits the dashboard's language policy so
+    // the inspector shows the same prose language the user gets at
+    // refresh time.
+    let trace_language_directive = crate::commands::language::resolve_effective_language(
+        state.storage.as_ref(),
+        Some(dashboard_id),
+        None,
+    )
+    .await
+    .ok()
+    .and_then(|resolved| resolved.system_directive());
     let engine = WorkflowEngine::with_runtime(
         state.tool_engine.as_ref(),
         state.mcp_manager.as_ref(),
         state.ai_engine.as_ref(),
         crate::commands::dashboard::active_provider_public(state).await?,
-    );
+    )
+    .with_language(trace_language_directive);
     let execution = engine.execute(&workflow, None).await?;
     let run = execution.run;
 
@@ -144,12 +202,23 @@ pub(crate) async fn trace_widget_pipeline_inner(
     let (initial, steps) = locate_pipeline_initial(&workflow, &context)?;
 
     let provider = crate::commands::dashboard::active_provider_public(state).await?;
+    // W47: trace-time pipeline runs against the dashboard's resolved
+    // assistant language, same as the live refresh path.
+    let language_directive = crate::commands::language::resolve_effective_language(
+        state.storage.as_ref(),
+        Some(dashboard_id),
+        None,
+    )
+    .await
+    .ok()
+    .and_then(|resolved| resolved.system_directive());
     let (final_value, step_traces) = run_pipeline_with_trace(
         initial,
         &steps,
         Some(state.ai_engine.as_ref()),
         provider.as_ref(),
         Some(state.mcp_manager.as_ref()),
+        language_directive.as_deref(),
     )
     .await;
 
@@ -258,7 +327,8 @@ fn widget_datasource_mut(
         | Widget::Logs { datasource, .. }
         | Widget::BarGauge { datasource, .. }
         | Widget::StatusGrid { datasource, .. }
-        | Widget::Heatmap { datasource, .. } => Some(datasource),
+        | Widget::Heatmap { datasource, .. }
+        | Widget::Gallery { datasource, .. } => Some(datasource),
     }
 }
 
@@ -397,4 +467,263 @@ pub fn trace_summary_for_reflection(trace: &PipelineTrace) -> String {
         ));
     }
     out
+}
+
+// ─── W32: Typed pipeline replay ─────────────────────────────────────────────
+
+/// Replay a candidate pipeline against an explicit sample value. Reuses
+/// the production `run_pipeline_with_trace` runner so the result matches
+/// what a live workflow would produce on the same input. Provider /
+/// MCP-aware steps (`llm_postprocess`, `mcp_call`) are intentionally not
+/// connected here: the Studio is a deterministic preview surface, so
+/// those steps return a typed "skipped" trace entry instead of hitting
+/// the network. Use the W23 Debug view for full-runtime traces.
+#[tauri::command]
+pub async fn replay_pipeline(
+    state: State<'_, AppState>,
+    req: ReplayPipelineRequest,
+) -> Result<ApiResult<PipelineReplayResult>, String> {
+    Ok(match replay_pipeline_inner(&state, req).await {
+        Ok(value) => ApiResult::ok(value),
+        Err(e) => ApiResult::err(e.to_string()),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplayPipelineRequest {
+    pub steps: Vec<PipelineStep>,
+    /// Inline sample value the pipeline starts from. Required when
+    /// `from_widget_trace` is `None`.
+    #[serde(default)]
+    pub sample: Option<Value>,
+    /// Replay against a stored W23 trace: we pull the trace's first
+    /// recorded input sample as the initial value. The Studio surfaces
+    /// this when seeded from the Debug modal.
+    #[serde(default)]
+    pub from_widget_trace: Option<WidgetTraceRef>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WidgetTraceRef {
+    pub widget_id: String,
+    pub captured_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineReplayResult {
+    pub started_at: i64,
+    pub finished_at: i64,
+    pub initial_value: Option<Value>,
+    pub steps: Vec<crate::models::pipeline::PipelineStepTrace>,
+    pub final_value: Option<Value>,
+    pub error: Option<String>,
+    /// 0-based index of the first step whose output became empty
+    /// (null / empty array) or that errored. `None` when every step
+    /// produced data. Helps the UI point at the broken step.
+    pub first_empty_step_index: Option<u32>,
+}
+
+async fn replay_pipeline_inner(
+    state: &State<'_, AppState>,
+    req: ReplayPipelineRequest,
+) -> AnyResult<PipelineReplayResult> {
+    let started_at = chrono::Utc::now().timestamp_millis();
+    let initial = match (&req.sample, &req.from_widget_trace) {
+        (Some(v), _) => v.clone(),
+        (None, Some(reference)) => {
+            let stored = state
+                .storage
+                .get_widget_trace(&reference.widget_id, reference.captured_at)
+                .await?
+                .ok_or_else(|| anyhow!("stored trace not found"))?;
+            let parsed: PipelineTrace = serde_json::from_str(&stored)?;
+            // The pipeline node's input equals the first step's input
+            // sample. For an empty pipeline, fall back to the trace's
+            // final value (still useful for ad-hoc replays).
+            if let Some(first) = parsed.steps.first() {
+                first.input_sample.preview.clone()
+            } else {
+                parsed.final_value.unwrap_or(Value::Null)
+            }
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "replay_pipeline requires either `sample` or `from_widget_trace`"
+            ));
+        }
+    };
+    // Deterministic-only: deny provider/MCP steps so the Studio never
+    // surprises the user with a network call or a cost line item.
+    if let Some(bad) = req.steps.iter().find(|s| {
+        matches!(
+            s,
+            PipelineStep::LlmPostprocess { .. } | PipelineStep::McpCall { .. }
+        )
+    }) {
+        return Err(anyhow!(
+            "Studio replay cannot execute {} steps — use the Debug view's full traced run.",
+            crate::modules::workflow_engine::pipeline_step_kind_public(bad)
+        ));
+    }
+    let (final_value, step_traces) =
+        run_pipeline_with_trace(initial.clone(), &req.steps, None, None, None, None).await;
+    let finished_at = chrono::Utc::now().timestamp_millis();
+    let error = step_traces.iter().find_map(|s| s.error.clone());
+    let first_empty_step_index = first_empty_step(&step_traces);
+    Ok(PipelineReplayResult {
+        started_at,
+        finished_at,
+        initial_value: Some(initial),
+        steps: step_traces,
+        final_value: Some(final_value),
+        error,
+        first_empty_step_index,
+    })
+}
+
+fn first_empty_step(steps: &[crate::models::pipeline::PipelineStepTrace]) -> Option<u32> {
+    use crate::models::pipeline::SampleKind;
+    for step in steps {
+        if step.error.is_some() {
+            return Some(step.index);
+        }
+        match step.output_sample.kind {
+            SampleKind::Null => return Some(step.index),
+            SampleKind::ArrayHead => {
+                if step.output_sample.size_hint.items.unwrap_or(0) == 0 {
+                    return Some(step.index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::pipeline::{
+        PipelineStep, PipelineStepTrace, SampleKind, SampleValue, SizeHint,
+    };
+
+    fn step_trace(
+        index: u32,
+        kind: &str,
+        output: SampleValue,
+        error: Option<&str>,
+    ) -> PipelineStepTrace {
+        PipelineStepTrace {
+            index,
+            kind: kind.to_string(),
+            config_json: Value::Null,
+            input_sample: SampleValue {
+                kind: SampleKind::Value,
+                size_hint: SizeHint::default(),
+                preview: Value::Null,
+            },
+            output_sample: output,
+            duration_ms: 0,
+            error: error.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn first_empty_step_returns_none_when_every_step_has_data() {
+        let traces = vec![step_trace(
+            0,
+            "pick",
+            SampleValue {
+                kind: SampleKind::ArrayHead,
+                size_hint: SizeHint {
+                    items: Some(3),
+                    bytes: None,
+                },
+                preview: json!([1, 2, 3]),
+            },
+            None,
+        )];
+        assert_eq!(first_empty_step(&traces), None);
+    }
+
+    #[test]
+    fn first_empty_step_flags_empty_array() {
+        let traces = vec![
+            step_trace(
+                0,
+                "pick",
+                SampleValue {
+                    kind: SampleKind::ArrayHead,
+                    size_hint: SizeHint {
+                        items: Some(2),
+                        bytes: None,
+                    },
+                    preview: json!([1, 2]),
+                },
+                None,
+            ),
+            step_trace(
+                1,
+                "filter",
+                SampleValue {
+                    kind: SampleKind::ArrayHead,
+                    size_hint: SizeHint {
+                        items: Some(0),
+                        bytes: None,
+                    },
+                    preview: json!([]),
+                },
+                None,
+            ),
+        ];
+        assert_eq!(first_empty_step(&traces), Some(1));
+    }
+
+    #[test]
+    fn first_empty_step_flags_step_error_before_empty() {
+        let traces = vec![step_trace(
+            0,
+            "pick",
+            SampleValue {
+                kind: SampleKind::Null,
+                size_hint: SizeHint::default(),
+                preview: Value::Null,
+            },
+            Some("path not found"),
+        )];
+        assert_eq!(first_empty_step(&traces), Some(0));
+    }
+
+    #[tokio::test]
+    async fn replay_matches_live_pipeline_for_deterministic_steps() {
+        let steps = vec![
+            PipelineStep::Pick {
+                path: "items".into(),
+            },
+            PipelineStep::Limit { count: 2 },
+            PipelineStep::Length,
+        ];
+        let sample = json!({ "items": [{"id":1},{"id":2},{"id":3}] });
+        let (live_final, _live_traces) = crate::modules::workflow_engine::run_pipeline_with_trace(
+            sample.clone(),
+            &steps,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let (replay_final, _replay_traces) =
+            crate::modules::workflow_engine::run_pipeline_with_trace(
+                sample.clone(),
+                &steps,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(live_final, replay_final);
+        assert_eq!(replay_final, json!(2));
+    }
 }

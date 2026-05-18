@@ -1,0 +1,128 @@
+id: recorded_replay_full_loop
+description: |
+  W33 — drives the captured turns through `RecordedProvider` (impl
+  `AIProvider`) so the full agent loop — submit_plan, dry_run_widget,
+  emit proposal — runs through the same validator/cost surfaces the
+  product chat path uses. This is the first scenario that exercises
+  the `AIProvider` trait extracted in W33 instead of just synthesising
+  a transcript for the validator.
+
+trace:
+  proposal:
+    id: prop-replay-stat
+    title: Active release stat (replay)
+    widgets:
+      - widget_type: stat
+        title: Active release
+        data: ""
+        datasource_plan:
+          kind: mcp_tool
+          server_id: example-mcp
+          tool_name: list_releases
+          arguments: { project: example-project }
+          pipeline:
+            - { kind: pick, path: releases }
+            - { kind: filter, field: state, op: eq, value: active }
+            - { kind: head }
+            - { kind: pick, path: version }
+        config:
+          unit: ""
+  tool_calls:
+    - call_id: replay-call-dry-run
+      name: dry_run_widget
+      arguments:
+        proposal:
+          title: Active release
+      result:
+        status: ok
+        value: v1.2.3
+  plan:
+    summary: Replay full loop — fetch MCP list_releases, dry-run, propose.
+    steps:
+      - { id: s1, title: Fetch releases, kind: fetch }
+      - { id: s2, title: Dry-run, kind: test }
+      - { id: s3, title: Propose, kind: propose }
+  usage:
+    provider_kind: openrouter
+    model: moonshotai/kimi-k2.6-instruct
+    prompt: 3400
+    completion: 720
+
+  # W33 — recorded turns the harness replays through AIProvider.
+  # Turn 1: agent submits plan + dry-run in one assistant message
+  #         (mirrors the multi-tool-call shape providers emit).
+  # Turn 2: agent emits the final proposal JSON as plain content; this
+  #         turn is flagged `request_strict_mode: true` so the
+  #         capability map resolves it to JsonObject for kimi-k2.6 and
+  #         the assertion can pin "strict mode was actually applied".
+  turns:
+    - content: ""
+      tool_calls:
+        - call_id: replay-call-plan
+          name: submit_plan
+          arguments:
+            summary: Fetch active release and surface as stat.
+            steps:
+              - { id: s1, title: Fetch releases, kind: fetch }
+              - { id: s2, title: Dry-run, kind: test }
+              - { id: s3, title: Propose, kind: propose }
+        - call_id: replay-call-dry-run
+          name: dry_run_widget
+          arguments:
+            proposal:
+              title: Active release
+      tokens:
+        provider_kind: openrouter
+        model: moonshotai/kimi-k2.6-instruct
+        prompt: 1600
+        completion: 220
+    - content: |
+        {
+          "id": "prop-replay-stat",
+          "title": "Active release stat (replay)",
+          "widgets": [
+            {
+              "widget_type": "stat",
+              "title": "Active release",
+              "data": "",
+              "datasource_plan": {
+                "kind": "mcp_tool",
+                "server_id": "example-mcp",
+                "tool_name": "list_releases",
+                "arguments": { "project": "example-project" },
+                "pipeline": [
+                  { "kind": "pick", "path": "releases" },
+                  { "kind": "filter", "field": "state", "op": "eq", "value": "active" },
+                  { "kind": "head" },
+                  { "kind": "pick", "path": "version" }
+                ]
+              },
+              "config": { "unit": "" }
+            }
+          ],
+          "shared_datasources": [],
+          "remove_widget_ids": []
+        }
+      request_strict_mode: true
+      tokens:
+        provider_kind: openrouter
+        model: moonshotai/kimi-k2.6-instruct
+        prompt: 1800
+        completion: 500
+
+assertions:
+  - kind: validator_passes
+  - kind: proposal_widget
+    count: 1
+    widget_type: stat
+    has_datasource_plan: true
+    has_pipeline_step_kind: [pick, filter]
+  - kind: tool_called
+    name: dry_run_widget
+    min_count: 1
+  - kind: no_hardcoded_literals
+  - kind: cost_lt_usd
+    value: 0.20
+  - kind: replay_loop_passes
+    max_cost_usd: 0.20
+    expect_strict_mode: true

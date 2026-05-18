@@ -10,30 +10,40 @@ interface Props {
 }
 
 export function TopBar({ dashboard, activeProvider, isChatOpen, onToggleChat, onOpenBuildChat, onOpenSettings }: Props) {
+  // W46: stable header layout — title area owns remaining space and
+  // truncates with an explicit tooltip; secondary text (description)
+  // collapses before primary text; action group is min-content and
+  // never gets pushed off-screen.
   return (
-    <header className="flex items-center justify-between h-14 px-4 bg-card/95 backdrop-blur-sm border-b border-border">
-      <div className="flex items-center gap-3 min-w-0">
-        {dashboard ? (
-          <div className="flex items-center gap-3 min-w-0">
-            <span className="hidden sm:inline-flex h-5 items-center rounded-sm bg-primary/15 px-1.5 text-[10px] mono font-semibold uppercase tracking-wider text-primary">
-              dash
+    <header className="flex items-center gap-3 h-14 px-4 bg-card/95 backdrop-blur-sm border-b border-border">
+      {dashboard ? (
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <span className="hidden sm:inline-flex h-5 flex-shrink-0 items-center rounded-sm bg-primary/15 px-1.5 text-[10px] mono font-semibold uppercase tracking-wider text-primary">
+            dash
+          </span>
+          <h1
+            className="min-w-0 flex-shrink truncate text-base font-semibold tracking-tight"
+            title={dashboard.name}
+          >
+            {dashboard.name}
+          </h1>
+          {dashboard.description && (
+            <span
+              className="hidden lg:inline min-w-0 flex-shrink truncate text-xs text-muted-foreground"
+              title={dashboard.description}
+            >
+              {dashboard.description}
             </span>
-            <h1 className="text-base font-semibold truncate tracking-tight">{dashboard.name}</h1>
-            {dashboard.description && (
-              <span className="text-xs text-muted-foreground hidden md:inline truncate max-w-md">
-                {dashboard.description}
-              </span>
-            )}
-          </div>
-        ) : (
-          <div className="flex items-center gap-2">
-            <span className="inline-flex h-5 items-center rounded-sm bg-muted px-1.5 text-[10px] mono font-semibold uppercase tracking-wider text-muted-foreground">
-              idle
-            </span>
-            <h1 className="text-base font-semibold text-muted-foreground">No dashboard selected</h1>
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      ) : (
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="inline-flex h-5 flex-shrink-0 items-center rounded-sm bg-muted px-1.5 text-[10px] mono font-semibold uppercase tracking-wider text-muted-foreground">
+            idle
+          </span>
+          <h1 className="min-w-0 truncate text-base font-semibold text-muted-foreground">No dashboard selected</h1>
+        </div>
+      )}
 
       <div className="flex items-center gap-2 flex-shrink-0">
         <button
@@ -43,11 +53,14 @@ export function TopBar({ dashboard, activeProvider, isChatOpen, onToggleChat, on
               ? 'border-border bg-muted/40 text-foreground hover:bg-muted'
               : 'border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/15'
           }`}
-          title={activeProvider ? `Active LLM provider: ${activeProvider.name}` : 'LLM provider is not configured'}
+          title={activeProvider ? `Active LLM provider: ${activeProvider.name} · ${activeProvider.default_model}` : 'LLM provider is not configured'}
         >
-          <span className={`relative w-2 h-2 rounded-full ${activeProvider ? 'bg-neon-lime glow-primary' : 'bg-destructive glow-destructive'}`} />
-          <span className="max-w-44 truncate mono uppercase tracking-wider">
+          <span className={`relative w-2 h-2 flex-shrink-0 rounded-full ${activeProvider ? 'bg-neon-lime glow-primary' : 'bg-destructive glow-destructive'}`} />
+          <span className="hidden xl:inline max-w-[11rem] truncate mono uppercase tracking-wider">
             {activeProvider ? `${activeProvider.name} · ${activeProvider.default_model}` : 'No provider'}
+          </span>
+          <span className="xl:hidden max-w-[8rem] truncate mono uppercase tracking-wider">
+            {activeProvider ? activeProvider.name : 'No provider'}
           </span>
         </button>
 

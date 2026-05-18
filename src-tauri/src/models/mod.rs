@@ -1,14 +1,20 @@
 pub mod alert;
 pub mod chat;
 pub mod dashboard;
+pub mod datasource;
+pub mod external_source;
+pub mod language;
 pub mod mcp;
 pub mod memory;
 pub mod pipeline;
 pub mod playground;
 pub mod pricing;
+pub mod provenance;
 pub mod provider;
+pub mod snapshot;
 pub mod validation;
 pub mod widget;
+pub mod widget_stream;
 pub mod workflow;
 
 use serde::{Deserialize, Serialize};

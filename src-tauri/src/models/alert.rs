@@ -134,6 +134,12 @@ pub struct AlertEvent {
     /// the alert had an `agent_action` and the daily budget permitted a
     /// run.
     pub triggered_session_id: Option<Id>,
+    /// W35: workflow run that produced the data this alert fired on.
+    /// Set when the widget refresh emitted a fresh `WorkflowRun`;
+    /// `None` for legacy rows and for ad-hoc evaluations that ran with
+    /// no backing workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

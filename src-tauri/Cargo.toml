@@ -41,6 +41,9 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "mac
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# W37++: robots.txt parsing for the safe web_fetch external source
+texting_robots = "0.2"
+
 # Scheduling
 tokio-cron-scheduler = "0.13"
 cron = "0.15"

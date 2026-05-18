@@ -1,0 +1,57 @@
+{
+  "generated_at": "2026-05-18T00:35:52.879Z",
+  "duration_ms": 12771,
+  "include_live": false,
+  "success": true,
+  "first_failure": null,
+  "gates": [
+    {
+      "name": "tauri.conf.json parses",
+      "ok": true,
+      "code": 0,
+      "signal": null,
+      "duration_ms": 25,
+      "stderr_tail": ""
+    },
+    {
+      "name": "check:contract",
+      "ok": true,
+      "code": 0,
+      "signal": null,
+      "duration_ms": 35,
+      "stderr_tail": ""
+    },
+    {
+      "name": "typecheck",
+      "ok": true,
+      "code": 0,
+      "signal": null,
+      "duration_ms": 2742,
+      "stderr_tail": ""
+    },
+    {
+      "name": "cargo fmt --check",
+      "ok": true,
+      "code": 0,
+      "signal": null,
+      "duration_ms": 392,
+      "stderr_tail": ""
+    },
+    {
+      "name": "cargo check --all-targets",
+      "ok": true,
+      "code": 0,
+      "signal": null,
+      "duration_ms": 6194,
+      "stderr_tail": ""
+    },
+    {
+      "name": "agent_eval replay lane",
+      "ok": true,
+      "code": 0,
+      "signal": null,
+      "duration_ms": 3381,
+      "stderr_tail": ""
+    }
+  ]
+}
